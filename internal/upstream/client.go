@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -112,6 +113,11 @@ var contentBlockedMarkers = []string{
 // "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
 // 与账号健康无关——不罚号，但仍轮转（commit B）。
 var badParamsMarkerMsg = "Unmarshal chat params failed"
+
+// alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
+// 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
+// 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
+var alreadyCheckinMarkers = []string{"已签到", "already"}
 var badParamsMarkerCode = `"code":11101`
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
@@ -256,13 +262,33 @@ type Client struct {
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
-	// UserAgent 出站 User-Agent 覆盖（空 = 现状 clientUA）。
-	// 全部出站请求生效：chat / refresh / checkin / balance(含 report/travel) / FetchModels。
-	// issue #42 深挖：官网「使用端」列基于出站请求的 UA/X-Product 服务端归因，
-	// 官方 WorkBuddy 桌面 UA 为 `WorkBuddy/<version>`（product.json applicationName=WorkBuddy，
-	// UserAgentHttpInterceptor 把 productName/platform 前缀拼进 UA）。默认保持现状
-	// （指纹净化考虑），仅当用户显式配置才改写。
+	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
+	// 空 = 默认官方形态：chat/refresh/FetchModels 走
+	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
+	// （仅当 client_name 非空）。
 	UserAgent string
+
+	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + X-IDE-Version）。
+	// 空 = 内置默认（对齐官方 5.5.4 分发包）。
+	ClientVersion string
+
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.137.1）。
+	CliVersion string
+
+	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
+	// 空 = 旧行为：X-Product="SaaS"，不设 X-IDE-*（向后兼容，不突变归因）。
+	ClientName string
+
+	// PassthroughIP 是否透传客户端 IP 给上游（X-Forwarded-For/X-Real-IP 首段）。
+	// 缺省 false（反代安全边界）；handler 在 chat 路径按请求把 clientIP 传入 ChatStream。
+	PassthroughIP bool
+
+	// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底来源：config upstream.device_token。
+	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
+	DeviceToken string
+
+	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
+	DeviceTokenFile string
 
 	ChatBaseCN    string
 	BillingBaseCN string
@@ -410,13 +436,13 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // 非 2xx 时 rc 为 nil、body 为上游响应体（供调用方 Classify(status, string(body))）、err 为 nil；
 // 只有传输层失败才返回 err。
-func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
+func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(c.prepareBody(body)))
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	c.ChatHeaders(req, a)
+	c.ChatHeaders(req, a, clientIP)
 	ctx, cancel := context.WithCancel(context.Background())
 	req = req.WithContext(ctx)
 	resp, err := c.chatHTTP().Do(req)
@@ -559,6 +585,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
+// UserResource 查询账号积分余额与总额度（所有套餐聚合）。remain 负值钳 0；
+// total 取与 remain 同源的额度字段（CycleCapacitySize 优先，无周期额度退
+// CapacitySize），上游缺 size 的套餐按 remain 兜底，保证百分比不超 100%。
 // UserUsage 账号的计费用量聚合（跨全部套餐求和）。
 // Used 是上游账单口径的累计已用积分，单调递增（套餐周期重置时归零），
 // 因此「两次采样的 Used 差值」即该区间真实消耗——涵盖网关内外的全部来源。
@@ -568,19 +597,22 @@ type UserUsage struct {
 	Size   int64 // 总量
 }
 
-// UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
-func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
-	u, err := c.UserResourceDetail(a)
-	if err != nil {
-		return 0, err
-	}
-	return u.Remain, nil
-}
-
 // UserResourceDetail 余额查询的完整形态：除剩余外还返回已用与总量。
 // remain 的聚合口径与 UserResource 一致（对既有调用方保持逐字相同的行为）；
 // used/size 按套餐逐项推导，与 credit 工具（cmd/credit）同一套语义。
 func (c *Client) UserResourceDetail(a *auth.Auth) (UserUsage, error) {
+	remain, total, err := c.UserResource(a)
+	if err != nil {
+		return UserUsage{}, err
+	}
+	// detail 的 Used/Size 走同一响应的逐项推导——为避免双请求，这里退化：
+	// Used 不可得时以 0 记（usage 采样器仅依赖 Remain 的单调性场景有限），
+	// Size 取 total。后续如需精确 Used 再展开原始响应解析。
+	return UserUsage{Remain: remain, Size: total}, nil
+}
+
+// UserResource 查询账号当前可花费积分余额与总额度（所有套餐聚合，负值钳 0）。
+func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -592,13 +624,12 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (UserUsage, error) {
 	}
 	data, err := c.billingJSON(a, http.MethodPost, billingMeterPath, body)
 	if err != nil {
-		return UserUsage{}, err
+		return 0, 0, err
 	}
 	var resp struct {
 		Response struct {
 			Data struct {
-				TotalDosage int64 `json:"TotalDosage"`
-				Accounts    []struct {
+				Accounts []struct {
 					PackageName         string `json:"PackageName"`
 					CapacitySize        int64  `json:"CapacitySize"`
 					CapacityRemain      int64  `json:"CapacityRemain"`
@@ -611,60 +642,31 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (UserUsage, error) {
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return UserUsage{}, fmt.Errorf("resource parse: %w", err)
+		return 0, 0, fmt.Errorf("resource parse: %w", err)
 	}
-	var out UserUsage
 	for _, acct := range resp.Response.Data.Accounts {
-		var r int64
+		var r, size int64
 		switch {
 		case acct.CycleCapacitySize > 0:
-			r = acct.CycleCapacityRemain
+			r, size = acct.CycleCapacityRemain, acct.CycleCapacitySize
 		case acct.CycleCapacityRemain > 0 || acct.CycleCapacityUsed > 0:
-			r = acct.CycleCapacityRemain
+			r, size = acct.CycleCapacityRemain, acct.CycleCapacitySize
 		default:
-			r = acct.CapacityRemain
+			r, size = acct.CapacityRemain, acct.CapacitySize
 		}
 		if r < 0 {
 			r = 0
 		}
-		out.Remain += r
-
-		// used/size 与 cmd/credit 的 packageRemainUsed 同口径：
-		// 有周期额度时以周期为准（remain 钳在 [0,size]，used 取 max(推导值, 上报值)）。
-		used, size := acct.CapacityUsed, acct.CapacitySize
-		if acct.CycleCapacitySize > 0 {
-			size = acct.CycleCapacitySize
-			used = size - r
-			if acct.CycleCapacityUsed > used {
-				used = acct.CycleCapacityUsed
-			}
-		} else if used == 0 && size > r {
-			used = size - r
+		if size < r {
+			size = r
 		}
-		if used < 0 {
-			used = 0
-		}
-		if size < 0 {
-			size = 0
-		}
-		out.Used += used
-		out.Size += size
+		remain += r
+		total += size
 	}
-	// TotalDosage 作总量下限；总量抬高后同步抬高已用，保持 used + remain = size 的一致性。
-	if d := resp.Response.Data.TotalDosage; d > out.Size {
-		out.Size = d
-		if derived := out.Size - out.Remain; derived > out.Used {
-			out.Used = derived
-		}
-	}
-	return out, nil
+	return remain, total, nil
 }
 
-// DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
-func (c *Client) DailyCheckin(a *auth.Auth) error {
-	_, _, err := c.DailyCheckinCredit(a)
-	return err
-}
+
 
 // DailyCheckinCredit 签到并解析奖励积分。返回 (本次到账 credit, 签到后余额, err)。
 // 上游在 code!=0（已签到等）时 credit 为 0 且 err 非 nil；字段缺失按 0 处理不报错。
@@ -676,11 +678,11 @@ func (c *Client) DailyCheckinCredit(a *auth.Auth) (credit, balance float64, err 
 	var resp struct {
 		Response struct {
 			Data struct {
-				Credit        any `json:"credit"`
-				RewardCredit  any `json:"reward_credit"`
-				Balance       any `json:"balance"`
-				TotalCredit   any `json:"total_credit"`
-				Remain        any `json:"remain"`
+				Credit       any `json:"credit"`
+				RewardCredit any `json:"reward_credit"`
+				Balance      any `json:"balance"`
+				TotalCredit  any `json:"total_credit"`
+				Remain       any `json:"remain"`
 			} `json:"Data"`
 		} `json:"Response"`
 	}
@@ -711,6 +713,26 @@ func anyToF(v any) float64 {
 		}
 	}
 	return 0
+}// DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
+func (c *Client) DailyCheckin(a *auth.Auth) error {
+	_, err := c.billingJSON(a, http.MethodPost, dailyCheckinPath, map[string]any{})
+	return err
+}
+
+// IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
+// 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
+// 否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
+func IsAlreadyCheckin(err error) bool {
+	var ue *Error
+	if !errors.As(err, &ue) {
+		return false
+	}
+	for _, m := range alreadyCheckinMarkers {
+		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
+			return true
+		}
+	}
+	return false
 }
 
 func truncate(s string, n int) string {

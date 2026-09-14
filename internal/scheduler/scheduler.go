@@ -265,10 +265,15 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshToken == "" {
 			continue
 		}
-		credit, _ , cerr := s.cfg.Upstream.DailyCheckinCredit(a)
+		credit, _, cerr := s.cfg.Upstream.DailyCheckinCredit(a)
 		if cerr != nil {
-			// 已签到等业务错误也继续走余额查询；业务错误时 credit=0
-			credit = 0
+			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
+			if upstream.IsAlreadyCheckin(cerr) {
+				log.Printf("checkin %s: 今天已签到（幂等）", st.UID)
+			} else {
+				log.Printf("checkin %s: %v", st.UID, cerr)
+			}
+			credit = 0 // 业务错误（含已签到）时奖励记 0
 		}
 		if lg := s.lg(); lg != nil {
 			lg.Append(ledger.Entry{
@@ -276,17 +281,15 @@ func (s *Scheduler) RunCheckinNow() {
 				Kind: ledger.KindCheckin, Delta: credit, Note: "每日签到",
 			})
 		}
-		if cerr != nil && credit == 0 {
-			log.Printf("checkin %s: %v", st.UID, cerr)
-		}
-		remain, err := s.cfg.Upstream.UserResource(a)
+		remain, total, err := s.cfg.Upstream.UserResource(a)
 		if err != nil {
 			log.Printf("user-resource %s: %v", st.UID, err)
 			continue
 		}
-		s.cfg.Pool.ReenableIfCredits(st.UID, remain)
+		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
 	}
 	s.RunStreakBonusNow()
+	s.RunSchoolNow() // 开学季活动（活动期 9/13-9/24，结束自动跳过）
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
@@ -309,7 +312,7 @@ func (s *Scheduler) RunActivityNow() {
 		}
 		first = false
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
-		if err := s.cfg.Upstream.ReportChatActivity(a, cid); err != nil {
+		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
 			log.Printf("activity %s: %v", a.UID, err)
 			continue
 		}
@@ -385,12 +388,12 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			remain, err := s.cfg.Upstream.UserResource(a)
+			remain, total, err := s.cfg.Upstream.UserResource(a)
 			if err != nil {
 				log.Printf("balance %s: %v", uid, err)
 				return
 			}
-			s.cfg.Pool.ReenableIfCredits(uid, remain)
+			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
 		}(a, st.UID)
 	}
 	wg.Wait()

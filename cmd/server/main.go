@@ -31,7 +31,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.2.0-panel"
+const appVersion = "1.6.3-panel"
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
@@ -90,7 +90,8 @@ func main() {
 			TTL:        cfg.SessionTTL,
 			GCInterval: cfg.SessionGCInterval,
 			Store:      store,
-			Available:  p.AvailableUIDs,
+			Available:         p.AvailableUIDs,
+			AvailableForModel: p.AvailableUIDsForModel,
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -114,8 +115,16 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
-	// 出站 UA 覆盖（issue #42）：非空才改写，空 = 现状 clientUA（指纹净化考虑）。
+	// 出站 UA 与归属头（issue #42 + 上游同步）：
+	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
+	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
 	up.UserAgent = cfg.Upstream.UserAgent
+	up.ClientVersion = cfg.Upstream.ClientVersion
+	up.CliVersion = cfg.Upstream.CliVersion
+	up.ClientName = cfg.Upstream.ClientName
+	up.DeviceToken = cfg.Upstream.DeviceToken
+	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
+	up.PassthroughIP = cfg.Upstream.PassthroughIP
 
 	// 使用量采样器：周期记录各账号上游 used 计数，供面板 5h/24h 消耗看板。
 	// 采样文件与 state.json 同目录，跨重启保留（used 单调递增，历史样本仍有效）。

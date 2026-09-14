@@ -115,6 +115,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		p.byUID[uid] = &entry{
 			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:      s.Credits,
+			creditsTotal: s.CreditsTotal,
 			disabled:     s.Disabled,
 			reason:       s.Reason,
 			until:        s.Until,
@@ -123,6 +124,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal:     errTotal,
 			lastErr:      s.LastErr,
 			lastSuccess:  s.LastSuccess,
+			tokenUsage:   s.TokenUsage,
 			softStreak:   s.SoftStreak,
 		}
 	}
@@ -189,6 +191,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = stateAccount{
 			Credits:      e.credits,
+			CreditsTotal: e.creditsTotal,
 			Disabled:     e.disabled,
 			Reason:       e.reason,
 			Until:        e.until,
@@ -197,6 +200,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			ErrTotal:     e.errTotal,
 			LastSuccess:  e.lastSuccess,
 			LastErr:      e.lastErr,
+			TokenUsage:   e.tokenUsage,
 			SoftStreak:   e.softStreak,
 		}
 	}

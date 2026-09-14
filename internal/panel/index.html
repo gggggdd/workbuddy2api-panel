@@ -31,6 +31,7 @@
   --shadow: 0 1px 2px rgba(16,20,32,.06), 0 8px 24px -14px rgba(16,20,32,.14);
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   background: var(--bg); color: var(--ink); font: 14px/1.55 var(--sans);
@@ -59,6 +60,77 @@ body {
 .nav a svg { width: 15px; height: 15px; flex: none; opacity: .85; }
 .nav .sig { padding: 12px 16px; border-top: 1px solid var(--line-soft); font-size: 11.5px; color: var(--ink-3); }
 .nav .sig .row { display: flex; align-items: center; gap: 7px; }
+/* 日志频道筛选 chips */
+.chips { display: inline-flex; gap: 4px; align-items: center; }
+.chips .chip { padding: 2px 10px; border-radius: 999px; }
+.chips .chip.on { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 550; }
+.ln .lch { font-style: normal; display: inline-block; font-size: 10px; line-height: 1; padding: 2px 6px; border-radius: 4px; margin-right: 8px; vertical-align: 1px; }
+.ln .lch.c-task { background: var(--accent-soft); color: var(--accent); }
+.ln .lch.c-chat { background: var(--ok-soft); color: var(--ok); }
+.ln .lch.c-sys { background: var(--surface-2); color: var(--ink-3); }
+
+/* 任务中心 */
+.tc-empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 42px 16px; color: var(--ink-3); }
+.tc-empty svg { width: 42px; height: 42px; opacity: .55; margin-bottom: 6px; }
+.tc-empty .t { font-weight: 550; color: var(--ink-2); }
+.tc-empty .d { font-size: 12.5px; max-width: 34em; text-align: center; }
+.sel-note { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-3); white-space: nowrap; flex: none; }
+.sel-note select {
+  appearance: none; -webkit-appearance: none;
+  background: var(--surface-2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 8px center;
+  border: 1px solid var(--line); border-radius: 7px; color: var(--ink);
+  font: 550 12px var(--sans); padding: 3px 24px 3px 9px; cursor: pointer;
+}
+.qprog { display: flex; align-items: center; gap: 12px; padding: 12px 16px 0; }
+.qprog .qbar { flex: 1; height: 4px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
+.qprog .qbar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .5s ease; }
+.qprog .note { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.qgroup { padding: 4px 0 10px; }
+.qgroup + .qgroup { border-top: 1px solid var(--line-soft); }
+.qgroup header {
+  display: flex; align-items: baseline; gap: 9px; padding: 10px 16px 6px;
+  background: none; border: none; box-shadow: none;
+}
+.qgroup header .nm { font-weight: 600; font-size: 13.5px; }
+.qgroup header .cnt { font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
+.qrow {
+  display: grid; grid-template-columns: 118px 1fr 52px 84px minmax(120px, 240px);
+  gap: 10px; align-items: center; padding: 7.5px 16px; font-size: 13px;
+}
+.qrow:hover { background: var(--surface-2); }
+.qrow .code { font: 11.5px/1.35 var(--mono); color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qrow .name { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.qrow .name .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qrow .prog { font-variant-numeric: tabular-nums; color: var(--ink-2); text-align: right; }
+.qrow .st { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.qrow .msg { font-size: 12px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qdot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.qdot.done { background: var(--ok); }
+.qdot.run { background: var(--accent); animation: qpulse 1.2s ease-in-out infinite; }
+.qdot.wait { background: none; border: 1.5px solid var(--ink-3); }
+.qdot.err { background: var(--bad); }
+.qdot.skip { background: var(--ink-3); }
+@keyframes qpulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .qdot.run { animation: none; } }
+.srow { display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto; gap: 14px; align-items: center; padding: 13px 16px; }
+.srow + .srow { border-top: 1px solid var(--line-soft); }
+.srow .who .nm { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.srow .who .id { font: 10.5px var(--mono); color: var(--ink-3); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shead {
+  display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto;
+  gap: 14px; align-items: center; padding: 9px 16px 7px;
+  font-size: 11.5px; color: var(--ink-3); border-bottom: 1px solid var(--line-soft);
+}
+.shead .stasks span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.stasks { display: grid; grid-template-columns: repeat(5, minmax(64px, 1fr)); gap: 6px 10px; }
+.stask { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
+.stask .mark { font-size: 13px; line-height: 1; width: 14px; text-align: center; flex: none; }
+.stask.ok .mark { color: var(--ok); }
+.stask.warn .mark { color: var(--warn); } .stask.warn .fr { color: var(--warn); font-variant-numeric: tabular-nums; }
+.stask.todo { color: var(--ink-3); }
+.srow .luck { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.srow .luck svg { width: 14px; height: 14px; opacity: .7; }
+.srow .err { grid-column: 1 / -1; font-size: 12px; color: var(--bad); margin-top: -4px; }
 .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
 .pulse.bad { background: var(--bad); }
 .pulse.warn { background: var(--warn); }
@@ -167,8 +239,30 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.usage-cell { min-width: 268px; }
+.usage-line {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  font: 600 11.5px/1.25 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.usage-item {
+  display: inline-flex; align-items: baseline; padding: 3px 6px; border: 1px solid transparent;
+  border-radius: 5px; background: var(--surface-2);
+}
+.usage-item b { font-weight: 650; }
+.usage-item em { margin-left: 2px; font: 500 10px/1 var(--sans); font-style: normal; }
+.usage-count { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 18%, transparent); }
+.usage-total {
+  color: var(--accent); background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 24%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 6%, transparent);
+}
+.usage-total b { font-size: 12px; letter-spacing: -.02em; }
+.usage-total em { color: var(--ink-2); }
+.usage-latency { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 18%, transparent); }
+.usage-rate { color: var(--ok); background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 18%, transparent); }
 .cred { min-width: 84px; }
-.cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; }
+.cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
+.cred .n .of { color: var(--ink-3); font-size: 11px; }
 .bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 5px; overflow: hidden; max-width: 88px; }
 .bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
 .tag {
@@ -268,6 +362,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#ledger" data-view="ledger">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h8.5a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H3z"/><path d="M3 8h9.5M5.5 5.2h3M5.5 10.8h3"/></svg>
         积分明细</a></li>
+      <li><a href="#taskscenter" data-view="taskscenter">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
+        任务中心</a></li>
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
@@ -304,7 +401,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
         <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
-        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">可用积分合计</div></div>
+        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
 
@@ -348,7 +445,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
             <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>最近成功</th><th class="c-acts"></th>
+            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
@@ -364,6 +461,19 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat"><div class="v" id="m5h">-</div><div class="k">近 5 小时</div></div>
         <div class="stat"><div class="v" id="m24h">-</div><div class="k">近 24 小时</div></div>
         <div class="stat"><div class="v" id="mReq">-</div><div class="k">请求总数</div></div>
+    <!-- 任务中心 -->
+    <section class="view" id="view-taskscenter" hidden>
+      <div class="box">
+        <header>
+          <h3>开学季 <span class="hint">09-13 ~ 09-24 · 每日重置</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="schoolSummary"></span>
+          <button class="xs" id="btnSchoolRefresh">刷新</button>
+          <button class="xs primary" id="btnSchoolRunAll">全部账号执行闭环</button>
+        </header>
+        <div class="state" id="schoolState"><span class="dots">加载中</span></div>
+        <div id="schoolList"></div>
+
       </div>
 
       <div class="box">
@@ -400,6 +510,29 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             适合相对观测而非精确结算。
           </div>
         </div>
+          <h3>成长任务队列 <span class="hint" id="qcSummary"></span></h3>
+          <span class="grow"></span>
+          <label class="sel-note">并发
+            <select id="qcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
+          </label>
+          <button class="xs" id="btnScanAll">扫描待办</button>
+          <button class="xs primary" id="btnRunQueue">执行全部待办</button>
+        </header>
+        <div class="qprog" id="qProg" hidden>
+          <div class="qbar"><i id="qBarFill"></i></div>
+          <span class="note" id="qProgText"></span>
+        </div>
+        <div class="tc-empty" id="tcEmpty">
+          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <rect x="8" y="6" width="24" height="36" rx="3"/>
+            <path d="M14 16h12M14 24h12M14 32h7" opacity=".45"/>
+            <circle cx="35" cy="33" r="8"/><path d="m40 38 5 5"/>
+          </svg>
+          <div class="t">还没有扫描过</div>
+          <div class="d">扫描所有账号的成长任务与开学季待办，把没做的排成一列，一键执行。</div>
+        </div>
+        <div id="qcList"></div>
+
       </div>
     </section>
 
@@ -613,6 +746,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header>
           <h3>运行日志</h3>
           <span class="grow"></span>
+          <span class="chips" id="logChips">
+            <button class="xs chip on" data-ch="all">全部</button>
+            <button class="xs chip" data-ch="task">任务</button>
+            <button class="xs chip" data-ch="chat">对话</button>
+            <button class="xs chip" data-ch="sys">系统</button>
+          </span>
           <span class="note" id="logNote">最近 500 行</span>
           <button class="xs" id="btnLogPin">自动滚动：开</button>
         </header>

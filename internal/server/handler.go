@@ -360,6 +360,9 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
+	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
+	clientIP := upstream.ExtractClientIP(r)
 	// 请求体上限：LimitReader 读 limit+1 以探测"超限"（读到 limit+1 字节即已超），
 	// 超限直接 413，不把截断的半截 JSON 喂给上游（issue #41：截断 body 让上游
 	// unmarshal 报 unexpected EOF，网关却罚号轮空）。
@@ -417,7 +420,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Session != nil {
 		sessKey = session.ExtractKey(body)
 		if sessKey != "" {
-			if uid, ok := h.cfg.Session.Resolve(sessKey); ok {
+			// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
+			// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
+			if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
 				stickyUID = uid
 			}
 		}
@@ -451,6 +456,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			unbindSticky()
 		}
 	}
+	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time) {
+		delta.Model = peek.Model
+		latency := time.Since(started)
+		latencyMs := latency.Milliseconds()
+		if latencyMs < 1 {
+			latencyMs = 1
+		}
+		delta.HasLatencyMs = true
+		delta.LatencyMs = latencyMs
+		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 && latencyMs > 0 {
+			delta.HasTokensPerSecond = true
+			delta.TokensPerSecond = float64(delta.CompletionTokens) * 1000 / float64(latencyMs)
+		}
+		h.cfg.Pool.RecordTokenUsage(uid, delta)
+	}
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
 	//   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
@@ -468,9 +488,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 选号：粘性号优先（PickByUID 已校验 health + 在途未满），否则普通轮换。
 		var acct *auth.Auth
 		if stickyUID != "" {
-			acct = h.cfg.Pool.PickByUID(stickyUID)
+			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, peek.Model)
 			if acct == nil {
-				// 粘性号当前不可用（冷却/占满）→ 解绑，本次回落普通轮换。
+				// 粘性号当前不可用（冷却/占满/被当前模型限额）→ 解绑，本次回落普通轮换。
 				unbindSticky()
 			}
 		}
@@ -517,16 +537,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body)
+		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
+		attemptStarted := time.Now()
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, clientIP)
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			fail(acct.UID)
 			continue
 		}
 		if status >= 400 {
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
 			st.status = status
 			kind := upstream.Classify(status, string(respBody))
 			// 内容拦截误报（passthrough 模式首遇）：判定为 system 指纹误报，
@@ -558,6 +582,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
 			_ = upstream.Stream(w, stats)
+			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
 			charged = stats.Credit()
@@ -568,11 +593,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
 		if err != nil {
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
 		}
+		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)

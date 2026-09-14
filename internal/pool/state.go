@@ -102,14 +102,15 @@ func (p *Pool) Revive(uid string) bool {
 // softStreak 属**冷却域**（与 until/coolKind 同域），故随冷却一并清零——与"解冻只清冷却
 // 不清熔断"的既有 C5 语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是历史软冷却累积。
 // 调用方必须已持有 p.mu。
-func (p *Pool) ReenableIfCredits(uid string, remain int64) {
+func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		if remain > 0 && !e.disabled {
-			p.reviveCoolingLocked(e, remain)
+			p.reviveCoolingLocked(e, remain, total)
 		} else {
 			e.credits = remain
+			e.creditsTotal = total
 		}
 		p.dirty.Store(true)
 	}
@@ -145,6 +146,50 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.sessionDeadFails = 0
 		p.dirty.Store(true)
 	}
+}
+
+// RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
+// usage 字段缺失时仍累计请求次数，但只累计明确存在的 token 字段。
+func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	usage := &e.tokenUsage
+	usage.RequestCount++
+	usage.LastUsedAt = time.Now()
+	if delta.Model != "" {
+		usage.LastModel = delta.Model
+	}
+	known := false
+	if delta.HasPromptTokens && delta.PromptTokens >= 0 {
+		usage.PromptTokens += delta.PromptTokens
+		known = true
+	}
+	if delta.HasCompletionTokens && delta.CompletionTokens >= 0 {
+		usage.CompletionTokens += delta.CompletionTokens
+		known = true
+	}
+	if delta.HasTotalTokens && delta.TotalTokens >= 0 {
+		usage.TotalTokens += delta.TotalTokens
+		known = true
+	}
+	if known {
+		usage.UsageCount++
+	}
+	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
+		usage.LastLatencyMs = delta.LatencyMs
+	}
+	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
+		speed := delta.TokensPerSecond
+		usage.LastTokensPerSecond = &speed
+	} else {
+		// 失败或缺少 completion_tokens 时不展示上一次请求的旧吞吐速度。
+		usage.LastTokensPerSecond = nil
+	}
+	p.dirty.Store(true)
 }
 
 // Status 查询单账号状态。
@@ -186,6 +231,49 @@ func (p *Pool) AvailableUIDs() []string {
 	}
 	sort.Strings(uids)
 	return uids
+}
+
+// AvailableUIDsForModel 同 AvailableUIDs，但把健康口径换成 healthyForModel：
+// 在该模型上被 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入（模型豁免）。
+// 供会话粘性按模型分配与命中校验；model 为空时等价于 AvailableUIDs。
+func (p *Pool) AvailableUIDsForModel(model string) []string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	uids := make([]string, 0, len(p.byUID))
+	for uid, e := range p.byUID {
+		if !e.healthyForModel(now, model) {
+			continue
+		}
+		if p.inFlightFull(e) {
+			continue
+		}
+		uids = append(uids, uid)
+	}
+	sort.Strings(uids)
+	return uids
+}
+
+// PickByUIDForModel 同 PickByUID，但用 healthyForModel 校验：绑定号在当前模型被
+// 6004 限流时返回 nil，让调用方（handler）解绑并回落普通轮换。
+// 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
+// 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
+func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return nil
+	}
+	now := time.Now()
+	if !e.healthyForModel(now, model) {
+		return nil
+	}
+	if p.inFlightFull(e) {
+		return nil
+	}
+	e.lastUsed = now
+	return e.a
 }
 
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
@@ -243,7 +331,13 @@ func (p *Pool) ServableNow() bool {
 	defer p.mu.RUnlock()
 	now := time.Now()
 	for _, e := range p.byUID {
-		if e.healthy(now) && !p.inFlightFull(e) {
+		if p.inFlightFull(e) {
+			continue
+		}
+		// 存在性语义：账号级 healthy，或处于模型级豁免形态（6004 单模型软冷却——
+		// 对触发模型不可用，对其他模型仍可选）。探活无请求模型上下文，取"存在可服务
+		// 模型"与 chat 实际可达性等价（issue #31 探活侧补齐）。
+		if e.healthy(now) || e.modelExempt() {
 			return true
 		}
 	}
@@ -271,11 +365,13 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		UID:             uid,
 		Nickname:        e.a.Nickname,
 		Credits:         e.credits,
+		CreditsTotal:    e.creditsTotal,
 		Cooling:         now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:          e.reason,
 		Disabled:        e.disabled,
 		SuccessCount:    e.successCount,
 		ErrTotal:        e.errTotal,
+		TokenUsage:      e.tokenUsage,
 		LastSuccessTime: e.lastSuccess,
 		LastErrTime:     e.lastErr,
 		Until:           e.until,

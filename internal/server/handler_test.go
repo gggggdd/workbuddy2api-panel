@@ -105,7 +105,7 @@ func testPoolWith(auths ...*auth.Auth) *pool.Pool {
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	for _, a := range auths {
 		p.Add(a)
-		p.SetCredits(a.UID, 1000)
+		p.SetCredits(a.UID, 1000, 0)
 	}
 	return p
 }
@@ -168,6 +168,9 @@ func TestChatOversizedBodyReturns413(t *testing.T) {
 	if st.Cooling || st.Disabled || st.ErrTotal != 0 {
 		t.Errorf("413 must not penalize account: %+v", st)
 	}
+	if st.TokenUsage.RequestCount != 0 {
+		t.Errorf("413 must not record token usage: %+v", st.TokenUsage)
+	}
 }
 
 // TestChatOversizedBodyDefaultLimitHeader 未显式设置 MaxBodyBytes 时兜底 8MB：
@@ -209,8 +212,8 @@ func TestChatBadParamsRotatesWithoutPenalty(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	p.SetCredits("bad", 2000) // 确定性源 r=0 → 先选 bad
-	p.SetCredits("good", 1000)
+	p.SetCredits("bad", 2000, 0) // 确定性源 r=0 → 先选 bad
+	p.SetCredits("good", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
@@ -275,6 +278,17 @@ func TestChatNonStreamAggregates(t *testing.T) {
 	if msg["content"] != "你好" {
 		t.Errorf("content=%q", msg["content"])
 	}
+	st, ok := h.cfg.Pool.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 1 ||
+		st.TokenUsage.PromptTokens != 1 || st.TokenUsage.CompletionTokens != 1 || st.TokenUsage.TotalTokens != 2 {
+		t.Errorf("token usage=%+v", st.TokenUsage)
+	}
+	if st.TokenUsage.LastLatencyMs < 1 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond <= 0 {
+		t.Errorf("latest performance=%+v", st.TokenUsage)
+	}
 }
 
 func TestChatStreamPassthrough(t *testing.T) {
@@ -298,6 +312,17 @@ func TestChatStreamPassthrough(t *testing.T) {
 	if !strings.Contains(body, "你好") || !strings.Contains(body, "data: [DONE]") {
 		t.Errorf("body=%q", body)
 	}
+	st, ok := h.cfg.Pool.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 1 ||
+		st.TokenUsage.PromptTokens != 1 || st.TokenUsage.CompletionTokens != 1 || st.TokenUsage.TotalTokens != 2 {
+		t.Errorf("token usage=%+v", st.TokenUsage)
+	}
+	if st.TokenUsage.LastLatencyMs < 1 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond <= 0 {
+		t.Errorf("latest performance=%+v", st.TokenUsage)
+	}
 }
 
 func TestChatRotatesOnHardCredit(t *testing.T) {
@@ -314,8 +339,8 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
 	// 让 bad 积分更高被先选中
-	p.SetCredits("bad", 2000)
-	p.SetCredits("good", 1000)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
@@ -329,6 +354,13 @@ func TestChatRotatesOnHardCredit(t *testing.T) {
 	st, _ := p.Status("bad")
 	if !st.Cooling || st.Reason == "" {
 		t.Errorf("bad account should be cooling: %+v", st)
+	}
+	if st.TokenUsage.RequestCount != 1 || st.TokenUsage.UsageCount != 0 {
+		t.Errorf("bad token usage=%+v", st.TokenUsage)
+	}
+	good, _ := p.Status("good")
+	if good.TokenUsage.RequestCount != 1 || good.TokenUsage.TotalTokens != 2 {
+		t.Errorf("good token usage=%+v", good.TokenUsage)
 	}
 }
 
@@ -350,8 +382,8 @@ func TestChatSoftCoolsOnRateLimitBody(t *testing.T) {
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
 	// 让 bad 积分更高被先选中（与 TestChatRotatesOnHardCredit 同一确定性手法）。
-	p.SetCredits("bad", 2000)
-	p.SetCredits("good", 1000)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
 	const soft = 45 * time.Second
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: soft})
 
@@ -458,8 +490,8 @@ func TestNewHandlerSoftCooldownDefault(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	p.SetCredits("bad", 2000)
-	p.SetCredits("good", 1000)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up}) // 不注入 SoftCooldown
 
 	rec := httptest.NewRecorder()
@@ -591,8 +623,8 @@ func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	p.SetCredits("bad", 2000) // bad 积分高，确定性源 → 先被选中
-	p.SetCredits("good", 1000)
+	p.SetCredits("bad", 2000, 0) // bad 积分高，确定性源 → 先被选中
+	p.SetCredits("good", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
 	rec := httptest.NewRecorder()
@@ -641,8 +673,8 @@ func TestChat6004ModelResetCoolsToParsedTime(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	p.SetCredits("bad", 2000)
-	p.SetCredits("good", 1000)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
 	// 隔离对 breaker 的干扰：熔断阈值默认 3，一次失败不触发。
 	h := NewHandler(Config{Pool: p, Upstream: up})
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
@@ -689,8 +721,8 @@ func TestChat6004WithoutResetFallsBackToBackoff(t *testing.T) {
 		&auth.Auth{UID: "bad", AccessToken: "at-bad", ExpiresAt: 9999999999},
 		&auth.Auth{UID: "good", AccessToken: "at-good", ExpiresAt: 9999999999},
 	)
-	p.SetCredits("bad", 2000)
-	p.SetCredits("good", 1000)
+	p.SetCredits("bad", 2000, 0)
+	p.SetCredits("good", 1000, 0)
 	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: time.Minute})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
@@ -1041,7 +1073,7 @@ func TestAPIKeyAuth(t *testing.T) {
 
 func TestStatusEndpoint(t *testing.T) {
 	p := testPoolWith(&auth.Auth{UID: "u1", Nickname: "nick", AccessToken: "at", ExpiresAt: 9999999999})
-	p.SetCredits("u1", 42)
+	p.SetCredits("u1", 42, 0)
 	h := NewHandler(Config{Pool: p, Upstream: upstream.New()})
 	req := httptest.NewRequest("GET", "/status", nil)
 	rec := httptest.NewRecorder()

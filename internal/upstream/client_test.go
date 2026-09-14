@@ -219,7 +219,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		}, nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1", EnterpriseID: "e1"}
-	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -268,7 +268,7 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 		t.Errorf("infos[0].DefaultEffort=%q want high", infos[0].DefaultEffort)
 	}
 	// glm-5.2 只支持 low/high，请求 max → 降级为 high
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`))
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -287,7 +287,7 @@ func TestChatStreamHardCreditError(t *testing.T) {
 		return jsonResp(402, `{"code":1,"msg":"余额不足"}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	_, status, respBody, err := c.ChatStream(a, []byte(`{}`))
+	_, status, respBody, err := c.ChatStream(a, []byte(`{}`), "")
 	if status != 402 {
 		t.Errorf("status=%d", status)
 	}
@@ -326,7 +326,7 @@ func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
 	c.IdleTimeout = 5 * time.Second
 
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`))
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -363,12 +363,15 @@ func TestUserResourceAggregation(t *testing.T) {
 		]}}}}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	remain, err := c.UserResource(a)
+	remain, total, err := c.UserResource(a)
 	if err != nil {
 		t.Fatalf("resource: %v", err)
 	}
 	if remain != 1500 {
 		t.Errorf("remain=%d want 1500", remain)
+	}
+	if total != 3000 {
+		t.Errorf("total=%d want 3000", total)
 	}
 }
 
@@ -378,9 +381,12 @@ func TestUserResourceNegativeClamped(t *testing.T) {
 			{"PackageName":"p","CycleCapacitySize":100,"CycleCapacityRemain":-50,"CycleCapacityUsed":150}
 		]}}}}`), nil
 	})
-	remain, err := c.UserResource(&auth.Auth{AccessToken: "at"})
+	remain, total, err := c.UserResource(&auth.Auth{AccessToken: "at"})
 	if err != nil || remain != 0 {
 		t.Errorf("remain=%d err=%v, want 0 (clamped)", remain, err)
+	}
+	if total != 100 {
+		t.Errorf("total=%d want 100", total)
 	}
 }
 
@@ -447,7 +453,7 @@ func TestChatStreamRoutesToChatHTTP(t *testing.T) {
 		}, nil
 	})}
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{}`))
+	rc, status, _, err := c.ChatStream(a, []byte(`{}`), "")
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
