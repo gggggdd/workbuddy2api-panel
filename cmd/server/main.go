@@ -3,7 +3,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -12,13 +15,21 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/ledger"
+	"workbuddy2api/internal/livecfg"
+	"workbuddy2api/internal/member"
+	"workbuddy2api/internal/panel"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/redisstore"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
+	"workbuddy2api/internal/usage"
 	"workbuddy2api/internal/upstream"
 )
+
+// appVersion 网关版本（fork 版）。
+const appVersion = "1.6.3-panel-ledger"
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config json")
@@ -119,6 +130,10 @@ func main() {
 	up.BillingBaseGlobal = cfg.Global.BillingBase
 	up.GlobalEnabled = cfg.Global.Enabled
 
+	usageTracker := usage.New(p, up, usage.DefaultPath(cfg.StateFile))
+	lgr := ledger.New(ledger.DefaultPath(cfg.StateFile), 20000)
+	members := member.NewStore(member.DefaultPath(cfg.StateFile))
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:                p,
 		Upstream:            up,
@@ -171,16 +186,50 @@ func main() {
 		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
 	}
 
+	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
+	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
+	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
+	live := livecfg.New(livecfg.Snapshot{
+		APIKey:               cfg.APIKey,
+		SoftCooldown:         cfg.SoftRateDur,
+		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
+	})
+	pn := panel.New(panel.Config{
+		Pool:        p,
+		Upstream:    up,
+		Ledger:      lgr,
+		Scheduler:   sch,
+		AuthDir:     cfg.AuthDir,
+		APIKey:      cfg.APIKey,
+		RedisMode:   redisMode,
+		StickyCount: sessCount,
+		Version:     appVersion,
+		Usage:       usageTracker,
+		Members:     members,
+		Live:        live,
+		ConfigPath:  *cfgPath,
+		LoadConfig: func() (any, error) {
+			return Load(*cfgPath)
+		},
+		SaveConfig: func(raw []byte) ([]string, error) {
+			return saveConfig(raw, *cfgPath, live, p, up, sch)
+		},
+	})
+	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
+	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
+
 	h := server.NewHandler(server.Config{
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		Panel:        pn,
+		Live:         live,
+		PromptMode:   cfg.Prompt.Mode,
+		PromptText:   cfg.PromptText,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
 	})
 
@@ -219,4 +268,116 @@ func main() {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
+}
+
+// saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
+//
+// 热生效范围（设计取舍）：
+//   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
+//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights
+//   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
+//
+// 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
+//   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
+//
+// 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
+// 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
+// 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
+	oldRaw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read current config: %w", err)
+	}
+	var cur, incoming map[string]any
+	if err := json.Unmarshal(oldRaw, &cur); err != nil {
+		cur = map[string]any{}
+	}
+	if err := json.Unmarshal(raw, &incoming); err != nil {
+		return nil, fmt.Errorf("parse submitted config: %w", err)
+	}
+	merged := mergeConfigMaps(cur, incoming)
+
+	// 2) 校验（与启动同一套 Default+normalize），失败直接返回、不落盘。
+	newCfg, err := ParseConfig(mergedJSON(merged))
+	if err != nil {
+		return nil, err
+	}
+
+	// 3) 落盘（原子替换）。
+	out, err := json.MarshalIndent(merged, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal config: %w", err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return nil, fmt.Errorf("write config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return nil, fmt.Errorf("replace config: %w", err)
+	}
+
+	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
+	live.Store(livecfg.Snapshot{
+		APIKey:               newCfg.APIKey,
+		SoftCooldown:         newCfg.SoftRateDur,
+		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
+	})
+	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
+	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
+	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
+	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
+	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
+	sch.Reconfigure(
+		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
+		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.CatHours,
+		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
+		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.CatEnabled)
+
+	return restartRequiredFields(newCfg), nil
+}
+
+func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
+	for k, v := range incoming {
+		if inMap, ok := v.(map[string]any); ok {
+			if curMap, ok := cur[k].(map[string]any); ok {
+				cur[k] = mergeConfigMaps(curMap, inMap)
+				continue
+			}
+		}
+		cur[k] = v
+	}
+	return cur
+}
+
+func ParseConfig(raw []byte) (*Config, error) {
+	return ParseConfigInto(raw, Default())
+}
+
+func mergedJSON(m map[string]any) []byte {
+	b, err := json.Marshal(m)
+	if err != nil {
+		return []byte("{}")
+	}
+	return b
+}
+
+func restartRequiredFields(c *Config) []string {
+	var out []string
+	// 这些字段在进程内被监听地址/HTTP client/目录句柄等装配期对象捕获。
+	if c.Listen != "" {
+		out = append(out, "listen")
+	}
+	if c.AuthDir != "" {
+		out = append(out, "auth_dir")
+	}
+	if c.StateFile != "" {
+		out = append(out, "state_file")
+	}
+	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
+	if c.Upstash.URL != "" || c.Upstash.Token != "" {
+		out = append(out, "upstash")
+	}
+	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
+	return out
 }

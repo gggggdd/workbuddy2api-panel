@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.23-alpine AS build
 WORKDIR /src
+# 国内构建加速：goproxy.cn 主用（境外 proxy.golang.org 在腾讯云近乎不通）
+ENV GOPROXY=https://goproxy.cn,direct
 COPY go.mod ./
 RUN go mod download
 COPY . .

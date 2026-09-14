@@ -371,3 +371,13 @@ func (c *Config) normalizePrompt() error {
 	}
 	return nil
 }
+
+func ParseConfigInto(raw []byte, c *Config) (*Config, error) {
+	if err := json.Unmarshal(raw, c); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	if err := c.normalize(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}

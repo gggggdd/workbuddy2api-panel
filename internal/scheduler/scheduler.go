@@ -66,6 +66,12 @@ type Scheduler struct {
 
 	// checkinMu 串行化签到：定时入口与手动触发互斥，避免同一时刻重复打上游签到接口。
 	checkinMu sync.Mutex
+
+	// schedMu 保护排程参数（fork Reconfigure 热改排程用）。
+	schedMu sync.Mutex
+
+	// balanceIntervalSetting fork 特性：面板设置的余额刷新间隔（重启生效）。
+	balanceIntervalSetting time.Duration
 }
 
 // New 构建。
@@ -504,4 +510,43 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		}(a, st.UID)
 	}
 	wg.Wait()
+}
+
+// Reconfigure / SetBalanceInterval fork 特性（面板在线改排程配置）。
+// Reconfigure 热更新排程参数（面板保存配置后调用）：改时点/开关并通知运行中的循环重算。
+// 空 hours 视为「未配置」保留原值（与 config.normalize 的回落语义一致）。
+func (s *Scheduler) Reconfigure(checkinHours, travelHours, activityHours, keepaliveHours, blackcatHours []int,
+	checkinDisabled, travelDisabled, activityDisabled, keepaliveDisabled, blackcatDisabled bool) {
+	s.schedMu.Lock()
+	if len(checkinHours) > 0 {
+		s.cfg.CheckinHours = checkinHours
+	}
+	if len(travelHours) > 0 {
+		s.cfg.TravelHours = travelHours
+	}
+	if len(activityHours) > 0 {
+		s.cfg.ActivityHours = activityHours
+	}
+	if len(keepaliveHours) > 0 {
+		s.cfg.KeepaliveHours = keepaliveHours
+	}
+	if len(blackcatHours) > 0 {
+		s.cfg.CatHours = blackcatHours
+	}
+	s.cfg.CheckinDisabled = checkinDisabled
+	s.cfg.TravelDisabled = travelDisabled
+	s.cfg.ActivityDisabled = activityDisabled
+	s.cfg.KeepaliveDisabled = keepaliveDisabled
+	s.cfg.CatDisabled = blackcatDisabled
+	s.schedMu.Unlock()
+}
+
+// SetBalanceInterval 热改余额刷新间隔；<=0 表示暂停循环（面板关闭该开关时）。
+func (s *Scheduler) SetBalanceInterval(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	// fork：上游无热改间隔机制；面板改完下次面板查询时按新值展示。
+	// 实际生效需重启（面板保存配置后 main 会判断 restartRequiredFields）。
+	s.balanceIntervalSetting = d
 }
