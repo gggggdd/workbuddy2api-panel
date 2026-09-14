@@ -2,6 +2,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/ledger"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/member"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
@@ -38,6 +41,16 @@ type Config struct {
 	RedisMode    string
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
+
+	// Ledger 积分账本（可选；nil = 不记账，零开销）。
+	Ledger ledger.LedgerStore
+
+	// Members 成员密钥与用量记账（可选；nil = 关闭成员体系，行为与从前一致）。
+	//
+	// 权限边界（有意为之）：成员密钥只能访问 /v1/chat/completions 与 /v1/models；
+	// /status 与 /panel/api/* 一律要求管理员 api_key——成员不该看到账号池、
+	// 冷却状态与其他成员信息。管理员 api_key 始终可通过任何端点。
+	Members *member.Store
 
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
@@ -125,14 +138,73 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }
 
+// authResult 鉴权结果。
+type authResult struct {
+	ok       bool
+	memberID string // 命中的成员 ID；管理员或未启用成员体系时为空
+}
+
+// authenticate 解析请求身份。
+//
+// 规则（管理员 api_key 恒优先）：
+//   - 管理员密钥 → 放行全部端点，不计入任何成员用量；
+//   - 成员密钥   → 仅放行 memberAllowed 白名单端点，记为该成员的用量；
+//   - api_key 为空且无成员体系 → 放行（与从前一致的"未启用鉴权"语义）；
+//   - api_key 为空但启用了成员体系 → 仍然只认成员密钥（否则成员隔离形同虚设）。
+//
+// 为避免"先用管理员密钥比一遍、再用成员密钥比一遍"造成的时序差异被用于
+// 探测密钥类型，两条路径都会完整执行比较（成员查找恒遍历全部成员）。
+func (h *Handler) authenticate(r *http.Request) authResult {
+	key := h.loadLive().APIKey
+	if httpauth.VerifyBearer(r, key) {
+		// key == "" 时 VerifyBearer 恒真：此时若无成员体系即"未启用鉴权"，
+		// 直接放行；若启用了成员体系则继续尝试成员解析（见下方）。
+		if key != "" || h.cfg.Members == nil {
+			return authResult{ok: true}
+		}
+	}
+	if h.cfg.Members != nil {
+		if m := h.cfg.Members.Resolve(r); m != nil {
+			return authResult{ok: true, memberID: m.ID}
+		}
+	}
+	return authResult{}
+}
+
+// memberAllowed 成员密钥可访问的端点（管理员不受限）。
+// 有意排除 /status 与 /panel/*：成员不应看到账号池、冷却状态与其他成员。
+func memberAllowed(path string) bool {
+	return path == "/v1/chat/completions" || path == "/v1/models"
+}
+
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		res := h.authenticate(r)
+		if !res.ok {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
+		if res.memberID != "" && !memberAllowed(r.URL.Path) {
+			writeOpenAIError(w, http.StatusForbidden, "member_forbidden",
+				"成员密钥仅可访问 /v1/chat/completions 与 /v1/models")
+			return
+		}
+		if res.memberID != "" {
+			r = r.WithContext(context.WithValue(r.Context(), memberCtxKey{}, res.memberID))
+		}
 		next(w, r)
 	}
+}
+
+// memberCtxKey 成员身份的 context 键（私有类型，避免与其他包的键冲突）。
+type memberCtxKey struct{}
+
+// memberOf 取出当前请求的成员 ID（管理员或未启用时为 ""）。
+func memberOf(r *http.Request) string {
+	if v, ok := r.Context().Value(memberCtxKey{}).(string); ok {
+		return v
+	}
+	return ""
 }
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
@@ -316,6 +388,29 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	tried := map[string]bool{}
 	var lastErr error
 
+	// 成员用量记账：局部变量 + defer 闭包，任何出口（成功/失败/panic）都记一次请求。
+	// 成功时 charged 为该次 usage.credit，失败时只计 Errors（不记消耗）。
+	mid := memberOf(r)
+	charged := 0.0
+	succeeded := false
+	if mid != "" && h.cfg.Members != nil {
+		defer func() { h.cfg.Members.Record(mid, charged, succeeded) }()
+	}
+	// 积分账本（去处）：请求收尾时按 (账号, 模型, 成员) 记一笔消耗。
+	// 成功才记；失败请求不计消耗。choreUID 在轮换循环里落到最终成功号。
+	var choreUID, choreNick, choreModel string
+	if h.cfg.Ledger != nil {
+		defer func() {
+			if succeeded && charged > 0 && choreUID != "" {
+				h.cfg.Ledger.Append(ledger.Entry{
+					At: time.Now(), UID: choreUID, Nick: choreNick,
+					Kind: ledger.KindChat, Delta: -charged,
+					Model: choreModel, Member: mid,
+				})
+			}
+		}()
+	}
+
 	// 会话粘性：从请求体提取会话键并解析绑定号（找不到/无效则 stickyUID 为空，走普通轮换）。
 	sessKey := ""
 	stickyUID := ""
@@ -389,6 +484,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		st.uid = acct.UID
+		choreUID, choreNick, choreModel = acct.UID, acct.Nickname, peek.Model
 		tried[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
@@ -464,6 +560,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			_ = upstream.Stream(w, stats)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			charged = stats.Credit()
+			succeeded = true
 			rc.Close()
 			return
 		}
@@ -478,6 +576,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		charged = completionCredit(resp)
+		succeeded = true
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"

@@ -41,3 +41,25 @@ func digest(s string) []byte {
 	sum := sha256.Sum256([]byte(s))
 	return sum[:]
 }
+
+// KeyEqual 常量时间比较两个密钥是否相等（供成员多密钥匹配复用同一口径）。
+// 与 VerifyBearer 的区别：不做"空 = 放行"约定——成员密钥恒非空，
+// 空输入在此视为不匹配，避免空密钥意外成为通配成员。
+func KeyEqual(a, b string) bool {
+	if a == "" || b == "" {
+		// 仍走一次比较，保持耗时形状一致。
+		subtle.ConstantTimeCompare(digest(""), digest(""))
+		return false
+	}
+	return subtle.ConstantTimeCompare(digest(a), digest(b)) == 1
+}
+
+// BearerToken 取出请求头中的 Bearer 令牌；无该方案时 ok=false。
+// 供需要"用令牌本身做身份解析"的调用方使用（如成员维度记账）。
+func BearerToken(r *http.Request) (string, bool) {
+	authz := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authz, bearerPrefix) {
+		return "", false
+	}
+	return authz[len(bearerPrefix):], true
+}

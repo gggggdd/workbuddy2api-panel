@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/ledger"
 )
 
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
@@ -34,11 +35,19 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 	// 0. 补签保连登：昨日漏签且有补签卡则补上（连续天数一断就要重攒 7 天）。
 	s.makeupYesterday(a)
 	// 0.5 礼包/补偿（每号一次，无则业务错误静默跳过）。
-	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil {
+	if credit, err := s.cfg.Upstream.ClaimGift(a); err == nil && credit > 0 {
 		log.Printf("streak-bonus %s: 🎊 新手礼包 +%dc", a.UID, credit)
+		if s.lg() != nil {
+			s.lg().Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+				Kind: ledger.KindGift, Delta: float64(credit), Note: "新手礼包"})
+		}
 	}
-	if credit, err := s.cfg.Upstream.ClaimCompensation(a); err == nil {
+	if credit, err := s.cfg.Upstream.ClaimCompensation(a); err == nil && credit > 0 {
 		log.Printf("streak-bonus %s: 🎊 补偿领取 +%dc", a.UID, credit)
+		if s.lg() != nil {
+			s.lg().Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+				Kind: ledger.KindCompensation, Delta: float64(credit), Note: "活动补偿"})
+		}
 	}
 
 	full, err := s.cfg.Upstream.GrowthStreakFull(a)
@@ -63,6 +72,10 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 		}
 		log.Printf("streak-bonus %s: ★ 兑换 %s 档（+%dc +%de 卡×%d 抽奖×%d）",
 			a.UID, tier.Tier, tier.Credit, tier.Energy, tier.Cards, tier.Chances)
+		if s.lg() != nil && tier.Credit > 0 {
+			s.lg().Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+				Kind: ledger.KindTask, Delta: float64(tier.Credit), Task: tier.Tier, Note: "连登兑换"})
+		}
 	}
 	// 抽奖：按当前 chances 全抽完（兑换刚发的次数已在服务端累加）。
 	chances, err := s.cfg.Upstream.LotteryChances(a)

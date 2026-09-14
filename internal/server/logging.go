@@ -68,7 +68,8 @@ type chatStatsReader struct {
 	seen     bool // 已见过首个 data 帧（TTFB 只记一次）
 	hasUsage bool // 末帧是否带 usage
 	tokens   int
-	pend     []byte // 已读未返回的行缓存
+	credit   float64 // usage.credit（成员记账用；无 usage 时为 0）
+	pend     []byte  // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -81,6 +82,9 @@ func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.tokens, s.hasUsage }
+
+// Credit 返回末帧 usage.credit（成员维度记账；无该字段时为 0）。
+func (s *chatStatsReader) Credit() float64 { return s.credit }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
@@ -98,7 +102,8 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	var chunk struct {
 		Usage *struct {
-			CompletionTokens int `json:"completion_tokens"`
+			CompletionTokens int     `json:"completion_tokens"`
+			Credit           float64 `json:"credit"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
@@ -106,6 +111,7 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	s.hasUsage = true
 	s.tokens = chunk.Usage.CompletionTokens
+	s.credit = chunk.Usage.Credit
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
@@ -148,6 +154,19 @@ func completionTokens(resp map[string]any) int {
 		return -1
 	}
 	return int(v)
+}
+
+// completionCredit 从 Aggregate 返回的响应中提取 usage.credit（成员记账用）；缺失返回 0。
+func completionCredit(resp map[string]any) float64 {
+	u, ok := resp["usage"].(map[string]any)
+	if !ok {
+		return 0
+	}
+	v, ok := u["credit"].(float64)
+	if !ok || v < 0 {
+		return 0
+	}
+	return v
 }
 
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。

@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1
 FROM golang:1.23-alpine AS build
 WORKDIR /src
+# 国内网络无法直连 proxy.golang.org，改用 goproxy.cn（无法访问时可自行替换或删除本行）。
+ENV GOPROXY=https://goproxy.cn,direct
 COPY go.mod ./
 RUN go mod download
 COPY . .

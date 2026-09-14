@@ -1,0 +1,240 @@
+// Package ledger 积分账本：记录积分来源（签到/任务/旅行/礼包）与去处（per-request 消耗），
+// 分账号统计。内存为主 + 原子落盘持久化（与 pool/state 同模式），重启不丢账。
+package ledger
+
+import (
+	"encoding/json"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+	"sync"
+	"time"
+)
+
+// Kind 条目类型。方向由 Delta 符号决定：正 = 来源（入账），负 = 去处（消耗）。
+type Kind string
+
+const (
+	KindChat         Kind = "chat"         // 去处：对话消耗（usage.credit）
+	KindCheckin      Kind = "checkin"      // 来源：每日签到
+	KindTask         Kind = "task"         // 来源：任务奖励（含一键完成自动领奖）
+	KindTravel       Kind = "travel"       // 来源：猫猫旅行到站奖励
+	KindGift         Kind = "gift"         // 来源：新手礼包
+	KindCompensation Kind = "compensation" // 来源：活动补偿
+	KindAdjust       Kind = "adjust"       // 校准：账本推算与余额快照的未知差额
+)
+
+// Entry 单条积分流水。
+type Entry struct {
+	At      time.Time `json:"at"`                // 发生时刻
+	UID     string    `json:"uid"`               // 账号 uid（完整）
+	Nick    string    `json:"nick,omitempty"`    // 账号昵称（记入时快照）
+	Kind    Kind      `json:"kind"`              // 类型
+	Delta   float64   `json:"delta"`             // 变动量：正=入账，负=消耗
+	Model   string    `json:"model,omitempty"`   // chat: 模型名
+	Task    string    `json:"task,omitempty"`    // task: 任务 code
+	Member  string    `json:"member,omitempty"`  // chat: 成员密钥 ID（管理员/直连为空）
+	Balance float64   `json:"balance,omitempty"` // 记账后该账号已知余额（可得时填）
+	Note    string    `json:"note,omitempty"`    // 备注（如 adjust 的差额说明）
+}
+
+// Store 账本。并发安全；写入内存 + 去抖落盘（合并写，避免高频 chat 拖慢请求路径）。
+type Store struct {
+	mu      sync.Mutex
+	entries []Entry
+	max     int        // 上限（滚动丢弃最旧）
+	dirty   bool
+	path    string     // 持久化文件；空 = 纯内存
+	saveMu  sync.Mutex // 落盘串行化
+}
+
+// New 创建账本。maxN <=0 时默认 20000 条；path 为空则不持久化。
+func New(path string, maxN int) *Store {
+	if maxN <= 0 {
+		maxN = 20000
+	}
+	s := &Store{max: maxN, path: path}
+	if path != "" {
+		s.load()
+	}
+	return s
+}
+
+// load 启动时恢复历史账目。
+func (s *Store) load() {
+	raw, err := os.ReadFile(s.path)
+	if err != nil {
+		return // 首次运行无文件，正常
+	}
+	var st struct {
+		Entries []Entry `json:"entries"`
+	}
+	if err := json.Unmarshal(raw, &st); err != nil {
+		log.Printf("ledger: 恢复失败（忽略，账本重开）: %v", err)
+		return
+	}
+	s.entries = st.Entries
+	log.Printf("ledger: 恢复 %d 条积分流水", len(s.entries))
+}
+
+// Append 记一条流水。delta 必须非零（零变动不入账）。
+func (s *Store) Append(e Entry) {
+	if e.Delta == 0 {
+		return
+	}
+	if e.At.IsZero() {
+		e.At = time.Now()
+	}
+	s.mu.Lock()
+	s.entries = append(s.entries, e)
+	if n := len(s.entries); n > s.max {
+		// 滚动丢弃最旧的 1/8，避免频繁截断
+		cut := s.max / 8
+		if cut < 1 {
+			cut = 1
+		}
+		s.entries = append([]Entry(nil), s.entries[n-cut:]...)
+	}
+	s.dirty = true
+	s.mu.Unlock()
+
+	go s.saveSoon()
+}
+
+// saveSoon 落盘去抖：500ms 内的连续写入合并为一次。
+func (s *Store) saveSoon() {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	time.Sleep(500 * time.Millisecond)
+	s.mu.Lock()
+	if !s.dirty {
+		s.mu.Unlock()
+		return
+	}
+	entries := make([]Entry, len(s.entries))
+	copy(entries, s.entries)
+	s.dirty = false
+	s.mu.Unlock()
+
+	if s.path == "" {
+		return
+	}
+	raw, err := json.MarshalIndent(struct {
+		Entries []Entry `json:"entries"`
+	}{entries}, "", " ")
+	if err != nil {
+		return
+	}
+	tmp := s.path + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(s.path), 0o755); err != nil {
+		log.Printf("ledger: 落盘失败: %v", err)
+		return
+	}
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		log.Printf("ledger: 落盘失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, s.path); err != nil {
+		log.Printf("ledger: 落盘失败: %v", err)
+	}
+}
+
+// Query 查询条件。零值字段不过滤；Since/Until 为空不限时间。
+type Query struct {
+	UID    string // 按账号
+	Kind   Kind   // 按类型
+	Member string // 按成员（仅 chat 类有意义）
+	Since  time.Time
+	Until  time.Time
+	Limit  int // 返回条数上限（时间倒序取最近 N 条；<=0 不限）
+}
+
+// List 按条件查询（时间倒序）。
+func (s *Store) List(q Query) []Entry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Entry
+	for i := len(s.entries) - 1; i >= 0; i-- {
+		e := s.entries[i]
+		if q.UID != "" && e.UID != q.UID {
+			continue
+		}
+		if q.Kind != "" && e.Kind != q.Kind {
+			continue
+		}
+		if q.Member != "" && e.Member != q.Member {
+			continue
+		}
+		if !q.Since.IsZero() && e.At.Before(q.Since) {
+			continue
+		}
+		if !q.Until.IsZero() && e.At.After(q.Until) {
+			continue
+		}
+		out = append(out, e)
+		if q.Limit > 0 && len(out) >= q.Limit {
+			break
+		}
+	}
+	return out
+}
+
+// AccountSummary 分账号汇总：入账/消耗/净额。
+type AccountSummary struct {
+	UID       string  `json:"uid"`
+	Nick      string  `json:"nick"`
+	Inflow    float64 `json:"inflow"`      // 来源合计（正数）
+	Outflow   float64 `json:"outflow"`     // 去处合计（正数，取绝对值便于展示）
+	Net       float64 `json:"net"`         // 净额 = inflow - outflow
+	ChatCount int     `json:"chat_count"`  // 对话请求数
+}
+
+// Summarize 分账号汇总（时间范围同 Query）。
+func (s *Store) Summarize(q Query) []AccountSummary {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	acc := map[string]*AccountSummary{}
+	var order []string
+	for _, e := range s.entries {
+		if !q.Since.IsZero() && e.At.Before(q.Since) {
+			continue
+		}
+		if !q.Until.IsZero() && e.At.After(q.Until) {
+			continue
+		}
+		a := acc[e.UID]
+		if a == nil {
+			a = &AccountSummary{UID: e.UID, Nick: e.Nick}
+			acc[e.UID] = a
+			order = append(order, e.UID)
+		}
+		if e.Nick != "" {
+			a.Nick = e.Nick
+		}
+		if e.Delta > 0 {
+			a.Inflow += e.Delta
+		} else {
+			a.Outflow += -e.Delta
+			if e.Kind == KindChat {
+				a.ChatCount++
+			}
+		}
+		a.Net += e.Delta
+	}
+	sort.Strings(order)
+	out := make([]AccountSummary, 0, len(order))
+	for _, uid := range order {
+		out = append(out, *acc[uid])
+	}
+	return out
+}
+
+// Totals 全局汇总（时间范围内）。
+func (s *Store) Totals(q Query) (inflow, outflow float64) {
+	for _, a := range s.Summarize(q) {
+		inflow += a.Inflow
+		outflow += a.Outflow
+	}
+	return
+}

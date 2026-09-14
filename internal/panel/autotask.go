@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/ledger"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
@@ -263,6 +264,10 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 			resp["claimed"] = true
 			resp["credit"] = credit
 			resp["energy"] = energy
+			if p.cfg.Ledger != nil && credit > 0 {
+				p.cfg.Ledger.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+					Kind: ledger.KindTask, Delta: float64(credit), Task: act.TaskCode, Note: "任务奖励"})
+			}
 			if credit > 0 || energy > 0 {
 				resp["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
 			} else {
@@ -744,6 +749,10 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 				item["claimed"] = true
 				item["credit"] = credit
 				item["energy"] = energy
+				if p.cfg.Ledger != nil && credit > 0 {
+					p.cfg.Ledger.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+						Kind: ledger.KindTask, Delta: float64(credit), Task: act.TaskCode, Note: "任务奖励"})
+				}
 				if credit > 0 || energy > 0 {
 					item["message"] = msg + fmt.Sprintf("；已自动领奖 +%d 分 +%d 能", credit, energy)
 				} else {

@@ -559,8 +559,28 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	return out, nil
 }
 
+// UserUsage 账号的计费用量聚合（跨全部套餐求和）。
+// Used 是上游账单口径的累计已用积分，单调递增（套餐周期重置时归零），
+// 因此「两次采样的 Used 差值」即该区间真实消耗——涵盖网关内外的全部来源。
+type UserUsage struct {
+	Remain int64 // 剩余积分
+	Used   int64 // 累计已用
+	Size   int64 // 总量
+}
+
 // UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
 func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
+	u, err := c.UserResourceDetail(a)
+	if err != nil {
+		return 0, err
+	}
+	return u.Remain, nil
+}
+
+// UserResourceDetail 余额查询的完整形态：除剩余外还返回已用与总量。
+// remain 的聚合口径与 UserResource 一致（对既有调用方保持逐字相同的行为）；
+// used/size 按套餐逐项推导，与 credit 工具（cmd/credit）同一套语义。
+func (c *Client) UserResourceDetail(a *auth.Auth) (UserUsage, error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -572,12 +592,13 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 	}
 	data, err := c.billingJSON(a, http.MethodPost, billingMeterPath, body)
 	if err != nil {
-		return 0, err
+		return UserUsage{}, err
 	}
 	var resp struct {
 		Response struct {
 			Data struct {
-				Accounts []struct {
+				TotalDosage int64 `json:"TotalDosage"`
+				Accounts    []struct {
 					PackageName         string `json:"PackageName"`
 					CapacitySize        int64  `json:"CapacitySize"`
 					CapacityRemain      int64  `json:"CapacityRemain"`
@@ -590,8 +611,9 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, fmt.Errorf("resource parse: %w", err)
+		return UserUsage{}, fmt.Errorf("resource parse: %w", err)
 	}
+	var out UserUsage
 	for _, acct := range resp.Response.Data.Accounts {
 		var r int64
 		switch {
@@ -605,15 +627,90 @@ func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
 		if r < 0 {
 			r = 0
 		}
-		remain += r
+		out.Remain += r
+
+		// used/size 与 cmd/credit 的 packageRemainUsed 同口径：
+		// 有周期额度时以周期为准（remain 钳在 [0,size]，used 取 max(推导值, 上报值)）。
+		used, size := acct.CapacityUsed, acct.CapacitySize
+		if acct.CycleCapacitySize > 0 {
+			size = acct.CycleCapacitySize
+			used = size - r
+			if acct.CycleCapacityUsed > used {
+				used = acct.CycleCapacityUsed
+			}
+		} else if used == 0 && size > r {
+			used = size - r
+		}
+		if used < 0 {
+			used = 0
+		}
+		if size < 0 {
+			size = 0
+		}
+		out.Used += used
+		out.Size += size
 	}
-	return remain, nil
+	// TotalDosage 作总量下限；总量抬高后同步抬高已用，保持 used + remain = size 的一致性。
+	if d := resp.Response.Data.TotalDosage; d > out.Size {
+		out.Size = d
+		if derived := out.Size - out.Remain; derived > out.Used {
+			out.Used = derived
+		}
+	}
+	return out, nil
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	_, err := c.billingJSON(a, http.MethodPost, dailyCheckinPath, map[string]any{})
+	_, _, err := c.DailyCheckinCredit(a)
 	return err
+}
+
+// DailyCheckinCredit 签到并解析奖励积分。返回 (本次到账 credit, 签到后余额, err)。
+// 上游在 code!=0（已签到等）时 credit 为 0 且 err 非 nil；字段缺失按 0 处理不报错。
+func (c *Client) DailyCheckinCredit(a *auth.Auth) (credit, balance float64, err error) {
+	data, err := c.billingJSON(a, http.MethodPost, dailyCheckinPath, map[string]any{})
+	if err != nil {
+		return 0, 0, err
+	}
+	var resp struct {
+		Response struct {
+			Data struct {
+				Credit        any `json:"credit"`
+				RewardCredit  any `json:"reward_credit"`
+				Balance       any `json:"balance"`
+				TotalCredit   any `json:"total_credit"`
+				Remain        any `json:"remain"`
+			} `json:"Data"`
+		} `json:"Response"`
+	}
+	_ = json.Unmarshal(data, &resp)
+	credit = anyToF(resp.Response.Data.Credit)
+	if credit == 0 {
+		credit = anyToF(resp.Response.Data.RewardCredit)
+	}
+	balance = anyToF(resp.Response.Data.Balance)
+	if balance == 0 {
+		balance = anyToF(resp.Response.Data.TotalCredit)
+	}
+	if balance == 0 {
+		balance = anyToF(resp.Response.Data.Remain)
+	}
+	return credit, balance, nil
+}
+
+// anyToF 宽松 any→float64（上游不同域字段可能是数字或字符串）。
+func anyToF(v any) float64 {
+	switch x := v.(type) {
+	case float64:
+		return x
+	case string:
+		var f float64
+		if _, err := fmt.Sscanf(x, "%g", &f); err == nil {
+			return f
+		}
+	}
+	return 0
 }
 
 func truncate(s string, n int) string {

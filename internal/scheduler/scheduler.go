@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/ledger"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
@@ -23,6 +24,7 @@ import (
 type Config struct {
 	Pool           *pool.Pool
 	Upstream       *upstream.Client
+	Ledger         ledger.LedgerStore // 积分账本（可选；nil = 不记账）
 	CheckinHours   []int // 默认 [9, 21]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
@@ -152,6 +154,9 @@ const (
 	taskBlackcat
 )
 
+// lg 返回账本接口（未接线时返回 nil 接口，调用方需判空）。
+func (s *Scheduler) lg() ledger.LedgerStore { return s.cfg.Ledger }
+
 // nextWake 返回 now 之后最近的唤醒时刻，以及该时刻需要执行的全部任务。
 // 多类任务若配到同一小时（如签到与旅行都含 9），该时刻多类任务需一并执行。
 // 已显式禁用的任务不进候选（nextFire 对其零值返回零时间，nextWake 再跳过零时点）。
@@ -260,9 +265,19 @@ func (s *Scheduler) RunCheckinNow() {
 		if a == nil || a.RefreshToken == "" {
 			continue
 		}
-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-			log.Printf("checkin %s: %v", st.UID, err)
-			// 已签到等业务错误也继续走余额查询
+		credit, _ , cerr := s.cfg.Upstream.DailyCheckinCredit(a)
+		if cerr != nil {
+			// 已签到等业务错误也继续走余额查询；业务错误时 credit=0
+			credit = 0
+		}
+		if lg := s.lg(); lg != nil {
+			lg.Append(ledger.Entry{
+				At: time.Now(), UID: st.UID, Nick: a.Nickname,
+				Kind: ledger.KindCheckin, Delta: credit, Note: "每日签到",
+			})
+		}
+		if cerr != nil && credit == 0 {
+			log.Printf("checkin %s: %v", st.UID, cerr)
 		}
 		remain, err := s.cfg.Upstream.UserResource(a)
 		if err != nil {

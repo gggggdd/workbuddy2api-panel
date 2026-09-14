@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/ledger"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/member"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
@@ -25,6 +27,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
@@ -114,9 +117,21 @@ func main() {
 	// 出站 UA 覆盖（issue #42）：非空才改写，空 = 现状 clientUA（指纹净化考虑）。
 	up.UserAgent = cfg.Upstream.UserAgent
 
+	// 使用量采样器：周期记录各账号上游 used 计数，供面板 5h/24h 消耗看板。
+	// 采样文件与 state.json 同目录，跨重启保留（used 单调递增，历史样本仍有效）。
+	usageTracker := usage.New(p, up, usage.DefaultPath(cfg.StateFile))
+
+	// 积分账本：来源（签到/任务/旅行/礼包）+ 去处（per-request 消耗），分账号。
+	// 与 state.json 同目录 ledger.json，跨重启保留。
+	lgr := ledger.New(ledger.DefaultPath(cfg.StateFile), 20000)
+
+	// 成员密钥与用量：与 state.json 同目录的 members.json，跨重启保留。
+	members := member.NewStore(member.DefaultPath(cfg.StateFile))
+
 	sch := scheduler.New(scheduler.Config{
 		Pool:              p,
 		Upstream:          up,
+		Ledger:            lgr,
 		CheckinHours:      cfg.Schedule.CheckinHours,
 		TravelHours:       cfg.Schedule.TravelHours,
 		ActivityHours:     cfg.Schedule.ActivityHours,
@@ -175,12 +190,15 @@ func main() {
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Upstream:    up,
+		Ledger:      lgr,
 		Scheduler:   sch,
 		AuthDir:     cfg.AuthDir,
 		APIKey:      cfg.APIKey,
 		RedisMode:   redisMode,
 		StickyCount: sessCount,
 		Version:     appVersion,
+		Usage:       usageTracker,
+		Members:     members,
 		Live:        live,
 		ConfigPath:  *cfgPath,
 		LoadConfig: func() (any, error) {
@@ -206,12 +224,29 @@ func main() {
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		Members:      members,
+		Ledger:       lgr,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
+	go usageTracker.Start(ctx)
+	// 成员用量按请求累加，故周期落盘（同 pool 的 5s flush 节奏思想；
+	// 记账是内存操作，落盘失败只记错误、不影响请求）。
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				members.Flush()
+			}
+		}
+	}()
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
@@ -220,7 +255,8 @@ func main() {
 	}
 	go func() {
 		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
+		p.Flush()       // 信号触发：先落盘再做优雅停机
+		members.Flush() // 成员用量同样补一次落盘
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
