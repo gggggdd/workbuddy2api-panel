@@ -7,7 +7,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"workbuddy2api/internal/auth"
 )
 
 type Pool struct {
@@ -35,6 +35,14 @@ type Pool struct {
 	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
+	// pickSeq 选号单调序号源：仅 pick 在持 p.mu 写锁时自增并赋给 entry.usedSeq，
+	// 无需 atomic。见 entry.usedSeq 注释（解决 Windows 时钟精度导致的 LRU 失效）。
+	pickSeq uint64
+	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
+	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
+	stopCh chan struct{}
+	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
+	closeOnce sync.Once
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -163,7 +171,7 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 	p.randInt64N = fn
 }
 
-// Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
+// startFlusher 每 flushInterval 检查 dirty 标志，有变更则 saveLocked 落盘。
 func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -190,22 +198,6 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	if changed {
 		p.saveLocked()
 	}
-}
-
-// Remove 从池中移除账号并立即落盘（管理面板用）。返回被移除账号的凭证
-// （含 FilePath，供调用方删除 auth 文件）；uid 不存在返回 nil。
-// 在途请求的 Release 对已删条目是 no-op，无需等待。
-func (p *Pool) Remove(uid string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return nil
-	}
-	delete(p.byUID, uid)
-	p.dirty.Store(true)
-	p.saveLocked()
-	return e.a
 }
 
 // upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。

@@ -31,9 +31,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/ledger"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/ledger"
+	"workbuddy2api/internal/upstream"
 )
 
 // autoAction 一个可自动化的任务动作。
@@ -385,7 +385,7 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 		},
 		"stream": true,
 	})
-	rc, status, respBody, err := p.cfg.Upstream.ChatStream(a, body, "")
+	rc, status, respBody, err := p.cfg.Upstream.ChatStream(a, body, "", upstream.ChatMeta{})
 	if err != nil {
 		return "", fmt.Errorf("对话请求: %w", err)
 	}

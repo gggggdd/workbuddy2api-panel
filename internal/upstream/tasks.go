@@ -19,7 +19,7 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"workbuddy2api/internal/auth"
 )
 
 // growth 域任务路径（与 scripts/task_common.py 对齐）。
@@ -151,7 +151,7 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 	req.Header.Set("Origin", "https://www.workbuddy.cn")
 	req.Header.Set("Referer", "https://www.workbuddy.cn/profile/growth-center")
 	req.Header.Set("x-client-platform", "web")
-	if ua := c.userAgent(); ua != "" {
+	if ua := c.userAgent(nil); ua != "" {
 		req.Header.Set("User-Agent", ua)
 	}
 	if a.UID != "" {

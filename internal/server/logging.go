@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"workbuddy2api/internal/pool"
 )
 
 // chatSeq 进程级请求序号。
@@ -24,7 +24,7 @@ var chatLogEnabled = true
 // chatLogOut 聊天表格日志的输出目标。生产默认 os.Stdout；main 在启用管理面板时
 // 经 SetChatLogOutput 注入 MultiWriter，把每行镜像进 /panel/api/logs 的环形缓冲，
 // stdout 行为不变。需在开始服务前调用一次（无并发竞争窗口）。
-var chatLogOut io.Writer = os.Stdout
+var chatLogOut io.Writer // nil = 跟随当前 os.Stdout（测试可在运行期替换 os.Stdout 捕获）
 
 // SetChatLogOutput 替换聊天表格日志输出目标（仅 main 启动期调用一次）。
 func SetChatLogOutput(w io.Writer) { chatLogOut = w }
@@ -76,6 +76,7 @@ type chatStatsReader struct {
 	hasCompletionTokens bool
 	hasTotalTokens      bool
 	credit              float64 // usage.credit（成员记账用；无 usage 时为 0）
+	hasCredit           bool    // usage 里真的出现了 credit 字段（显式 0 也是合法观测）
 	pend                []byte  // 已读未返回的行缓存
 }
 
@@ -102,8 +103,8 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 	}
 }
 
-// Credit 返回末帧 usage.credit（成员维度记账；无该字段时为 0）。
-func (s *chatStatsReader) Credit() float64 { return s.credit }
+// Credit 返回末帧 usage.credit 与是否存在（缺失≠免费：ok=false 不能当 0 记账）。
+func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
@@ -124,12 +125,13 @@ func (s *chatStatsReader) parseSSELine(line string) {
 			PromptTokens     *int    `json:"prompt_tokens"`
 			CompletionTokens *int    `json:"completion_tokens"`
 			TotalTokens      *int    `json:"total_tokens"`
-			Credit           float64 `json:"credit"`
+			Credit           *float64 `json:"credit"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
 		return
 	}
+	s.hasUsage = true
 	if chunk.Usage.PromptTokens != nil {
 		s.hasPromptTokens = true
 		s.promptTokens = *chunk.Usage.PromptTokens
@@ -142,8 +144,9 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.hasTotalTokens = true
 		s.totalTokens = *chunk.Usage.TotalTokens
 	}
-	if chunk.Usage.Credit != 0 {
-		s.credit = chunk.Usage.Credit
+	if chunk.Usage.Credit != nil {
+		s.hasCredit = true
+		s.credit = *chunk.Usage.Credit
 	}
 }
 
@@ -277,7 +280,11 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	w := chatLogOut
+	if w == nil {
+		w = os.Stdout
+	}
+	fmt.Fprintf(w, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,

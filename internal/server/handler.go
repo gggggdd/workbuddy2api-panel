@@ -13,15 +13,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/ledger"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/member"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/httpauth"
+	"workbuddy2api/internal/livecfg"
+	"workbuddy2api/internal/ledger"
+	"workbuddy2api/internal/member"
+	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/prompt"
+	"workbuddy2api/internal/session"
+	"workbuddy2api/internal/upstream"
 )
 
 // Config handler 依赖。
@@ -539,7 +539,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 		attemptStarted := time.Now()
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, clientIP)
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, clientIP, upstream.ChatMeta{})
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
@@ -585,7 +585,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
-			charged = stats.Credit()
+			charged, _ = stats.Credit()
 			succeeded = true
 			rc.Close()
 			return
@@ -698,4 +698,25 @@ func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 			"code":    code,
 		},
 	})
+}
+
+// rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
+// 仅当 bare != 原 model 时由 chatCompletions 调用；body 不可解析时原样返回（不二次错误化）。
+func rewriteModel(body []byte, bare string) []byte {
+	if len(body) == 0 || bare == "" {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	if cur, ok := obj["model"].(string); !ok || cur == bare {
+		return body
+	}
+	obj["model"] = bare
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
 }

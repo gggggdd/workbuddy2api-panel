@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/upstream"
 )
 
 func mkSample(t int64, accts map[string]int64) sample {

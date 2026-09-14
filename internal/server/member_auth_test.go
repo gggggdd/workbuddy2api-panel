@@ -6,9 +6,9 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/member"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/member"
+	"workbuddy2api/internal/upstream"
 )
 
 // fakeUpstreamOK 供鉴权测试使用：模型列表与聊天都返回成功，

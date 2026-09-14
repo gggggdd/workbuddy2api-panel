@@ -26,7 +26,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
+	"workbuddy2api/internal/httpauth"
 )
 
 // bucketSec 用量分桶粒度：15 分钟。5h 窗口取最近 20 桶、24h 取最近 96 桶，

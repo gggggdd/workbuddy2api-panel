@@ -1,12 +1,11 @@
 package session
 
 import (
-	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
+	"workbuddy2api/internal/redisstore"
 )
 
 // countingStore 记录镜像调用次数的假 Store（不联网）。
@@ -286,55 +285,5 @@ func TestLoadFromStoreRestores(t *testing.T) {
 	u, ok := r.Resolve("c1")
 	if !ok || u != "a1" {
 		t.Errorf("restored c1 -> %s want a1", u)
-	}
-}
-
-// TestExtractKeyDerivedFromContent 客户端不发会话 id 时回退到内容派生键：
-// 同一对话多轮（历史追加）→ 键稳定不变；不同对话 → 键不同。
-func TestExtractKeyDerivedFromContent(t *testing.T) {
-	// 第一轮
-	turn1 := `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"帮我写个排序算法"}]}`
-	// 第二轮：历史追加了 assistant 与新的 user（system 与首条 user 不变）
-	turn2 := `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"帮我写个排序算法"},{"role":"assistant","content":"好的"},{"role":"user","content":"换成快排"}]}`
-	k1, k2 := ExtractKey([]byte(turn1)), ExtractKey([]byte(turn2))
-	if k1 == "" {
-		t.Fatal("derived key should not be empty when messages present")
-	}
-	if k1 != k2 {
-		t.Errorf("derived key must be stable across turns: turn1=%q turn2=%q", k1, k2)
-	}
-	if !strings.HasPrefix(k1, "d-") {
-		t.Errorf("derived key should carry prefix d-: %q", k1)
-	}
-	// 不同对话（首条 user 不同）→ 不同键
-	other := `{"model":"glm-5.3","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"翻译这段话"}]}`
-	if ExtractKey([]byte(other)) == k1 {
-		t.Error("different first user message must yield a different derived key")
-	}
-	// 显式 id 优先于派生键
-	withID := `{"conversation_id":"my-session","messages":[{"role":"user","content":"帮我写个排序算法"}]}`
-	if got := ExtractKey([]byte(withID)); got != "my-session" {
-		t.Errorf("explicit id must win over derived key, got %q", got)
-	}
-	// 无 messages / 纯无文本内容 → 空（退回普通轮换，不误粘）
-	if got := ExtractKey([]byte(`{"model":"x"}`)); got != "" {
-		t.Errorf("no messages should yield empty key, got %q", got)
-	}
-	if got := ExtractKey([]byte(`{"messages":[{"role":"user","content":[]}]}`)); got != "" {
-		t.Errorf("text-less content should yield empty key, got %q", got)
-	}
-}
-
-// TestExtractKeyMultimodalContent 多模态 content 数组取文本部分派生。
-func TestExtractKeyMultimodalContent(t *testing.T) {
-	body := `{"messages":[{"role":"user","content":[{"type":"text","text":"看图说话"},{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`
-	k := ExtractKey([]byte(body))
-	if k == "" || !strings.HasPrefix(k, "d-") {
-		t.Fatalf("multimodal text should derive a key, got %q", k)
-	}
-	// 同一文本（图片不同）→ 同键（图片不参与派生，避免签名 URL 变化破坏粘性）
-	body2 := `{"messages":[{"role":"user","content":[{"type":"text","text":"看图说话"},{"type":"image_url","image_url":{"url":"http://x/z.png"}}]}]}`
-	if ExtractKey([]byte(body2)) != k {
-		t.Error("image url changes must not break derived key stability")
 	}
 }

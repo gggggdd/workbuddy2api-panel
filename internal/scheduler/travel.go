@@ -7,9 +7,9 @@ import (
 	"log"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/ledger"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/ledger"
+	"workbuddy2api/internal/upstream"
 )
 
 const (

@@ -19,14 +19,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/ledger"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/member"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"workbuddy2api/internal/httpauth"
+	"workbuddy2api/internal/livecfg"
+	"workbuddy2api/internal/ledger"
+	"workbuddy2api/internal/member"
+	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/scheduler"
+	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/usage"
 )
 
 // Config 面板依赖（main 装配注入）。
@@ -396,16 +396,11 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0, len(infos))
 	for _, mi := range infos {
 		out = append(out, map[string]any{
-			"id":                   mi.ID,
-			"name":                 mi.Name,
-			"context_length":       mi.ContextWindow,
-			"max_output_tokens":    mi.MaxTokens,
-			"max_allowed_size":     mi.MaxAllowedSize,
-			"default_effort":       mi.DefaultEffort,
-			"supported_efforts":    mi.Efforts,
-			"can_disable_thinking": mi.CanDisableThinking,
-			"supports_reasoning":   mi.SupportsReasoning,
-			"credits":              mi.Credits,
+			"id":                mi.ID,
+			"name":              mi.Name,
+			"context_length":    mi.ContextWindow,
+			"max_output_tokens": mi.MaxTokens,
+			"supported_efforts": mi.Efforts,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
@@ -422,7 +417,7 @@ func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	p.cfg.Pool.Revive(uid)
+	p.cfg.Pool.ReviveDisabled(uid)
 	log.Printf("panel: revive uid=%s（人工清除禁用/冷却/熔断）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -456,13 +451,13 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	remain, total, err := p.cfg.Upstream.UserResourceRT(a)
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
+	p.cfg.Pool.ReenableIfCredits(uid, remain)
 	resp["credits"] = remain
 	resp["credits_total"] = total
 	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
@@ -477,12 +472,12 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, err := p.cfg.Upstream.UserResource(a)
+	remain, total, err := p.cfg.Upstream.UserResourceRT(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
-	p.cfg.Pool.SetCredits(uid, remain, total)
+	p.cfg.Pool.SetCredits(uid, remain)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
 

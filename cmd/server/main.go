@@ -3,12 +3,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"flag"
-	"fmt"
-	"io"
-	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -16,42 +11,25 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/ledger"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/member"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/panel"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/scheduler"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/server"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/redisstore"
+	"workbuddy2api/internal/scheduler"
+	"workbuddy2api/internal/server"
+	"workbuddy2api/internal/session"
+	"workbuddy2api/internal/upstream"
 )
 
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.6.3-panel"
-
 func main() {
-	cfgPath := flag.String("config", "config.json", "配置文件路径（默认当前目录 config.json；不存在时自动生成推荐配置）")
+	cfgPath := flag.String("config", "config.json", "path to config json")
 	flag.Parse()
 
 	cfg, err := Load(*cfgPath)
 	if err != nil {
-		// errors.Is 才能看穿 Load 里 fmt.Errorf("%w") 的包装；os.IsNotExist 不行。
-		if errors.Is(err, fs.ErrNotExist) {
-			// 首次运行：目录下没有配置 → 自动落一份推荐配置（含随机 api_key）再加载。
-			// 双击 exe / 裸跑 docker 即开，无需先手工复制样例。
-			if key, werr := WriteDefault(*cfgPath); werr == nil {
-				log.Printf("config %s 不存在，已生成推荐配置（api_key=%s，记录在该文件里，可自行修改）", *cfgPath, key)
-				cfg, err = Load(*cfgPath)
-			}
-			if err != nil {
-				// 生成失败（目录只读等）：退回纯默认 + env（旧行为兜底），不阻塞启动。
-				log.Printf("config %s not found (auto-generate failed), using defaults+env: %v", *cfgPath, err)
-				cfg, err = Load("")
-			}
+		// 配置文件不存在时给一次机会用纯默认 + env
+		if os.IsNotExist(err) {
+			log.Printf("config %s not found, using defaults+env", *cfgPath)
+			cfg, err = Load("")
 		}
 		if err != nil {
 			log.Fatalf("load config: %v", err)
@@ -64,11 +42,15 @@ func main() {
 	}
 	log.Printf("loaded %d account(s) from %s", len(auths), cfg.AuthDir)
 
+	// global realm 路由开关（config global.enabled，缺省 true）：注入 auth 包全局闸。
+	// Realm()/IsGlobal() 先过此闸——显式 false 时恒 cn（逃生门：纯 CN 锁定的第一道闸）。
+	auth.SetGlobalEnabled(cfg.Global.Enabled)
+
 	// redisstore：未配置/连接失败 → Noop（纯内存模式，一切功能照常）。
 	store := redisstore.New(cfg.Upstash.URL, cfg.Upstash.Token)
 
 	p := pool.New(cfg.StateFile)
-	defer p.Flush() // 进程退出前强制落盘（后台 flush 每 5s 一次，退出时补一次）
+	defer p.Close() // 进程退出前停后台落盘 goroutine + 最后补一次落盘（FIX-4:goroutine 泄漏）
 	p.SetStore(store)
 	p.RestoreFromSnapshot() // 择新恢复：Redis 快照比本地新才采用，否则本地优先
 	p.SyncToDir(auths)      // 与 auths 目录对齐：新账号加入、已删除文件账号剔除（状态保留）
@@ -90,8 +72,12 @@ func main() {
 			TTL:        cfg.SessionTTL,
 			GCInterval: cfg.SessionGCInterval,
 			Store:      store,
-			Available:         p.AvailableUIDs,
-			AvailableForModel: p.AvailableUIDsForModel,
+			Available:  p.AvailableUIDs,
+			// 按模型的可用性口径：绑定号在当前模型被 6004 限额时重分配，
+			// 而不是被钉在这个号上反复失败。
+			// realm 感知闭包：带前缀模型名按 realm 过滤可用账号（跨 realm 不泄漏，
+			// 见 wiring.go）；裸名走 cn（现状零回归）。
+			AvailableForModel: realmAwareAvailableForModel(p),
 		})
 		sessRouter.LoadFromStore() // 启动时从 Redis 恢复粘性（读操作仅此处）
 		sessRouter.StartGC()
@@ -115,42 +101,41 @@ func main() {
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
 	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
-	// 出站 UA 与归属头（issue #42 + 上游同步）：
-	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
-	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
+	// 出站 UA（A 段）：非空才做显式覆盖，空 = 默认 WorkBuddy 三段式
+	// `WorkBuddy/<client_version> WorkBuddy/<client_version> CLI/<cli_version>`。
 	up.UserAgent = cfg.Upstream.UserAgent
+	// 版本段（upstream.client_version / cli_version）：空 = 各走内置默认。
 	up.ClientVersion = cfg.Upstream.ClientVersion
 	up.CliVersion = cfg.Upstream.CliVersion
-	up.ClientName = cfg.Upstream.ClientName
+	// 设备风控头（X-Device-Token）全局兜底 + 文件读取路径；空 = 不注入。
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
+	// 用量归属头（X-Product/X-IDE-*）+ 客户端 IP 透传开关（见 ChatHeaders / handler）。
+	up.ClientName = cfg.Upstream.ClientName
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
-
-	// 使用量采样器：周期记录各账号上游 used 计数，供面板 5h/24h 消耗看板。
-	// 采样文件与 state.json 同目录，跨重启保留（used 单调递增，历史样本仍有效）。
-	usageTracker := usage.New(p, up, usage.DefaultPath(cfg.StateFile))
-
-	// 积分账本：来源（签到/任务/旅行/礼包）+ 去处（per-request 消耗），分账号。
-	// 与 state.json 同目录 ledger.json，跨重启保留。
-	lgr := ledger.New(ledger.DefaultPath(cfg.StateFile), 20000)
-
-	// 成员密钥与用量：与 state.json 同目录的 members.json，跨重启保留。
-	members := member.NewStore(member.DefaultPath(cfg.StateFile))
+	// global realm 双域路由（config global 段）：base 空回落内置默认 https://www.workbuddy.ai；
+	// GlobalEnabled 与 auth 包开关一致（双保险第二道闸在 upstream.globalOn）。
+	up.ChatBaseGlobal = cfg.Global.ChatBase
+	up.BillingBaseGlobal = cfg.Global.BillingBase
+	up.GlobalEnabled = cfg.Global.Enabled
 
 	sch := scheduler.New(scheduler.Config{
-		Pool:              p,
-		Upstream:          up,
-		Ledger:            lgr,
-		CheckinHours:      cfg.Schedule.CheckinHours,
-		TravelHours:       cfg.Schedule.TravelHours,
-		ActivityHours:     cfg.Schedule.ActivityHours,
-		KeepaliveHours:    cfg.Schedule.KeepaliveHours,
-		BlackcatHours:     cfg.Schedule.BlackcatHours,
-		CheckinDisabled:   !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:    !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:  !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
-		BlackcatDisabled:  !cfg.Schedule.BlackcatEnabled,
+		Pool:                p,
+		Upstream:            up,
+		CheckinHours:        cfg.Schedule.CheckinHours,
+		TravelHours:         cfg.Schedule.TravelHours,
+		ActivityHours:       cfg.Schedule.ActivityHours,
+		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
+		SchoolHours:         cfg.Schedule.SchoolHours,
+		CatHours:            cfg.Schedule.CatHours,
+		ActivityReportCount: cfg.Schedule.ActivityReportCount,
+		ExpiringSoonWindow:  cfg.ExpiringSoonDur, // 快过期积分优先消耗（issue:积分过期）
+		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:      !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
+		SchoolDisabled:      !cfg.Schedule.SchoolEnabled,
+		CatDisabled:         !cfg.Schedule.CatEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -168,57 +153,23 @@ func main() {
 	case !cfg.Schedule.ActivityEnabled:
 		log.Printf("活跃上报已禁用（schedule.activity_enabled=false）")
 	default:
-		log.Printf("活跃上报已启用：%v 点（每日 1 次，点亮连登 + 解锁 first_buddy）", cfg.Schedule.ActivityHours)
+		log.Printf("活跃上报已启用：%v 点（每号 %d 条，点亮连登 + 补满领猫对话门槛）", cfg.Schedule.ActivityHours, cfg.Schedule.ActivityReportCount)
 	}
 	if !cfg.Schedule.KeepaliveEnabled {
 		log.Printf("token 保活已禁用（schedule.keepalive_enabled=false）")
 	} else {
 		log.Printf("token 保活已启用：%v 点", cfg.Schedule.KeepaliveHours)
 	}
-	switch {
-	case !cfg.Schedule.BlackcatEnabled:
-		log.Printf("夜猫子已禁用（schedule.blackcat_enabled=false）")
-	default:
-		log.Printf("夜猫子已启用：%v 点（23:00–08:00 窗口 glm-5.2 对话补足）", cfg.Schedule.BlackcatHours)
+	if !cfg.Schedule.SchoolEnabled {
+		log.Printf("开学季任务已禁用（schedule.school_enabled=false）")
+	} else {
+		log.Printf("开学季任务已启用：%v 点（school_open_day_2026.py ALL --run --yes）", cfg.Schedule.SchoolHours)
 	}
-	switch {
-	case !cfg.Schedule.BalanceRefreshEnabled:
-		log.Printf("余额后台刷新已禁用（schedule.balance_refresh_enabled=false）")
-	case cfg.BalanceRefreshInterval > 0:
-		log.Printf("余额后台刷新：每 %s（签到时点照常额外刷新）", cfg.BalanceRefreshInterval)
+	if !cfg.Schedule.CatEnabled {
+		log.Printf("夜猫子任务已禁用（schedule.cat_enabled=false）")
+	} else {
+		log.Printf("夜猫子任务已启用：%v 点（task_runner.py ALL --yes --only black_cat）", cfg.Schedule.CatHours)
 	}
-
-	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
-	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
-	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
-	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
-	})
-	pn := panel.New(panel.Config{
-		Pool:        p,
-		Upstream:    up,
-		Ledger:      lgr,
-		Scheduler:   sch,
-		AuthDir:     cfg.AuthDir,
-		APIKey:      cfg.APIKey,
-		RedisMode:   redisMode,
-		StickyCount: sessCount,
-		Version:     appVersion,
-		Usage:       usageTracker,
-		Members:     members,
-		Live:        live,
-		ConfigPath:  *cfgPath,
-		LoadConfig: func() (any, error) {
-			return Load(*cfgPath)
-		},
-		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
-		},
-	})
-	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
-	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
 	h := server.NewHandler(server.Config{
 		Pool:         p,
@@ -228,178 +179,44 @@ func main() {
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
-		Panel:        pn,
-		Live:         live,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
-		Members:      members,
-		Ledger:       lgr,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	go sch.Run(ctx)
-	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
-	go usageTracker.Start(ctx)
-	// 成员用量按请求累加，故周期落盘（同 pool 的 5s flush 节奏思想；
-	// 记账是内存操作，落盘失败只记错误、不影响请求）。
-	go func() {
-		t := time.NewTicker(10 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				members.Flush()
-			}
-		}
-	}()
 
 	srv := &http.Server{
 		Addr:              cfg.Listen,
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
+		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
+		// 取值大于 MaxBodyMB 在常规带宽下的上传耗时；聊天请求体上限默认 8MB。
+		ReadTimeout: 60 * time.Second,
+		// IdleTimeout keep-alive 空闲连接回收：配合 ctx 传播（FIX-2）防连接泄漏堆积。
+		// 注意：SSE 流式响应期间连接非空闲，不受此项掐断；不设全局 WriteTimeout
+		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
+		IdleTimeout: 120 * time.Second,
 	}
 	go func() {
 		<-ctx.Done()
-		p.Flush()       // 信号触发：先落盘再做优雅停机
-		members.Flush() // 成员用量同样补一次落盘
+		p.Flush() // 信号触发：先落盘再做优雅停机
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
+	if cfg.Global.Enabled {
+		log.Printf("global realm 已启用（chat_base=%q billing_base=%q，空=默认 workbuddy.ai）",
+			cfg.Global.ChatBase, cfg.Global.BillingBase)
+	} else {
+		log.Printf("global realm 已禁用（config global.enabled=false，纯 CN）")
+	}
+	log.Printf("workbuddy2api listening on %s (api_key=%v)", cfg.Listen, cfg.APIKey != "")
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
 	log.Printf("bye")
-}
-
-// panelListenPath 从 listen 地址提取 ":port" 形式，用于启动日志拼面板 URL
-// （":7863" 或 "0.0.0.0:7863" → ":7863"；异常输入原样返回）。
-func panelListenPath(listen string) string {
-	for i := len(listen) - 1; i >= 0; i-- {
-		if listen[i] == ':' {
-			return listen[i:]
-		}
-	}
-	return listen
-}
-
-// saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
-//
-// 热生效范围（设计取舍）：
-//   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights
-//   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
-//
-// 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
-//   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
-//
-// 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
-// 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
-// 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
-	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
-	oldRaw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read current config: %w", err)
-	}
-	var cur, incoming map[string]any
-	if err := json.Unmarshal(oldRaw, &cur); err != nil {
-		cur = map[string]any{}
-	}
-	if err := json.Unmarshal(raw, &incoming); err != nil {
-		return nil, fmt.Errorf("parse submitted config: %w", err)
-	}
-	merged := mergeConfigMaps(cur, incoming)
-
-	// 2) 校验（与启动同一套 Default+normalize），失败直接返回、不落盘。
-	newCfg, err := ParseConfig(mergedJSON(merged))
-	if err != nil {
-		return nil, err
-	}
-
-	// 3) 落盘（原子替换）。
-	out, err := json.MarshalIndent(merged, "", "  ")
-	if err != nil {
-		return nil, fmt.Errorf("marshal config: %w", err)
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return nil, fmt.Errorf("write config: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, fmt.Errorf("replace config: %w", err)
-	}
-
-	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
-	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-	})
-	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
-	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
-	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
-	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
-	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
-	sch.Reconfigure(
-		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
-		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
-		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
-		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
-	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
-
-	return restartRequiredFields(newCfg), nil
-}
-
-// restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
-// 恒返回完整清单中的"与当前进程装配期依赖相关"的项——面板据此提示用户。
-func restartRequiredFields(c *Config) []string {
-	var out []string
-	// 这些字段在进程内被监听地址/HTTP client/目录句柄等装配期对象捕获。
-	if c.Listen != "" {
-		out = append(out, "listen")
-	}
-	if c.AuthDir != "" {
-		out = append(out, "auth_dir")
-	}
-	if c.StateFile != "" {
-		out = append(out, "state_file")
-	}
-	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
-	if c.Upstash.URL != "" || c.Upstash.Token != "" {
-		out = append(out, "upstash")
-	}
-	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
-	return out
-}
-
-// mergeConfigMaps 把 incoming 深合并进 cur（原地），返回 cur。
-// 对嵌套对象逐键覆盖而不是整体替换：面板表单只提交它管理的键，
-// 未提交的兄弟键（含用户手写的未知键）保持原样。
-func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
-	for k, v := range incoming {
-		if inMap, ok := v.(map[string]any); ok {
-			if curMap, ok := cur[k].(map[string]any); ok {
-				cur[k] = mergeConfigMaps(curMap, inMap)
-				continue
-			}
-		}
-		cur[k] = v
-	}
-	return cur
-}
-
-// mergedJSON 把合并后的 map 序列化回 JSON（供 ParseConfig 校验）。
-func mergedJSON(m map[string]any) []byte {
-	b, err := json.Marshal(m)
-	if err != nil {
-		return []byte("{}")
-	}
-	return b
 }

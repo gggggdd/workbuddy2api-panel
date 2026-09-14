@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"workbuddy2api/internal/auth"
 )
 
 // 本文件为 P 组性能审查的量化基准（go test -bench 可复现），结论见 REVIEW-conflicts-perf.md。
@@ -16,7 +16,7 @@ func benchPool(b *testing.B) *Pool {
 	p := New("")
 	for i := 0; i < 46; i++ {
 		p.Add(&auth.Auth{UID: fmt.Sprintf("u%02d", i)})
-		p.SetCredits(fmt.Sprintf("u%02d", i), int64(1000-i*13%900), 0)
+		p.SetCredits(fmt.Sprintf("u%02d", i), int64(1000-i*13%900))
 	}
 	return p
 }

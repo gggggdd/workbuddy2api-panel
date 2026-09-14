@@ -20,7 +20,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"workbuddy2api/internal/auth"
 )
 
 const (
@@ -199,7 +199,7 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.cfg.Pool.Add(a)
-	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
+	p.cfg.Pool.ReviveDisabled(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
 
 	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。
 	checkinMsg := ""
@@ -208,9 +208,9 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	remain := int64(-1)
 	total := int64(0)
-	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {
+	if rm, tt, err := p.cfg.Upstream.UserResourceRT(a); err == nil {
 		remain, total = rm, tt
-		p.cfg.Pool.ReenableIfCredits(acct.UID, rm, tt)
+		p.cfg.Pool.ReenableIfCredits(acct.UID, rm)
 	}
 
 	p.loginMu.Lock()

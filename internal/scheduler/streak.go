@@ -11,8 +11,8 @@ import (
 	"log"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/ledger"
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/ledger"
 )
 
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。

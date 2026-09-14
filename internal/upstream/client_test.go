@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"workbuddy2api/internal/auth"
 )
 
 func TestClassify(t *testing.T) {
@@ -50,6 +50,15 @@ func TestClassify(t *testing.T) {
 		{400, `Unmarshal chat params failed`, ErrBadParams},
 		{400, `{"code":11101,"msg":"x"}`, ErrBadParams},
 		{200, `quota exceeded`, ErrHardCredit},
+		// 账号级授权/配额故障（与 429 一起纳入轮换）：11140 request illegal = auth_forbidden
+		// 风控（需重登），14017 = quota_not_activated（试用未激活，需完成 register）。修复前
+		// 11140 走 4xx → ErrClient 只换号不罚，坏号留在池内被反复选中刷风控。
+		// 注意：11140 不按 code 单独判定——该 code 也承载 rate-limiting 软限流文案
+		// （上方 {200, "code":11140 rate-limiting} 必须仍是 ErrSoftRate），只能靠 msg 区分。
+		{403, `{"error":{"data":{"code":11140,"msg":"request illegal"}}}`, ErrAccountFault},
+		{403, `request illegal`, ErrAccountFault},
+		{429, `{"error":{"data":{"code":14017,"msg":"The trial version is not yet activated. Please log out of your current account and log in again to activate it immediately and start your free trial."}}}`, ErrAccountFault},
+		{400, `{"code":14017,"msg":"trial not activated"}`, ErrAccountFault},
 		// session 死亡优先于限流文案（401+12153 需人工重登，短冷却无意义）。
 		{401, `{"code":12153,"msg":"Offline user session not found, rate limit"}`, ErrSessionDead},
 		{401, `Offline user session not found`, ErrSessionDead},
@@ -62,6 +71,35 @@ func TestClassify(t *testing.T) {
 	for _, c := range cases {
 		if got := Classify(c.status, c.body); got != c.want {
 			t.Errorf("Classify(%d,%q)=%v want %v", c.status, c.body, got, c.want)
+		}
+	}
+}
+
+// TestContentBlockedClientMessage 内容拦截把上游 body 改写成防火墙口径：
+// 括号填分类关键词（由 body 抽出，抽不到回「违禁词」），绝不泄露上游 code/账号/upstream 字样。
+func TestContentBlockedClientMessage(t *testing.T) {
+	cases := []struct {
+		body    string
+		keyword string
+	}{
+		{`{"code":11128,"msg":"blocked by security policy"}`, "违禁词"},
+		{`{"code":"11128","msg":"blocked by security policy"}`, "违禁词"},
+		{`Illegal API invocation from an unapproved channel`, "违禁词"},
+		{`{"code":11128,"msg":"content contains NSFW material"}`, "nsfw"},
+		{`{"msg":"命中色情内容"}`, "色情"},
+		{`violence detected`, "violence"},
+		{"", "违禁词"},
+	}
+	for _, c := range cases {
+		got := ContentBlockedClientMessage(c.body)
+		want := fmt.Sprintf("触发网站风控违禁词，无法调用模型：内容命中网关内容防火墙规则[%s]，已被拦截。请修改内容后重试。", c.keyword)
+		if got != want {
+			t.Errorf("ContentBlockedClientMessage(%q)=\n%q\nwant %q", c.body, got, want)
+		}
+		for _, leak := range []string{"11128", "account", "accounts", "账号", "upstream", "cooling", "no_healthy"} {
+			if strings.Contains(strings.ToLower(got), leak) {
+				t.Errorf("client message must not leak %q: %s", leak, got)
+			}
 		}
 	}
 }
@@ -219,7 +257,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		}, nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1", EnterpriseID: "e1"}
-	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "")
+	rc, status, respBody, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -227,7 +265,7 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "SaaS" {
+	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "WorkBuddy" {
 		t.Errorf("headers: auth=%q uid=%q product=%q", gotAuth, gotUID, gotProduct)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
@@ -260,15 +298,13 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 	if len(infos) != 1 {
 		t.Fatalf("infos=%+v", infos)
 	}
-	// ModelInfo.Efforts 应携带 supportedEfforts，DefaultEffort 应携带 reasoning.effort
+	// ModelInfo.Efforts 应携带 supportedEfforts
 	if len(infos[0].Efforts) != 2 || infos[0].Efforts[0] != "low" {
 		t.Errorf("infos[0].Efforts=%v", infos[0].Efforts)
 	}
-	if infos[0].DefaultEffort != "high" {
-		t.Errorf("infos[0].DefaultEffort=%q want high", infos[0].DefaultEffort)
-	}
+
 	// glm-5.2 只支持 low/high，请求 max → 降级为 high
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","reasoning_effort":"max","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -287,7 +323,7 @@ func TestChatStreamHardCreditError(t *testing.T) {
 		return jsonResp(402, `{"code":1,"msg":"余额不足"}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	_, status, respBody, err := c.ChatStream(a, []byte(`{}`), "")
+	_, status, respBody, err := c.ChatStream(a, []byte(`{}`), "", ChatMeta{})
 	if status != 402 {
 		t.Errorf("status=%d", status)
 	}
@@ -326,7 +362,7 @@ func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
 	c.IdleTimeout = 5 * time.Second
 
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{"model":"glm-5.2","messages":[]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -342,6 +378,91 @@ func TestChatStreamReadsMultipleChunksOverRealTransport(t *testing.T) {
 	}
 	if strings.Contains(got, "context canceled") {
 		t.Fatalf("body read hit context canceled, got %q", got)
+	}
+}
+
+// TestResourceSummaryAggregation 断言 ResourceSummary 聚合口径：
+// remain 取 Cycle 期剩余、size 取 CycleSize（TotalDosage 作 size 下限）、used 派生。
+func TestResourceSummaryAggregation(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		if !strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource") {
+			return nil, errors.New("wrong path: " + r.URL.Path)
+		}
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"TotalDosage":3000,"Accounts":[
+			{"PackageName":"签到包","CapacitySize":2000,"CapacityRemain":1200,"CapacityUsed":800,"CycleCapacitySize":2000,"CycleCapacityRemain":1200,"CycleCapacityUsed":800},
+			{"PackageName":"体验包","CapacitySize":1000,"CapacityRemain":300,"CapacityUsed":700,"CycleCapacitySize":1000,"CycleCapacityRemain":300,"CycleCapacityUsed":700}
+		]}}}}`), nil
+	})
+	remain, used, size, packs, err := c.ResourceSummary(&auth.Auth{AccessToken: "at", UID: "u1"})
+	if err != nil {
+		t.Fatalf("summary: %v", err)
+	}
+	if remain != 1500 || size != 3000 {
+		t.Errorf("summary remain=%d size=%d want 1500/3000 (TotalDosage 作 size 下限)", remain, size)
+	}
+	// used = TotalDosage(3000) - remain(1500) = 1500。
+	if used != 1500 {
+		t.Errorf("used=%d want 1500", used)
+	}
+	if packs != 2 {
+		t.Errorf("packs=%d want 2", packs)
+	}
+}
+
+// TestResourceSummaryGlobalRealm 断言 global 账号走 global billing base + /billing/meter/*
+// （无 /v2 前缀），且 404 时 fallback /v2——realm 感知双路径，供 cmd/credit 复用。
+func TestResourceSummaryGlobalRealm(t *testing.T) {
+	var billingCalls []string
+	billSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		billingCalls = append(billingCalls, r.URL.Path)
+		if r.URL.Path == "/billing/meter/get-user-resource" {
+			w.WriteHeader(404)
+			_, _ = w.Write([]byte(`{"code":404,"msg":"nope"}`))
+			return
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[
+			{"PackageName":"g","CycleCapacitySize":500,"CycleCapacityRemain":200,"CycleCapacityUsed":300}
+		]}}}}`))
+	}))
+	defer billSrv.Close()
+
+	auth.SetGlobalEnabled(true)
+	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
+	c := &Client{
+		HTTP:              &http.Client{},
+		BillingBaseCN:     "https://billing.cn",
+		BillingBaseGlobal: strings.TrimSuffix(billSrv.URL, "/"),
+		GlobalEnabled:     true,
+	}
+	a := &auth.Auth{AccessToken: "at", UID: "g1", Domain: "www.workbuddy.ai"}
+	remain, used, size, packs, err := c.ResourceSummary(a)
+	if err != nil {
+		t.Fatalf("global summary: %v", err)
+	}
+	if remain != 200 || used != 300 || size != 500 || packs != 1 {
+		t.Errorf("global summary=%d/%d/%d/%d want 200/300/500/1", remain, used, size, packs)
+	}
+	if len(billingCalls) != 2 ||
+		billingCalls[0] != "/billing/meter/get-user-resource" ||
+		billingCalls[1] != "/v2/billing/meter/get-user-resource" {
+		t.Errorf("global billing fallback calls=%v", billingCalls)
+	}
+}
+
+// TestResourceSummaryCNUnchanged 零回归：CN 账号仍是 /v2/billing/meter/get-user-resource 单路径。
+func TestResourceSummaryCNUnchanged(t *testing.T) {
+	var calls []string
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		calls = append(calls, r.URL.Path)
+		return jsonResp(200, `{"code":0,"data":{"Response":{"Data":{"Accounts":[]}}}}`), nil
+	})
+	_, _, _, _, err := c.ResourceSummary(&auth.Auth{AccessToken: "at", UID: "cn1", Domain: "www.codebuddy.cn"})
+	if err != nil {
+		t.Fatalf("cn summary: %v", err)
+	}
+	if len(calls) != 1 || calls[0] != "/v2/billing/meter/get-user-resource" {
+		t.Errorf("cn billing calls=%v want single /v2 path", calls)
 	}
 }
 
@@ -363,15 +484,12 @@ func TestUserResourceAggregation(t *testing.T) {
 		]}}}}`), nil
 	})
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	remain, total, err := c.UserResource(a)
+	remain, err := c.UserResource(a)
 	if err != nil {
 		t.Fatalf("resource: %v", err)
 	}
 	if remain != 1500 {
 		t.Errorf("remain=%d want 1500", remain)
-	}
-	if total != 3000 {
-		t.Errorf("total=%d want 3000", total)
 	}
 }
 
@@ -381,12 +499,9 @@ func TestUserResourceNegativeClamped(t *testing.T) {
 			{"PackageName":"p","CycleCapacitySize":100,"CycleCapacityRemain":-50,"CycleCapacityUsed":150}
 		]}}}}`), nil
 	})
-	remain, total, err := c.UserResource(&auth.Auth{AccessToken: "at"})
+	remain, err := c.UserResource(&auth.Auth{AccessToken: "at"})
 	if err != nil || remain != 0 {
 		t.Errorf("remain=%d err=%v, want 0 (clamped)", remain, err)
-	}
-	if total != 100 {
-		t.Errorf("total=%d want 100", total)
 	}
 }
 
@@ -400,6 +515,45 @@ func TestDailyCheckinAlready(t *testing.T) {
 	err := c.DailyCheckin(&auth.Auth{AccessToken: "at"})
 	if err == nil || !strings.Contains(err.Error(), "已签到") {
 		t.Errorf("err=%v", err)
+	}
+}
+
+// TestIsAlreadyCheckin "今天已签到"判定为幂等成功（中文/英文 markers 均命中）。
+func TestIsAlreadyCheckin(t *testing.T) {
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":10001,"msg":"今天已签到"}`), nil
+	})
+	if !IsAlreadyCheckin(c.DailyCheckin(&auth.Auth{AccessToken: "at"})) {
+		t.Error("今天已签到 应判为 already")
+	}
+
+	c2 := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":10001,"msg":"Already checked in today"}`), nil
+	})
+	if !IsAlreadyCheckin(c2.DailyCheckin(&auth.Auth{AccessToken: "at"})) {
+		t.Error("already(英文) 应判为 already")
+	}
+}
+
+// TestIsAlreadyCheckinRejectsNonUpstream 网络层/解析层错误不得当作幂等成功。
+// 误判会让当天实际未签到的账号被标成正常（停机补签遇到抖动时尤其危险）。
+func TestIsAlreadyCheckinRejectsNonUpstream(t *testing.T) {
+	if IsAlreadyCheckin(errors.New("dial tcp: connection refused")) {
+		t.Error("网络错误不得判为 already")
+	}
+	if IsAlreadyCheckin(errors.New("parse failed: unexpected EOF")) {
+		t.Error("解析错误不得判为 already")
+	}
+	// 非"已签到"语义的上游业务错误（如余额不足）也不得判为 already。
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		return jsonResp(200, `{"code":10002,"msg":"积分不足，请充值"}`), nil
+	})
+	if IsAlreadyCheckin(c.DailyCheckin(&auth.Auth{AccessToken: "at"})) {
+		t.Error("余额不足不得判为 already")
+	}
+	// nil 不判为 already。
+	if IsAlreadyCheckin(nil) {
+		t.Error("nil 不得判为 already")
 	}
 }
 
@@ -453,7 +607,7 @@ func TestChatStreamRoutesToChatHTTP(t *testing.T) {
 		}, nil
 	})}
 	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	rc, status, _, err := c.ChatStream(a, []byte(`{}`), "")
+	rc, status, _, err := c.ChatStream(a, []byte(`{}`), "", ChatMeta{})
 	if err != nil || status != 200 {
 		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
@@ -476,38 +630,5 @@ func TestChatHTTPNilFallsBackToHTTP(t *testing.T) {
 	})
 	if c.chatHTTP() != c.HTTP {
 		t.Error("chatHTTP() should fall back to HTTP when ChatHTTP is nil")
-	}
-}
-
-func TestFetchModelsDefaultEffortDualKeyAndSizes(t *testing.T) {
-	// 上游双键：老模型 reasoning.effort（auto），新模型（glm-5.3 系）只有 reasoning.defaultEffort；
-	// credits/maxAllowedSize/canDisableThinking/supportsReasoning 等尺寸与能力字段应一并透出。
-	c := testClient(func(r *http.Request) (*http.Response, error) {
-		return jsonResp(200, `{"code":0,"data":{"models":[
-			{"id":"glm-5.3","maxInputTokens":1000000,"maxOutputTokens":48000,"maxAllowedSize":1000000,"credits":"x0.79","supportsReasoning":true,"reasoning":{"defaultEffort":"high","canDisableThinking":true,"supportedEfforts":["low","high","max"]}},
-			{"id":"auto","maxInputTokens":168000,"maxOutputTokens":32000,"supportsReasoning":true,"reasoning":{"effort":"high"}}
-		],"agents":[{"name":"cli","models":["glm-5.3","auto"]}]}}`), nil
-	})
-	a := &auth.Auth{AccessToken: "at", UID: "u1"}
-	infos, err := c.FetchModels(a)
-	if err != nil {
-		t.Fatalf("fetch models: %v", err)
-	}
-	byID := map[string]ModelInfo{}
-	for _, mi := range infos {
-		byID[mi.ID] = mi
-	}
-	g := byID["glm-5.3"]
-	if g.DefaultEffort != "high" {
-		t.Errorf("glm-5.3 DefaultEffort=%q want high (from defaultEffort key)", g.DefaultEffort)
-	}
-	if !g.CanDisableThinking || !g.SupportsReasoning {
-		t.Errorf("glm-5.3 capability flags: canDisable=%v supportsReasoning=%v want true/true", g.CanDisableThinking, g.SupportsReasoning)
-	}
-	if g.MaxAllowedSize != 1000000 || g.MaxTokens != 48000 || g.Credits != "x0.79" {
-		t.Errorf("glm-5.3 sizes: maxAllowed=%d maxOut=%d credits=%q", g.MaxAllowedSize, g.MaxTokens, g.Credits)
-	}
-	if au := byID["auto"]; au.DefaultEffort != "high" {
-		t.Errorf("auto DefaultEffort=%q want high (from legacy effort key)", au.DefaultEffort)
 	}
 }

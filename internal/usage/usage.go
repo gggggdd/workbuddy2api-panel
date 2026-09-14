@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"workbuddy2api/internal/pool"
+	"workbuddy2api/internal/upstream"
 )
 
 const (
