@@ -1,6 +1,11 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
+// URL ?key= 自动写入（便于分享带密钥的直达链接与自动化测试）
+try {
+  const urlKey = new URLSearchParams(location.search).get('key');
+  if (urlKey) localStorage.setItem(LS_KEY, urlKey);
+} catch (e) { /* 隐私模式忽略 */ }
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
