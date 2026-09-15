@@ -1,11 +1,16 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
+// URL ?key= 自动写入（分享直达与自动化测试）
+try {
+  const urlKey = new URLSearchParams(location.search).get('key');
+  if (urlKey) localStorage.setItem(LS_KEY, urlKey);
+} catch (e) { /* ignore */ }
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
-let refTimer = null;
+let refTimer, usgTimer = null;
 
 const $ = id => document.getElementById(id);
 
@@ -500,8 +505,11 @@ function refreshVisible() {
 }
 function start() {
   loadOverview(true);
+  loadUsage(true);
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);
+  if (usgTimer) clearInterval(usgTimer);
+  usgTimer = setInterval(() => loadUsage(true), 60000);
   checkAuthGate();
 }
 async function checkAuthGate() {
@@ -867,3 +875,43 @@ function startQueuePolling() {
     } catch (e) { /* 忽略 */ }
   }, 3000);
 }
+
+/* ── 积分使用量看板 ───────────────────────────────────────────────── */
+// 消耗来自上游账单口径的 used 计数采样（涵盖定时任务等非网关请求的消耗）。
+// 上游计费有分钟级延迟且为整数分，故数值存在小幅采样误差。
+function fmtUsed(sec) {
+  if (sec >= 86400) return Math.floor(sec / 86400) + ' 天 ' + Math.floor(sec % 86400 / 3600) + ' 时';
+  if (sec >= 3600) return Math.floor(sec / 3600) + ' 时 ' + Math.floor(sec % 3600 / 60) + ' 分';
+  const m = Math.floor(sec / 60);
+  return m ? m + ' 分钟' : Math.max(0, Math.round(sec)) + ' 秒';
+}
+function renderWindow(id, subId, w) {
+  const v = $(id), s = $(subId);
+  if (!w || !w.accounts) { v.textContent = '—'; v.classList.add('partial'); s.textContent = '暂无样本'; return; }
+  v.classList.toggle('partial', !w.complete);
+  v.innerHTML = w.used + '<span class="u">分</span>';
+  const parts = [];
+  if (!w.complete) parts.push('数据不足（已覆盖 ' + fmtUsed(w.seconds) + '）');
+  else parts.push('近 ' + fmtUsed(w.seconds));
+  if (w.per_hour > 0) parts.push('约 ' + w.per_hour.toFixed(1) + ' 分/时');
+  s.textContent = parts.join(' · ');
+}
+async function loadUsage(quiet) {
+  try {
+    const d = await api('usage');
+    renderWindow('usg5h', 'usg5hSub', d.window_5h);
+    renderWindow('usg24h', 'usg24hSub', d.window_24h);
+    const t = $('usgTotal');
+    if (d.total_used == null) { t.textContent = '—'; $('usgTotalSub').textContent = d.oldest || '暂无数据'; }
+    else {
+      t.innerHTML = d.total_used + '<span class="u">分</span>';
+      $('usgTotalSub').textContent = '账单累计口径 · 含定时任务消耗';
+    }
+    $('usgNote').textContent = d.samples
+      ? d.samples + ' 个样本 · 更新于 ' + ago(new Date(d.updated_at * 1000).toISOString())
+      : '等待首次采样（约 5 分钟一次）';
+  } catch (e) {
+    if (!quiet) { $('usgNote').textContent = e.message; }
+  }
+}
+
