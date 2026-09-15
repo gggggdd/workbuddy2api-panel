@@ -476,6 +476,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	//   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
 	//   - passthrough + 降级期：换 Degraded 中性提示词直达，不再先撞 400。
 	//   - passthrough 非降级期：透传客户端原始 system（不改写）。
+	// 轮级键：无会话键客户端按 body 最后一条 user 消息派生（同轮内所有上游
+	// 调用共享同键）。必须在 prompt.Rewrite 之前取——改写会动 messages 内容。
+	turnKey := ""
+	if sessKey == "" {
+		turnKey = session.TurnKey(body)
+	}
+
 	degradedApplied := false
 	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
 		body = prompt.Rewrite(body, h.cfg.PromptText)
@@ -537,9 +544,27 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
+		// P0 费用优化：按账号+会话注入 prompt_cache_key，命中上游前缀缓存
+		// （同前缀 8k token 从 ~0.34 降到 ~0.02 credit，实测 ~17×）。
+		// 必须在轮换循环内注入：key 含 acct.UID 隔离段，换号后键随之变化。
+		reqBody := upstream.InjectPromptCacheKey(body, acct.UID, sessKey)
+
+		// 会话头族（上游重构核心）：conversationID 从 body 解析；聚合主键按
+		// 入站透传 > 粘性 key > 轮级兜底三级取值，换号重试/降级重发共享同键，
+		// 上游用量明细按对话轮聚合（修 RequestID 碎片化，issue #35/#69）。
+		chatMeta := upstream.ChatMeta{ConversationID: session.ResolveConversationID(reqBody)}
+		if v := r.Header.Get("X-Conversation-Request-ID"); v != "" {
+			chatMeta.ConversationRequestID = v
+		} else if sessKey != "" {
+			chatMeta.ConversationRequestID = session.RequestIDForKey(sessKey)
+		} else {
+			chatMeta.ConversationRequestID = session.TurnRequestID(turnKey)
+		}
+		chatMeta.TraceID = r.Header.Get("X-Trace-ID")
+
 		// 客户端 IP 按请求传递（PassthroughIP 开启时注入；消除共享字段竞态）。
 		attemptStarted := time.Now()
-		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, body, clientIP, upstream.ChatMeta{})
+		rc, status, respBody, terr := h.cfg.Upstream.ChatStream(acct, reqBody, clientIP, chatMeta)
 		if terr != nil {
 			// 网络层抖动：只换号，不喂熔断计数（传输层错误对连续失败连坐熔断过于严苛）。
 			// 上游 client 已打 transport error 日志。
