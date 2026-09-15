@@ -473,8 +473,6 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 // 持久化
 // ---------------------------------------------------------------------------
 
-// ─── fork 特性适配：token 用量累计（成员/账本展示用） ───
-
 // RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
 // usage 字段缺失时仍累计请求次数，但只累计明确存在的 token 字段。
 func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
@@ -517,19 +515,4 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 		usage.LastTokensPerSecond = nil
 	}
 	p.dirty.Store(true)
-}
-
-// Remove fork 特性：把账号彻底移出池（面板删除账号用），返回被移出的凭证。
-// 上游只有 Disable（保留在池里）；删除语义由本仓库 panel 的账号管理实现。
-func (p *Pool) Remove(uid string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return nil
-	}
-	delete(p.byUID, uid)
-	p.dirty.Store(true)
-	p.saveLocked()
-	return e.a
 }

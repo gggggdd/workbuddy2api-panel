@@ -242,7 +242,6 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			CoolKind:     e.coolKind,
 			SuccessCount: e.successCount,
 			ErrTotal:     e.errTotal,
-			TokenUsage:   e.tokenUsage,
 			LastSuccess:  e.lastSuccess,
 			LastErr:      e.lastErr,
 			SoftStreak:   e.softStreak,

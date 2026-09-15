@@ -28,6 +28,7 @@ func (k CoolKind) String() string {
 // Status 单个账号对外暴露的状态（脱敏）。
 type Status struct {
 	UID           string    `json:"uid"`
+	TokenUsage    TokenUsage `json:"token_usage,omitempty"` // fork: 用量摘要
 	Realm         string    `json:"realm,omitempty"`
 	Nickname      string    `json:"nickname,omitempty"`
 	Credits       int64     `json:"credits"`
@@ -43,7 +44,6 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	Disabled          bool               `json:"disabled"`
 	DisabledReason    string             `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
-	TokenUsage        TokenUsage         `json:"token_usage,omitempty"` // fork 特性：token 用量摘要
 	SuccessCount      int64              `json:"success_count,omitempty"`
 	ErrTotal          int64              `json:"err_total,omitempty"`
 	LastSuccessTime   time.Time          `json:"last_success,omitempty"`
@@ -68,10 +68,9 @@ type RateLimitedModel struct {
 }
 
 type entry struct {
+	tokenUsage TokenUsage // fork: 用量摘要
 	a       *auth.Auth
 	credits int64
-
-	tokenUsage TokenUsage // fork 特性：聊天请求 token 用量摘要（持久化）
 	// creditsExpiring 即将过期（签到时按 expiringSoon 窗口判定）的可用积分子集，
 	// 是 credits 的一部分（credits = creditsExpiring + 长期积分）。选号权重对其
 	// 额外加成：优先消耗快过期积分，避免官方活动赠送的奖励积分到期作废
@@ -261,8 +260,6 @@ type stateAccount struct {
 	// 退避从基数重新开始（向后兼容）。
 	SoftStreak int `json:"soft_streak,omitempty"`
 
-	TokenUsage TokenUsage `json:"token_usage,omitempty"` // fork 特性：token 用量摘要（持久化）
-
 	// ModelCost 实测扣费账本（model → 观测）。仅内存态，重启后重新学习：
 	// 成本会随上游活动（限免期/夜间免费/折扣）变化，持久化旧值反而是脏数据。
 	ModelCost map[string]stateModelCost `json:"-"`
@@ -358,7 +355,7 @@ type TokenUsage struct {
 	LastModel           string    `json:"last_model,omitempty"`
 }
 
-// TokenUsageDelta 是一次聊天账号尝试的 usage 增量（fork 特性：成员/账本记账依赖）。
+// TokenUsageDelta 是一次聊天账号尝试的 usage 增量。
 // 各 Has* 字段用于区分上游缺少字段与字段值确实为 0。
 type TokenUsageDelta struct {
 	Model               string

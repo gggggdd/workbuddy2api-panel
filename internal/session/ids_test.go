@@ -133,8 +133,4 @@ func TestTurnRequestIDDerivation(t *testing.T) {
 			t.Errorf("TurnRequestID value %q len=%d want 32", id, len(id))
 		}
 	}
-<<<<<<< HEAD
 }
-=======
-}
->>>>>>> fork/main

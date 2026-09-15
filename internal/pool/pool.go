@@ -211,3 +211,19 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
+
+// Remove 从池中移除账号并立即落盘（管理面板用）。返回被移除账号的凭证
+// （含 FilePath，供调用方删除 auth 文件）；uid 不存在返回 nil。
+// 在途请求的 Release 对已删条目是 no-op，无需等待。
+func (p *Pool) Remove(uid string) *auth.Auth {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return nil
+	}
+	delete(p.byUID, uid)
+	p.dirty.Store(true)
+	p.saveLocked()
+	return e.a
+}
