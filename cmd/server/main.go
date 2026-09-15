@@ -210,6 +210,7 @@ func main() {
 		Live:         live,
 		PromptMode:   cfg.Prompt.Mode,
 		PromptText:   cfg.PromptText,
+		GlobalEnabled: cfg.Global.Enabled,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,

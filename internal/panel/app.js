@@ -284,7 +284,9 @@ async function loadModels() {
       if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
       const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
         : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
-      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div></td>' +
+      const isG = String(m.id).startsWith('global:');
+      const realmTag = isG ? '<span class="tag" style="margin-left:6px">国际版</span>' : '';
+      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"><div class="nm">' + esc(m.id) + realmTag + '</div><div class="id">' + esc(m.name || '') + '</div></td>' +
         '<td class="num">' + (m.credits ? esc(m.credits) : '—') + '</td>' +
         '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="efs" style="white-space:normal">' + effs + '</td>' +

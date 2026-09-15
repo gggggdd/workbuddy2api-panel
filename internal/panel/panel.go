@@ -23,6 +23,7 @@ import (
 	"workbuddy2api/internal/livecfg"
 	"workbuddy2api/internal/ledger"
 	"workbuddy2api/internal/member"
+	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/upstream"
@@ -408,6 +409,15 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 			"max_output_tokens": mi.MaxTokens,
 			"supported_efforts": mi.Efforts,
 		})
+	}
+		// fork：追加国际版静态模型名单（无 global 账号也可展示，标注 realm）
+	if auth.GlobalEnabled() {
+		for _, id := range upstream.GlobalModelNames {
+			out = append(out, map[string]any{
+				"id":   "global:" + id,
+				"name": "国际版 " + id,
+			})
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
