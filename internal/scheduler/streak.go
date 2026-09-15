@@ -13,6 +13,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/ledger"
+	"workbuddy2api/internal/upstream"
 )
 
 // RunStreakBonusNow 对所有可用账号执行连登兑换 + 抽奖（幂等：locked/无次数自动跳过）。
@@ -93,6 +94,14 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 			return
 		}
 		log.Printf("streak-bonus %s: 🎲 第%d抽 %s", a.UID, i+1, compactJSON(raw))
+		// 账本：抽奖积分入账（实物券等 credit=0 不入账）。载荷形状随活动期变化，
+		// LotteryCredit 宽松匹配候选键；未命中时不入账，绝不臆造金额。
+		if lg := s.lg(); lg != nil {
+			if code, credit := upstream.LotteryCredit(raw); credit > 0 {
+				lg.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+					Kind: ledger.KindLottery, Delta: credit, Task: code, Note: "连登抽奖"})
+			}
+		}
 	}
 	if chances > 0 {
 		log.Printf("streak-bonus %s: 抽奖完成 %d 次", a.UID, chances)

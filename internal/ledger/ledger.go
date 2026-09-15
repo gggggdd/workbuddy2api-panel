@@ -20,6 +20,7 @@ const (
 	KindCheckin      Kind = "checkin"      // 来源：每日签到
 	KindTask         Kind = "task"         // 来源：任务奖励（含一键完成自动领奖）
 	KindTravel       Kind = "travel"       // 来源：猫猫旅行到站奖励
+	KindLottery      Kind = "lottery"      // 来源：抽奖积分（开学季转盘 / 连登抽奖）
 	KindGift         Kind = "gift"         // 来源：新手礼包
 	KindCompensation Kind = "compensation" // 来源：活动补偿
 	KindAdjust       Kind = "adjust"       // 校准：账本推算与余额快照的未知差额

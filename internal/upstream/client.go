@@ -1089,30 +1089,66 @@ func (c *Client) DailyCheckinCredit(a *auth.Auth) (credit, balance float64, err 
 	if err != nil {
 		return 0, 0, err
 	}
-	var resp struct {
-		Response struct {
-			Data struct {
-				Credit       any `json:"credit"`
-				RewardCredit any `json:"reward_credit"`
-				Balance      any `json:"balance"`
-				TotalCredit  any `json:"total_credit"`
-				Remain       any `json:"remain"`
-			} `json:"Data"`
-		} `json:"Response"`
-	}
-	_ = json.Unmarshal(data, &resp)
-	credit = anyToF(resp.Response.Data.Credit)
-	if credit == 0 {
-		credit = anyToF(resp.Response.Data.RewardCredit)
-	}
-	balance = anyToF(resp.Response.Data.Balance)
-	if balance == 0 {
-		balance = anyToF(resp.Response.Data.TotalCredit)
-	}
-	if balance == 0 {
-		balance = anyToF(resp.Response.Data.Remain)
-	}
+	credit, balance = parseCheckinCredit(data)
 	return credit, balance, nil
+}
+
+// parseCheckinCredit 从签到成功响应提取 (本次到账, 签到后余额)。
+//
+// 上游 /billing/meter 族（daily-checkin 与 get-user-resource 同族）返回
+// data.Response.Data 嵌套，故优先该层；同时兼容 data 下平铺字段——两种形状
+// 都试，命中即用，避免因信封层级差异静默丢积分。字段可能是数字或字符串。
+// 全部未命中时返回 (0,0)：调用方按「无入账」处理，不臆造金额。
+func parseCheckinCredit(data json.RawMessage) (credit, balance float64) {
+	scopes := checkinScopes(data)
+	for _, want := range []struct {
+		keys []string
+		dst  *float64
+	}{
+		{[]string{"credit", "reward_credit"}, &credit},
+		{[]string{"balance", "total_credit", "remain"}, &balance},
+	} {
+		for _, m := range scopes {
+			for _, k := range want.keys {
+				if v, ok := m[k]; ok {
+					if f := anyToF(v); f != 0 {
+						*want.dst = f
+						break
+					}
+				}
+			}
+			if *want.dst != 0 {
+				break
+			}
+		}
+	}
+	return credit, balance
+}
+
+// checkinScopes 列出签到响应的候选取值层：顶层、data、data.Response、
+// data.Response.Data（后者为 /billing/meter 族实测形状）。
+func checkinScopes(raw json.RawMessage) []map[string]any {
+	var top map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &top) != nil {
+		return nil
+	}
+	out := []map[string]any{top}
+	add := func(m map[string]any, key string) map[string]any {
+		if sub, ok := m[key].(map[string]any); ok {
+			out = append(out, sub)
+			return sub
+		}
+		return nil
+	}
+	if d := add(top, "data"); d != nil {
+		if r := add(d, "Response"); r != nil {
+			add(r, "Data")
+		}
+	}
+	if r := add(top, "Response"); r != nil {
+		add(r, "Data")
+	}
+	return out
 }
 
 // anyToF 宽松 any→float64（上游不同域字段可能是数字或字符串）。

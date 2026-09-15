@@ -104,3 +104,53 @@ func (c *Client) LotteryDraw(a *auth.Auth) (json.RawMessage, error) {
 	return c.growthJSON(a, http.MethodPost, lotteryDrawPath,
 		map[string]any{"client_token": clientToken()})
 }
+
+// LotteryCredit 从抽奖载荷中提取积分增量与奖品描述。
+//
+// 奖品字段形状随活动期变化（LotteryDraw 因此刻意透传原始载荷、不做解析），
+// 故此处按候选键宽松匹配：优先顶层，其次 prize / reward / data 子对象。
+// 命中第一个数值即返回；全部未命中时 credit=0、code 为空——调用方据此不入账，
+// 绝不臆造金额。首次真实抽奖的原始载荷会由调用方打进日志，可据其收紧候选键。
+func LotteryCredit(raw json.RawMessage) (code string, credit float64) {
+	if len(raw) == 0 {
+		return "", 0
+	}
+	var top map[string]any
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return "", 0
+	}
+	// 候选积分键（按优先级）。school 域用 credit_amount，growth 域尚未实测。
+	creditKeys := []string{"credit", "credit_amount", "reward_credit", "amount"}
+	codeKeys := []string{"prize_code", "code", "prize", "name"}
+	scope := []map[string]any{top}
+	for _, k := range []string{"prize", "reward", "data"} {
+		if sub, ok := top[k].(map[string]any); ok {
+			scope = append(scope, sub)
+		}
+	}
+	for _, m := range scope {
+		for _, k := range creditKeys {
+			if v, ok := m[k]; ok {
+				if f := anyToF(v); f != 0 {
+					credit = f
+					break
+				}
+			}
+		}
+		if credit != 0 {
+			break
+		}
+	}
+	for _, m := range scope {
+		for _, k := range codeKeys {
+			if v, ok := m[k].(string); ok && v != "" {
+				code = v
+				break
+			}
+		}
+		if code != "" {
+			break
+		}
+	}
+	return code, credit
+}

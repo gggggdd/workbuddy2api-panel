@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/ledger"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -73,13 +74,27 @@ func (s *Scheduler) schoolAccount(a *auth.Auth) {
 		return
 	}
 	for i := 0; i < chances; i++ {
-		prize, err := s.cfg.Upstream.SchoolDraw(a)
+		prizeCode, credit, err := s.cfg.Upstream.SchoolDraw(a)
 		if err != nil {
 			log.Printf("school %s: draw: %v", a.UID, err)
 			return
 		}
-		log.Printf("school %s: 🎲 %s", a.UID, prize)
+		log.Printf("school %s: 🎲 %s +%dc", a.UID, prizeCode, credit)
+		// 账本：转盘积分入账（实物券 credit=0 不入账）。
+		if lg := s.lg(); lg != nil && credit > 0 {
+			lg.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+				Kind: ledger.KindLottery, Delta: float64(credit), Task: prizeCode, Note: "开学季转盘"})
+		}
 		time.Sleep(2 * time.Second)
+	}
+}
+
+// schoolRecordTask 开学季任务奖励入账。积分金额取自任务条目的 reward_credit
+// （/tasks 给出），领奖响应只回抽奖次数、不回积分。
+func (s *Scheduler) schoolRecordTask(a *auth.Auth, taskCode string, credit int) {
+	if lg := s.lg(); lg != nil && credit > 0 {
+		lg.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+			Kind: ledger.KindTask, Delta: float64(credit), Task: taskCode, Note: "开学季任务"})
 	}
 }
 
@@ -106,7 +121,8 @@ func (s *Scheduler) schoolShareTask(a *auth.Auth) {
 		log.Printf("school %s: share claim: %v", a.UID, err)
 		return
 	}
-	log.Printf("school %s: ★ 分享任务完成，+100c +%d 抽奖次数", a.UID, granted)
+	log.Printf("school %s: ★ 分享任务完成，+%dc +%d 抽奖次数", a.UID, share.RewardCredit, granted)
+	s.schoolRecordTask(a, "share_invite", share.RewardCredit)
 }
 
 // schoolPollDone 轮询任务是否达标（异步计分，最多 schoolPollLoops 次）。
@@ -156,7 +172,8 @@ func (s *Scheduler) schoolChatTimesTask(a *auth.Auth) {
 		log.Printf("school %s: chat claim: %v", a.UID, err)
 		return
 	}
-	log.Printf("school %s: ★ 对话任务完成，+50c +%d 抽奖次数", a.UID, granted)
+	log.Printf("school %s: ★ 对话任务完成，+%dc +%d 抽奖次数", a.UID, t.RewardCredit, granted)
+	s.schoolRecordTask(a, "chat_3_times", t.RewardCredit)
 }
 
 // schoolExpertTask 完成 expert_use：viewed → 专家事件链 → 轮询 → 领奖。
@@ -191,7 +208,8 @@ func (s *Scheduler) schoolExpertTask(a *auth.Auth) {
 		log.Printf("school %s: expert claim: %v", a.UID, err)
 		return
 	}
-	log.Printf("school %s: ★ 专家任务完成，+50c +%d 抽奖次数", a.UID, granted)
+	log.Printf("school %s: ★ 专家任务完成，+%dc +%d 抽奖次数", a.UID, t.RewardCredit, granted)
+	s.schoolRecordTask(a, "expert_use", t.RewardCredit)
 }
 
 // schoolDesktopTask 完成 desktop_chat_1_time：viewed 激活 → 真实 chat → 六事件链。
@@ -229,7 +247,8 @@ func (s *Scheduler) schoolDesktopTask(a *auth.Auth) {
 		}
 		if t2 := findSchoolTask(tasks2, "desktop_chat_1_time"); t2 != nil && t2.Progress >= t2.TargetCount {
 			if granted, err := s.cfg.Upstream.SchoolClaimTask(a, "desktop_chat_1_time"); err == nil {
-				log.Printf("school %s: ★ 桌面端体验任务完成 +100c +%d 抽奖", a.UID, granted)
+				log.Printf("school %s: ★ 桌面端体验任务完成 +%dc +%d 抽奖", a.UID, t2.RewardCredit, granted)
+				s.schoolRecordTask(a, "desktop_chat_1_time", t2.RewardCredit)
 			}
 			return
 		}

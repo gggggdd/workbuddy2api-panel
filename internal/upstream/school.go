@@ -54,6 +54,10 @@ type SchoolTask struct {
 	Status      string `json:"status"` // pending | completed | claimed
 	Progress    int    `json:"progress"`
 	TargetCount int    `json:"target_count"`
+	// RewardCredit 任务奖励积分。由 /tasks 直接给出（实测 share_invite=100、
+	// chat_3_times=50、expert_use=50、desktop_chat_1_time=100），领奖响应不返回
+	// 积分金额，故入账取值一律以本字段为准。
+	RewardCredit int `json:"reward_credit"`
 }
 
 // SchoolTasks 任务列表 + 活动是否在期。
@@ -104,20 +108,17 @@ func (c *Client) SchoolChances(a *auth.Auth) (int, error) {
 	return out.Chance.Balance, nil
 }
 
-// SchoolDraw 抽奖一次，返回奖品描述（prize_code + 积分）。
-func (c *Client) SchoolDraw(a *auth.Auth) (string, error) {
+// SchoolDraw 抽奖一次，返回奖品编码与积分增量（credit=0 表示实物券等无积分奖品）。
+func (c *Client) SchoolDraw(a *auth.Auth) (prizeCode string, credit int, err error) {
 	var out struct {
 		PrizeCode    string `json:"prize_code"`
 		CreditAmount int    `json:"credit_amount"`
 	}
 	if err := c.schoolJSON(a, http.MethodPost, "/wheel/draw",
 		map[string]any{"draw_uuid": clientToken()}, &out); err != nil {
-		return "", err
+		return "", 0, err
 	}
-	if out.CreditAmount > 0 {
-		return fmt.Sprintf("%s +%dc", out.PrizeCode, out.CreditAmount), nil
-	}
-	return out.PrizeCode, nil
+	return out.PrizeCode, out.CreditAmount, nil
 }
 
 // ---- 开学季 chat_3_times / expert_use（2026-09-14 判据破解）----

@@ -450,8 +450,9 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
-// 与 scheduler.RunCheckinNow 的单号语义一致。
+// accountCheckin 单号签到：DailyCheckinCredit 一次 POST 完成签到并解析奖励
+//（已签到等业务错误不阻塞余额刷新），成功且本轮有到账则入账——与 scheduler /
+// login 的签到记账同口径。此前只调 DailyCheckin、不入账，面板手动签到的积分会丢。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -460,12 +461,19 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	checkinMsg := ""
-	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
-		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
+	credit, _, cerr := p.cfg.Upstream.DailyCheckinCredit(a)
+	if cerr != nil {
+		checkinMsg = cerr.Error() // "今天已签到"等业务错误照常查余额
+	} else if p.cfg.Ledger != nil && credit > 0 {
+		p.cfg.Ledger.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+			Kind: ledger.KindCheckin, Delta: credit, Note: "每日签到（面板）"})
 	}
 	resp := map[string]any{"ok": true}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
+	}
+	if credit > 0 {
+		resp["credit"] = credit
 	}
 	remain, total, err := p.cfg.Upstream.UserResourceRT(a)
 	if err != nil {
@@ -476,7 +484,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
 	resp["credits"] = remain
 	resp["credits_total"] = total
-	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
+	log.Printf("panel: checkin uid=%s msg=%q credit=%.0f credits=%d/%d", uid, checkinMsg, credit, remain, total)
 	writeJSON(w, http.StatusOK, resp)
 }
 

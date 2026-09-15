@@ -1026,7 +1026,7 @@ $('memBody').addEventListener('click', async ev => {
 
 
 /* ── 积分明细（账本） ─────────────────────────────────────────────── */
-const LG_KIND = { chat: '对话消耗', checkin: '签到', task: '任务奖励', travel: '猫猫旅行', gift: '新手礼包', compensation: '补偿', adjust: '校准' };
+const LG_KIND = { chat: '对话消耗', checkin: '签到', task: '任务奖励', travel: '猫猫旅行', lottery: '抽奖', gift: '新手礼包', compensation: '补偿', adjust: '校准' };
 const lgFmt = n => (n >= 0 ? '+' : '') + (Math.round(n * 100) / 100);
 function lgTime(iso) { const d = new Date(iso); return isNaN(d) ? iso : d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
 function lgDetail(e) {
