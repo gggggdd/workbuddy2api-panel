@@ -1040,7 +1040,7 @@ async function loadLedger() {
   try {
     const [sum, det] = await Promise.all([
       api('ledger/summary?hours=' + hours),
-      api('ledger?hours=' + hours + '&kind=' + $('lgKind').value + '&limit=300')
+      api('ledger?hours=' + hours + '&kind=' + $('lgKind').value + '&limit=2000')
     ]);
     const net = (sum.inflow || 0) - (sum.outflow || 0);
     $('lgIn').textContent = '+' + (Math.round((sum.inflow || 0) * 100) / 100);
