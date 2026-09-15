@@ -187,7 +187,7 @@ func TestModelCooldownsClearedByRevive(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.CooldownSoftForModel("u1", 600*time.Second, time.Now().Add(time.Hour), "glm-5.3", "6004")
-	p.ReenableIfCredits("u1", 500)
+	p.ReenableIfCredits("u1", 500, 0)
 	p.mu.RLock()
 	n := len(p.byUID["u1"].modelCooldowns)
 	p.mu.RUnlock()
@@ -326,8 +326,8 @@ func TestModelCooldownsPickSkipsLimitedModel(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
 	p.Add(&auth.Auth{UID: "u2"})
-	p.SetCredits("u1", 1000)
-	p.SetCredits("u2", 1)
+	p.SetCredits("u1", 1000, 0)
+	p.SetCredits("u2", 1, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 })
 	p.CooldownSoftForModel("u1", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")
 	if got := p.PickExcludingForModel(nil, "glm-5.3"); got == nil || got.UID != "u2" {
@@ -463,8 +463,8 @@ func TestHealthyForModelPriorityViaPick(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "cooled"})
 	p.Add(&auth.Auth{UID: "exempt"})
-	p.SetCredits("cooled", 100)
-	p.SetCredits("exempt", 50)
+	p.SetCredits("cooled", 100, 0)
+	p.SetCredits("exempt", 50, 0)
 	p.SetRandomSource(func(n int64) int64 { return 0 }) // r=0 → 最高分 cooled
 	p.Cooldown("cooled", CoolSoft, time.Hour, "429")    // 全账号级冷却，无模型级记录
 	p.CooldownSoftForModel("exempt", time.Minute, time.Now().Add(5*time.Minute), "glm-5.3", "6004")

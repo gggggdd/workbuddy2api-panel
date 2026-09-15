@@ -10,8 +10,11 @@
 package session
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,9 +34,8 @@ type Config struct {
 	GCInterval time.Duration
 	Store      redisstore.Store
 	Available  func() []string
-	// AvailableForModel 按请求模型返回"在该模型上可用"的账号
-	// （healthy 且未占满在途，且未被该模型限流/限额）。nil 时回落 Available
-	// （无模型维度，行为与引入前一致）。
+	// AvailableForModel 按请求模型返回"在该模型上可用"的账号（healthy 且未占满在途，
+	// 且未被该模型限流/限额）。nil 时回落 Available（无模型维度，行为与引入前一致）。
 	//
 	// 为什么粘性需要模型维度：绑定只记 uid，而同一个会话可能换模型。账号被 6004
 	// 模型级限额后对**其他模型**仍可用（issue #31 豁免），此时若只按账号级可用性
@@ -132,7 +134,7 @@ func (r *Router) Resolve(key string) (string, bool) {
 // 被该模型限流）走重新分配。
 //
 // 为什么必须带模型：绑定只记 uid，同一个会话可能换模型；账号被 6004 模型级限额后
-// 对其他模型仍可用（见 pool.healthyForModel 的模型级冷却豁免）。若只按账号级
+// 对其他模型仍可用（见 pool.healthyForModel 的 softRateModel 豁免）。若只按账号级
 // 可用性校验，会话会被钉在一个"对当前模型不可用"的号上反复失败。
 func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	now := time.Now()
@@ -147,7 +149,7 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 			r.touch(key, e.uid, now)
 			return e.uid, true
 		}
-		// 绑定号在该模型上已冷却/占满/被限流 → 失效，落入慢路径重分配。
+		// 绑定号已冷却/占满 → 失效，落入慢路径重分配。
 	}
 
 	// ── Slow path: 写锁 re-check 后分配 ────────────────────
@@ -256,7 +258,7 @@ func (r *Router) gcOnce(now time.Time) int {
 	return len(expiredKeys)
 }
 
-// availableSet 把可用账号列表转集合（快路径命中校验用）。
+// availableSet 把 AvailableForModel(model) 的有序列表转集合（快路径命中校验用）。
 func (r *Router) availableSet(model string) map[string]bool {
 	uids := r.availableSlice(model)
 	set := make(map[string]bool, len(uids))
@@ -266,8 +268,7 @@ func (r *Router) availableSet(model string) map[string]bool {
 	return set
 }
 
-// availableSlice 安全调用可用账号函数（nil 函数视空池）。
-// 优先走 AvailableForModel（带模型过滤）；未注入时回落 Available（无模型维度）。
+// availableSlice 安全调用 AvailableForModel；未注入时回落 Available（nil 视空池）。
 func (r *Router) availableSlice(model string) []string {
 	if r.cfg.AvailableForModel != nil {
 		return r.cfg.AvailableForModel(model)
@@ -292,12 +293,14 @@ func hashIndex(key string, n int) int {
 	return int(h % uint32(n))
 }
 
-// ExtractKey 从请求体提取会话键；按下列顺序依次尝试，找不到返回空串（绝不失败）。
+// ExtractKey 从请求体提取会话键；按下列顺序依次尝试，找不到时回退到
+// 内容派生的稳定键（见 deriveKey），仍为空则返回空串（绝不失败）。
 //  1. metadata.conversation_id
 //  2. metadata.conversationId
 //  3. conversation_id
 //  4. conversationId
 //  5. metadata.user_id
+//  6. 派生键：system 提示词 + 首条用户消息的哈希（客户端不发会话 id 时的回退）
 //
 // issue #35：客户端实际发 camelCase 的 conversationId，此前只识别 snake_case，
 // 导致粘性路由不命中、同对话轮转不同账号、上游上下文缓存 miss。现两种命名均识别，
@@ -324,7 +327,73 @@ func ExtractKey(body []byte) string {
 	if v := strOrEmpty(obj["conversation_id"]); v != "" {
 		return v
 	}
-	return strOrEmpty(obj["conversationId"])
+	if v := strOrEmpty(obj["conversationId"]); v != "" {
+		return v
+	}
+	return deriveKey(obj)
+}
+
+// derivedKeyPrefix 派生键前缀，与显式会话 id 的命名空间隔离：
+// 即便客户端恰好传了形如 "d-<hex>" 的显式 id 也不至于与派生键混淆（显式 id 优先返回）。
+const derivedKeyPrefix = "d-"
+
+// deriveKey 从消息内容派生稳定会话键：SHA-256(system 文本 + 首条 user 文本) 前 16 字节。
+//
+// 为什么用「system + 首条 user」而不是全部消息：
+//   - 多轮对话里历史消息每轮追加，全量哈希会每轮变化 → 粘性完全失效；
+//   - system 与首条 user 在一次对话中恒定，足以区分不同对话；
+//   - 同一会话多轮请求 → 同一键 → 稳定粘住同一账号（上游 prompt 缓存命中）。
+//
+// 取不到用户文本（纯图片等）时返回空串：不粘性，退回普通轮换（安全降级）。
+func deriveKey(obj map[string]any) string {
+	msgs, ok := obj["messages"].([]any)
+	if !ok || len(msgs) == 0 {
+		return ""
+	}
+	systemText, firstUserText := "", ""
+	for _, m := range msgs {
+		msg, ok := m.(map[string]any)
+		if !ok {
+			continue
+		}
+		text := messageText(msg["content"])
+		switch strOrEmpty(msg["role"]) {
+		case "system", "developer":
+			if systemText == "" {
+				systemText = text
+			}
+		case "user":
+			if firstUserText == "" {
+				firstUserText = text
+			}
+		}
+		if firstUserText != "" && systemText != "" {
+			break // 都已拿到：停止遍历长历史
+		}
+	}
+	if firstUserText == "" {
+		return "" // 无用户消息：无从归属会话
+	}
+	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
+}
+
+// messageText 提取消息 content 的文本表示。
+// 兼容：字符串 / [{type:"text",text:"..."}] 数组（OpenAI 多模态）；其他类型取空。
+func messageText(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var sb strings.Builder
+		for _, part := range v {
+			if p, ok := part.(map[string]any); ok {
+				sb.WriteString(strOrEmpty(p["text"]))
+			}
+		}
+		return sb.String()
+	}
+	return ""
 }
 
 // strOrEmpty 把 JSON 字符串字段安全转 string（非字符串类型返回空）。

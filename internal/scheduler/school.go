@@ -1,99 +1,248 @@
-// school.go 开学季任务与夜猫子任务的脚本类排程：从系统 crontab 迁入 Go scheduler。
+// school.go 开学季管家：签到排程末尾自动「分享上报 → 领奖 → 抽奖」。
 //
-// 背景：school（12:00）与 cat（01:00 夜猫窗口）原由系统 crontab 调
-// scripts/school_open_day_cron.sh 执行——依赖外部系统 cron、容器重建可能丢失、
-// 不在 config 里配置。迁入后成为第五、第六类任务，时点由 schedule.school_hours /
-// schedule.cat_hours 配置，school_open_day_cron.sh 保留为手动触发入口。
+// 活动期 2026-09-13 ~ 09-24（每日刷新）：share_invite 判据为纯前端上报
+// （POST /tasks/share-complete，实测三账号即点亮），+100c + 1 次抽奖/天/号。
+// chat_3_times / expert_use 判据绑定小程序原生沙箱会话，纯 API 不做（需人工）。
+// 活动结束后 in_period=false 自动跳过，无需下线代码。
 package scheduler
 
 import (
+	"fmt"
 	"log"
-	"os"
-	"os/exec"
-	"path/filepath"
+	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
-// repoRoot 定位仓库根（容器内 /app、宿主 /root/workbuddy2api）。
-// 策略：从当前工作目录逐级向上找 scripts/school_open_day_2026.py，
-// 找不到回落 os.Getwd()（此时 Run 会因脚本缺失打 WARN，不 panic）。
-// 注意：Go scheduler 在 cmd/server 内以工作目录启动（容器 WORKDIR /app），
-// 若进程以别的工作目录拉起（如 systemd/裸 binary），上溯穷尽后仍以
-// os.Getwd() 兜底，把缺失暴露成 WARN 而非静默。
-func repoRoot() string {
-	start, err := os.Getwd()
-	if err != nil {
-		return "."
-	}
-	dir := start
-	for {
-		if _, err := os.Stat(filepath.Join(dir, "scripts", "school_open_day_2026.py")); err == nil {
-			return dir
-		}
-		parent := filepath.Dir(dir)
-		if parent == dir {
-			return start
-		}
-		dir = parent
-	}
-}
+// schoolPollLoops/LGap share-complete 后的异步计分轮询（实测 2.5s 内点亮）。
+const (
+	schoolPollLoops = 3
+	schoolPollGap   = 2500 * time.Millisecond
+)
 
-// scriptRunner 脚本子进程的最小执行面：可被测试替换，避免测试真正拉起 python3。
-type scriptRunner interface {
-	SetDir(string)
-	Run() error
-}
-
-// scriptCmd exec.Cmd 适配器：把 exec.Cmd 的 Dir 字段包装成 SetDir 方法，
-// 满足 scriptRunner 接口（exec.Cmd 本身只有字段没有方法）。
-type scriptCmd struct{ cmd *exec.Cmd }
-
-func (c *scriptCmd) SetDir(dir string) { c.cmd.Dir = dir }
-func (c *scriptCmd) Run() error        { return c.cmd.Run() }
-
-// newScriptCmd 构建脚本子进程。包级变量便于测试注入 fake（installFakeExec 覆盖）。
-// 工作目录由调用方 SetDir 显式设置仓库根。
-var newScriptCmd = func(program string, args ...string) scriptRunner {
-	return &scriptCmd{cmd: exec.Command(program, args...)}
-}
-
-// runScript 依次执行若干脚本命令：任一命令失败只记一行 WARN，不向上抛、
-// 不影响调度主循环继续跑下一个时点。单命令失败不中断后续命令。
-func runScript(name, root string, commands [][]string) {
-	for _, cmdArgs := range commands {
-		c := newScriptCmd(cmdArgs[0], cmdArgs[1:]...)
-		c.SetDir(root)
-		if err := c.Run(); err != nil {
-			log.Printf("WARN: %s (%s): %v", name, cmdArgs[1], err)
+// RunSchoolNow 对所有可用账号执行开学季活动闭环（幂等：不在期/已领静默跳过）。
+// 由 RunCheckinNow 末尾调用（活动是每日刷新，搭每日签到的车最自然）。
+func (s *Scheduler) RunSchoolNow() {
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled {
 			continue
 		}
-		log.Printf("%s: ok (%s)", name, cmdArgs[1])
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.AccessToken == "" {
+			continue
+		}
+		if a.IsGlobal() {
+			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
+		}
+		s.schoolAccount(a)
+		time.Sleep(activityAccountDelay)
 	}
 }
 
-// RunSchoolNow 立即执行开学季任务：school_open_day_2026.py ALL --run --yes。
-// 全量跑任务点亮 + 领奖 + 自动抽空抽奖余额。活动下线（in_period=false）时脚本
-// 各段全量跳过、正常退出，不视为失败。失败只记 WARN。
-func (s *Scheduler) RunSchoolNow() {
-	root := repoRoot()
-	runScript("school", root, [][]string{
-		{"python3", "scripts/school_open_day_2026.py", "ALL", "--run", "--yes"},
-	})
-}
-
-// RunCatNow 立即执行夜猫子任务：task_runner.py ALL --yes --only black_cat。
-// black_cat 时段敏感：夜猫窗口 23:00–08:00 CST 内最多补 1 次（task_runner 内部
-// 判定，非窗口期打印 skip 正常退出）。失败只记 WARN。
-func (s *Scheduler) RunCatNow() {
-	root := repoRoot()
-	runScript("cat", root, [][]string{
-		{"python3", "scripts/task_runner.py", "ALL", "--yes", "--only", "black_cat"},
-	})
-}
-
-// RunSchoolAccountNow fork 特性（panel 任务中心）：单账号立即执行开学季闭环。
-// 上游 school 闭环是脚本化 ALL 批处理；本仓库按账号粒度复用同一脚本链。
+// RunSchoolAccountNow 单账号开学季闭环（面板任务中心逐账号执行用）：
+// 四任务独立处理 + 抽完抽奖次数，与每日排程同语义。
 func (s *Scheduler) RunSchoolAccountNow(a *auth.Auth) {
-	s.RunSchoolNow() // 上游实现按池内全部健康账号执行；单账号语义由调用方过滤
+	s.schoolAccount(a)
+}
+
+// schoolAccount 单账号闭环：四个任务独立处理（已领/不在期静默跳过），最后抽完次数。
+// 判据（三账号实测 2026-09-13/14，protocol.md §7.11/§8）：
+//   - share_invite（每日 +100c+1抽）：POST share-complete 即点亮。
+//   - desktop_chat_1_time（单次 +100c+1抽）：viewed + 真实 chat + 桌面六事件链。
+//   - chat_3_times（每日 +50c+1抽）：viewed + 3 条 chat_request_send 埋点
+//     （conversationId 任意，无需真实会话）。
+//   - expert_use（每日 +50c+1抽）：viewed + mp 事件链（专家召唤 ×3 + 对话）。
+func (s *Scheduler) schoolAccount(a *auth.Auth) {
+	tasks, inPeriod, err := s.cfg.Upstream.SchoolTasks(a)
+	if err != nil {
+		log.Printf("school %s: tasks: %v", a.UID, err)
+		return
+	}
+	if !inPeriod {
+		return // 活动已结束，静默
+	}
+	_ = tasks
+	s.schoolShareTask(a)
+	s.schoolDesktopTask(a)
+	s.schoolChatTimesTask(a)
+	s.schoolExpertTask(a)
+	// 抽奖：把余额全抽完（含本次活动新领的次数）。
+	chances, err := s.cfg.Upstream.SchoolChances(a)
+	if err != nil {
+		return
+	}
+	for i := 0; i < chances; i++ {
+		prize, err := s.cfg.Upstream.SchoolDraw(a)
+		if err != nil {
+			log.Printf("school %s: draw: %v", a.UID, err)
+			return
+		}
+		log.Printf("school %s: 🎲 %s", a.UID, prize)
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// schoolShareTask 完成 share_invite：share-complete 上报 → 轮询 → 领奖。
+func (s *Scheduler) schoolShareTask(a *auth.Auth) {
+	tasks, _, err := s.cfg.Upstream.SchoolTasks(a)
+	if err != nil {
+		return
+	}
+	share := findSchoolTask(tasks, "share_invite")
+	if share == nil || share.Status == "claimed" {
+		return
+	}
+	if err := s.cfg.Upstream.SchoolShareComplete(a); err != nil {
+		log.Printf("school %s: share-complete: %v", a.UID, err)
+		return
+	}
+	if !s.schoolPollDone(a, "share_invite") {
+		log.Printf("school %s: share-complete 上报后未点亮（明日重试）", a.UID)
+		return
+	}
+	granted, err := s.cfg.Upstream.SchoolClaimTask(a, "share_invite")
+	if err != nil {
+		log.Printf("school %s: share claim: %v", a.UID, err)
+		return
+	}
+	log.Printf("school %s: ★ 分享任务完成，+100c +%d 抽奖次数", a.UID, granted)
+}
+
+// schoolPollDone 轮询任务是否达标（异步计分，最多 schoolPollLoops 次）。
+func (s *Scheduler) schoolPollDone(a *auth.Auth, code string) bool {
+	for i := 0; i < schoolPollLoops; i++ {
+		time.Sleep(schoolPollGap)
+		tasks2, _, err := s.cfg.Upstream.SchoolTasks(a)
+		if err != nil {
+			continue
+		}
+		if t := findSchoolTask(tasks2, code); t != nil && t.TargetCount > 0 && t.Progress >= t.TargetCount {
+			return true
+		}
+	}
+	return false
+}
+
+// schoolChatTimesTask 完成 chat_3_times：viewed → 3 条埋点 → 轮询 → 领奖。
+func (s *Scheduler) schoolChatTimesTask(a *auth.Auth) {
+	tasks, _, err := s.cfg.Upstream.SchoolTasks(a)
+	if err != nil {
+		return
+	}
+	t := findSchoolTask(tasks, "chat_3_times")
+	if t == nil || t.Status == "claimed" || (t.TargetCount > 0 && t.Progress >= t.TargetCount && t.Status == "completed") {
+		return
+	}
+	if t.Status == "pending" {
+		if err := s.cfg.Upstream.SchoolTaskViewed(a, "chat_3_times"); err != nil {
+			log.Printf("school %s: chat viewed: %v", a.UID, err)
+			return
+		}
+	}
+	for i := 0; i < t.TargetCount && i < 5; i++ {
+		if err := s.cfg.Upstream.ReportMPEvent(a, upstream.SchoolChatTimesEvents(fmt.Sprintf("wb2api-chat-%d-%d", time.Now().Unix(), i))); err != nil {
+			log.Printf("school %s: chat events: %v", a.UID, err)
+			return
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !s.schoolPollDone(a, "chat_3_times") {
+		log.Printf("school %s: chat_3_times 未点亮（明日重试）", a.UID)
+		return
+	}
+	granted, err := s.cfg.Upstream.SchoolClaimTask(a, "chat_3_times")
+	if err != nil {
+		log.Printf("school %s: chat claim: %v", a.UID, err)
+		return
+	}
+	log.Printf("school %s: ★ 对话任务完成，+50c +%d 抽奖次数", a.UID, granted)
+}
+
+// schoolExpertTask 完成 expert_use：viewed → 专家事件链 → 轮询 → 领奖。
+// 开学季专家（16-BackToSchool 分类）：论文写作导师。
+func (s *Scheduler) schoolExpertTask(a *auth.Auth) {
+	tasks, _, err := s.cfg.Upstream.SchoolTasks(a)
+	if err != nil {
+		return
+	}
+	t := findSchoolTask(tasks, "expert_use")
+	if t == nil || t.Status == "claimed" || (t.TargetCount > 0 && t.Progress >= t.TargetCount) {
+		return
+	}
+	if t.Status == "pending" {
+		if err := s.cfg.Upstream.SchoolTaskViewed(a, "expert_use"); err != nil {
+			log.Printf("school %s: expert viewed: %v", a.UID, err)
+			return
+		}
+	}
+	events := upstream.SchoolExpertUseEvents("ex_jB0dyFIQJEWa", "论文写作导师",
+		fmt.Sprintf("wb2api-exp-%d", time.Now().Unix()))
+	if err := s.cfg.Upstream.ReportMPEvent(a, events...); err != nil {
+		log.Printf("school %s: expert events: %v", a.UID, err)
+		return
+	}
+	if !s.schoolPollDone(a, "expert_use") {
+		log.Printf("school %s: expert_use 未点亮（明日重试）", a.UID)
+		return
+	}
+	granted, err := s.cfg.Upstream.SchoolClaimTask(a, "expert_use")
+	if err != nil {
+		log.Printf("school %s: expert claim: %v", a.UID, err)
+		return
+	}
+	log.Printf("school %s: ★ 专家任务完成，+50c +%d 抽奖次数", a.UID, granted)
+}
+
+// schoolDesktopTask 完成 desktop_chat_1_time：viewed 激活 → 真实 chat → 六事件链。
+func (s *Scheduler) schoolDesktopTask(a *auth.Auth) {
+	tasks, _, err := s.cfg.Upstream.SchoolTasks(a)
+	if err != nil {
+		return
+	}
+	t := findSchoolTask(tasks, "desktop_chat_1_time")
+	if t == nil || t.Status == "claimed" || t.Progress >= t.TargetCount {
+		return
+	}
+	if t.Status == "pending" {
+		if err := s.cfg.Upstream.SchoolTaskViewed(a, "desktop_chat_1_time"); err != nil {
+			log.Printf("school %s: desktop viewed: %v", a.UID, err)
+			return
+		}
+	}
+	conv, req, err := s.cfg.Upstream.DesktopChatWithExpert(a, "")
+	if err != nil {
+		log.Printf("school %s: desktop chat: %v", a.UID, err)
+		return
+	}
+	events := upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model")
+	if err := s.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		log.Printf("school %s: desktop events: %v", a.UID, err)
+		return
+	}
+	// 异步计分轮询后领奖（失败不阻塞 share 主流程）。
+	for i := 0; i < schoolPollLoops; i++ {
+		time.Sleep(schoolPollGap)
+		tasks2, _, err := s.cfg.Upstream.SchoolTasks(a)
+		if err != nil {
+			continue
+		}
+		if t2 := findSchoolTask(tasks2, "desktop_chat_1_time"); t2 != nil && t2.Progress >= t2.TargetCount {
+			if granted, err := s.cfg.Upstream.SchoolClaimTask(a, "desktop_chat_1_time"); err == nil {
+				log.Printf("school %s: ★ 桌面端体验任务完成 +100c +%d 抽奖", a.UID, granted)
+			}
+			return
+		}
+	}
+	log.Printf("school %s: desktop_chat_1_time 未点亮（明日重试）", a.UID)
+}
+
+// findSchoolTask 按任务码查条目。
+func findSchoolTask(tasks []upstream.SchoolTask, code string) *upstream.SchoolTask {
+	for i := range tasks {
+		if tasks[i].TaskCode == code {
+			return &tasks[i]
+		}
+	}
+	return nil
 }

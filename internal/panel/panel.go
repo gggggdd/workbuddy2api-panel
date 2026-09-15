@@ -78,7 +78,7 @@ type Panel struct {
 	// logins 进行中的 OAuth 设备授权会话（state → 创建时刻）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
 	loginMu sync.Mutex
-	logins  map[string]time.Time
+	logins  map[string]loginSession
 
 	// taskMu/taskLocks 一键完成任务的 per-account 互斥：同一账号的任务动作
 	// （单任务 / 全量）同时只允许一条在跑。重复点击直接返回 409"仍在执行"，
@@ -121,6 +121,12 @@ func (p *Panel) unlockAccount(uid string) {
 // 防止"开了添加账号弹窗就走开"的会话永久滞留。
 const loginTTL = 15 * time.Minute
 
+// loginSession 进行中的 OAuth 设备授权会话（fork: 支持双域选 realm）。
+type loginSession struct {
+	created time.Time
+	realm   string // "cn" / "global"，缺省 cn
+}
+
 // New 构建面板。
 func New(cfg Config) *Panel {
 	if cfg.RedisMode == "" {
@@ -131,7 +137,7 @@ func New(cfg Config) *Panel {
 		mux:     http.NewServeMux(),
 		started: time.Now(),
 		logs:    NewRing(500),
-		logins:  map[string]time.Time{},
+		logins:  make(map[string]loginSession),
 	}
 	p.routes()
 	return p
@@ -457,7 +463,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
-	p.cfg.Pool.ReenableIfCredits(uid, remain)
+	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
 	resp["credits"] = remain
 	resp["credits_total"] = total
 	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
@@ -477,7 +483,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
 	}
-	p.cfg.Pool.SetCredits(uid, remain)
+	p.cfg.Pool.SetCredits(uid, remain, total)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credits": remain, "credits_total": total})
 }
 

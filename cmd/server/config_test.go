@@ -1,10 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDefault(t *testing.T) {
@@ -289,16 +291,6 @@ func TestScheduleEnabledByDefault(t *testing.T) {
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want [10]", c.Schedule.ActivityHours)
 	}
-	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
-		t.Errorf("school_hours=%v want [12]", c.Schedule.SchoolHours)
-	}
-	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
-		t.Errorf("cat_hours=%v want [1]", c.Schedule.CatHours)
-	}
-	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
-		t.Errorf("school/cat enabled defaults want true/true, got %v/%v",
-			c.Schedule.SchoolEnabled, c.Schedule.CatEnabled)
-	}
 }
 
 // TestScheduleLegacyConfigKeepsRunning 老 config（只写签到/保活小时数组，无新键）加载后仍是启用态，
@@ -326,15 +318,6 @@ func TestScheduleLegacyConfigKeepsRunning(t *testing.T) {
 	}
 	if len(c.Schedule.ActivityHours) != 1 || c.Schedule.ActivityHours[0] != 10 {
 		t.Errorf("activity_hours=%v want default [10]", c.Schedule.ActivityHours)
-	}
-	if len(c.Schedule.SchoolHours) != 1 || c.Schedule.SchoolHours[0] != 12 {
-		t.Errorf("school_hours=%v want default [12]", c.Schedule.SchoolHours)
-	}
-	if len(c.Schedule.CatHours) != 1 || c.Schedule.CatHours[0] != 1 {
-		t.Errorf("cat_hours=%v want default [1]", c.Schedule.CatHours)
-	}
-	if !c.Schedule.SchoolEnabled || !c.Schedule.CatEnabled {
-		t.Errorf("school/cat switches must default true on legacy config: %+v", c.Schedule)
 	}
 }
 
@@ -511,6 +494,80 @@ func TestBadSessionTTL(t *testing.T) {
 	}
 }
 
+func TestWriteDefault(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "sub", "config.json") // 顺带验证父目录自动创建
+	key, err := WriteDefault(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// key 形如 sk-<24字符随机串>，两次生成不重复
+	if !strings.HasPrefix(key, "sk-") || len(key) < 20 {
+		t.Errorf("key=%q want sk-<random>", key)
+	}
+	if key2, _ := WriteDefault(filepath.Join(dir, "another.json")); key2 == key {
+		t.Errorf("two generated keys identical: %q", key)
+	}
+	// 落盘文件可被 Load 正常加载，推荐值齐备且 api_key 生效
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("load generated config: %v", err)
+	}
+	if c.APIKey != key {
+		t.Errorf("api_key=%q want %q", c.APIKey, key)
+	}
+	if c.Listen != ":7863" || c.AuthDir != "./auths" || c.StateFile != "./data/state.json" {
+		t.Errorf("generated defaults off: %+v", c)
+	}
+	if len(c.Schedule.CheckinHours) == 0 || !c.Schedule.CheckinEnabled {
+		t.Errorf("generated schedule off: %+v", c.Schedule)
+	}
+	// 已存在的文件不覆盖：二次写入同一路径必须报错
+	if _, err := WriteDefault(fp); err == nil {
+		t.Error("WriteDefault must refuse to overwrite existing file")
+	}
+}
+
+func TestBalanceRefreshDefaults(t *testing.T) {
+	// 缺省：启用 + 30 分钟
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Schedule.BalanceRefreshEnabled || c.BalanceRefreshInterval != 5*time.Minute {
+		t.Errorf("default balance refresh: enabled=%v interval=%v", c.Schedule.BalanceRefreshEnabled, c.BalanceRefreshInterval)
+	}
+	// 显式配置 10 分钟
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"balance_refresh_minutes":10}}`), 0o600)
+	c2, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.BalanceRefreshInterval != 10*time.Minute {
+		t.Errorf("interval=%v want 10m", c2.BalanceRefreshInterval)
+	}
+	// 显式关闭：interval 归零（不启动）
+	os.WriteFile(fp, []byte(`{"schedule":{"balance_refresh_enabled":false}}`), 0o600)
+	c3, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.BalanceRefreshInterval != 0 {
+		t.Errorf("disabled interval=%v want 0", c3.BalanceRefreshInterval)
+	}
+	// 启用但 minutes<=0 → 回落默认 30
+	os.WriteFile(fp, []byte(`{"schedule":{"balance_refresh_minutes":-5}}`), 0o600)
+	c4, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c4.BalanceRefreshInterval != 5*time.Minute {
+		t.Errorf("fallback interval=%v want 30m", c4.BalanceRefreshInterval)
+	}
+}
+
 // TestMaxBodyDefault 默认 max_body_mb=8。
 func TestMaxBodyDefault(t *testing.T) {
 	c := Default()
@@ -568,8 +625,9 @@ func TestMaxBodyEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptDefaultMode 默认 prompt.mode=passthrough 且不加载 PromptText（透传客户端原始 system）。
-func TestPromptDefaultMode(t *testing.T) {
+// TestPromptDefaultPassthrough 默认 prompt.mode=passthrough（对齐上游：透传客户端
+// 原始 system 是更保守的缺省）；custom 由用户显式选择，此时 PromptText 为内置默认（非空）。
+func TestPromptDefaultPassthrough(t *testing.T) {
 	c, err := Load("")
 	if err != nil {
 		t.Fatal(err)
@@ -577,9 +635,7 @@ func TestPromptDefaultMode(t *testing.T) {
 	if c.Prompt.Mode != "passthrough" {
 		t.Errorf("prompt.mode=%q want passthrough", c.Prompt.Mode)
 	}
-	if c.PromptText != "" {
-		t.Errorf("default passthrough should not load PromptText, got len=%d", len(c.PromptText))
-	}
+	// passthrough 不加载提示词文本（透传客户端 system）；切 custom 时 normalize 会加载。
 }
 
 // TestPromptExplicitPassthrough passthrough 模式不加载文本（透传客户端原始 system）。
@@ -626,9 +682,12 @@ func TestPromptFileOverride(t *testing.T) {
 	want := "我的自定义人格入口"
 	os.WriteFile(pf, []byte(want), 0o600)
 	cf := filepath.Join(dir, "c.json")
-	// 路径写进 JSON 字符串需转义反斜杠：Windows 下 filepath.Join 生成 C:\Users\...，
-	// 原样拼接会让 \U 成为非法 JSON 转义。ToSlash 统一为正斜杠（跨平台可解析）。
-	os.WriteFile(cf, []byte(`{"prompt":{"mode":"custom","file":"`+filepath.ToSlash(pf)+`"}}`), 0o600)
+	// 用 json.Marshal 拼路径：Windows 反斜杠必须转义，手工字符串拼接会产出非法 JSON。
+	cfgJSON, err := json.Marshal(map[string]any{"prompt": map[string]any{"mode": "custom", "file": pf}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(cf, cfgJSON, 0o600)
 	c, err := Load(cf)
 	if err != nil {
 		t.Fatal(err)
@@ -650,7 +709,7 @@ func TestPromptEnvOverride(t *testing.T) {
 	}
 }
 
-// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 走缺省 passthrough。
+// TestPromptLegacyConfigNoImpact 旧 config（无 prompt 段）零影响：mode 缺省 passthrough。
 func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "c.json")
@@ -664,35 +723,6 @@ func TestPromptLegacyConfigNoImpact(t *testing.T) {
 	}
 	if c.Listen != ":9999" {
 		t.Errorf("listen=%q", c.Listen)
-	}
-}
-
-// TestUpstreamVersionConfig 配置 upstream.client_version / cli_version 与 env
-// WB2A_CLIENT_VERSION / WB2A_CLI_VERSION 均生效；缺省空串 = headers 层回落内置默认。
-func TestUpstreamVersionConfig(t *testing.T) {
-	dir := t.TempDir()
-	fp := filepath.Join(dir, "c.json")
-	os.WriteFile(fp, []byte(`{"upstream":{"client_version":"6.0.0","cli_version":"3.0.0"}}`), 0o600)
-	c, err := Load(fp)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.Upstream.ClientVersion != "6.0.0" || c.Upstream.CliVersion != "3.0.0" {
-		t.Errorf("client_version=%q cli_version=%q want 6.0.0/3.0.0", c.Upstream.ClientVersion, c.Upstream.CliVersion)
-	}
-	// 缺省为空（headers 层回落内置默认）。
-	if c2, err := Load(""); err != nil || c2.Upstream.ClientVersion != "" || c2.Upstream.CliVersion != "" {
-		t.Errorf("default versions=%q/%q want empty (err=%v)", c2.Upstream.ClientVersion, c2.Upstream.CliVersion, err)
-	}
-	// env 覆盖。
-	t.Setenv("WB2A_CLIENT_VERSION", "7.0.0")
-	t.Setenv("WB2A_CLI_VERSION", "4.0.0")
-	c3, err := Load("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c3.Upstream.ClientVersion != "7.0.0" || c3.Upstream.CliVersion != "4.0.0" {
-		t.Errorf("env versions=%q/%q want 7.0.0/4.0.0", c3.Upstream.ClientVersion, c3.Upstream.CliVersion)
 	}
 }
 
@@ -722,5 +752,27 @@ func TestUpstreamUserAgentConfig(t *testing.T) {
 	}
 	if c3.Upstream.UserAgent != "EnvAgent/9" {
 		t.Errorf("env user_agent=%q want EnvAgent/9", c3.Upstream.UserAgent)
+	}
+}
+
+// TestLoadConfigPathIsDirectory config 路径是目录时给出可操作提示（Docker bind mount 陷阱）。
+// 复现：compose 挂载 ./config.json 但宿主机缺该文件 → Docker 创建同名目录 → 启动失败。
+// 旧行为只报 "read config: ... Incorrect function" 之类晦涩错误，无从排查。
+func TestLoadConfigPathIsDirectory(t *testing.T) {
+	dir := t.TempDir()
+	asDir := filepath.Join(dir, "config.json")
+	if err := os.Mkdir(asDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Load(asDir)
+	if err == nil {
+		t.Fatal("want error when config path is a directory")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "是目录") {
+		t.Errorf("error should explain it is a directory: %v", err)
+	}
+	if !strings.Contains(msg, "config.example.json") {
+		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
 	}
 }

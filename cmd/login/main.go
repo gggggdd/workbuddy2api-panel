@@ -35,10 +35,10 @@ import (
 // 上游常量：CN → copilot.tencent.com（Origin 为 codebuddy.cn）；global → www.workbuddy.ai
 // （base 与 Origin/Referer 同域）。端点 URL 由 realmConfig 按 realm 动态拼出，不再硬编码。
 const (
-	upstreamBaseCN     = "https://copilot.tencent.com"
-	upstreamBaseGlobal = "https://www.workbuddy.ai"
-	clientUA           = "CLI/2.63.2 CodeBuddy/2.63.2"
-	originRefererCN    = "https://www.codebuddy.cn"
+	upstreamBaseCN      = "https://copilot.tencent.com"
+	upstreamBaseGlobal  = "https://www.workbuddy.ai"
+	clientUA            = "CLI/2.63.2 CodeBuddy/2.63.2"
+	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
 )
 

@@ -35,8 +35,9 @@ type Pool struct {
 	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
-	// pickSeq 选号单调序号源：仅 pick 在持 p.mu 写锁时自增并赋给 entry.usedSeq，
-	// 无需 atomic。见 entry.usedSeq 注释（解决 Windows 时钟精度导致的 LRU 失效）。
+	// pickSeq 单调递增的选号序号：每次 pick 选中账号时自增并记到 entry.usedSeq，
+	// 为 LRU 兜底/防惊群提供与 time.Now() 精度无关的严格全序（Windows ~0.5ms 精度下
+	// lastUsed 墙钟会全等）。仅 pick 写锁路径读写，无需 atomic。
 	pickSeq uint64
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
@@ -61,6 +62,19 @@ func New(stateFp string) *Pool {
 		p.startFlusher()
 	}
 	return p
+}
+
+// Close 停止后台落盘 goroutine 并做最后一次落盘（幂等）。
+// 进程退出前调用，消除 startFlusher 的 goroutine 泄漏；不调用也不影响正确性
+// （进程退出即回收），仅是生命周期卫生。
+func (p *Pool) Close() {
+	if p.stopCh == nil {
+		return
+	}
+	p.closeOnce.Do(func() {
+		close(p.stopCh)
+	})
+	p.Flush()
 }
 
 // SetBreaker 注入熔断器参数（main 从 config 解析后调用）。非正值保留原值（用默认）。
@@ -171,7 +185,7 @@ func (p *Pool) SetRandomSource(fn func(n int64) int64) {
 	p.randInt64N = fn
 }
 
-// startFlusher 每 flushInterval 检查 dirty 标志，有变更则 saveLocked 落盘。
+// Add 加入账号；已存在则保留原状态、更新凭证（upsert 单账号，不影响其他账号）。
 func (p *Pool) Add(a *auth.Auth) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -200,18 +214,6 @@ func (p *Pool) SyncToDir(auths []*auth.Auth) {
 	}
 }
 
-// upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
-// 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
-func (p *Pool) upsertLocked(a *auth.Auth) {
-	if e, ok := p.byUID[a.UID]; ok {
-		e.a = a // 保留 credits/cooling 状态
-		return
-	}
-	p.byUID[a.UID] = &entry{a: a}
-}
-
-// Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
-
 // Remove 从池中移除账号并立即落盘（管理面板用）。返回被移除账号的凭证
 // （含 FilePath，供调用方删除 auth 文件）；uid 不存在返回 nil。
 // 在途请求的 Release 对已删条目是 no-op，无需等待。
@@ -227,3 +229,15 @@ func (p *Pool) Remove(uid string) *auth.Auth {
 	p.saveLocked()
 	return e.a
 }
+
+// upsertLocked 更新或插入单个账号；已存在则只换凭证、保留 credits/cooling 状态。
+// 调用方必须已持有 p.mu；Add 与 SyncToDir 共用此 upsert 逻辑。
+func (p *Pool) upsertLocked(a *auth.Auth) {
+	if e, ok := p.byUID[a.UID]; ok {
+		e.a = a // 保留 credits/cooling 状态
+		return
+	}
+	p.byUID[a.UID] = &entry{a: a}
+}
+
+// Pick 返回 healthy 中积分最高的账号；无可用返回 nil。

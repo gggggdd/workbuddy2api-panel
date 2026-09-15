@@ -9,8 +9,8 @@ package upstream
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"io"
+	"net/http"
 	"time"
 
 	"workbuddy2api/internal/auth"

@@ -26,6 +26,9 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a == nil || a.AccessToken == "" {
 			continue
 		}
+		if a.IsGlobal() {
+			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
+		}
 		s.streakBonusAccount(a)
 	}
 }
@@ -72,10 +75,6 @@ func (s *Scheduler) streakBonusAccount(a *auth.Auth) {
 		}
 		log.Printf("streak-bonus %s: ★ 兑换 %s 档（+%dc +%de 卡×%d 抽奖×%d）",
 			a.UID, tier.Tier, tier.Credit, tier.Energy, tier.Cards, tier.Chances)
-		if s.lg() != nil && tier.Credit > 0 {
-			s.lg().Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
-				Kind: ledger.KindTask, Delta: float64(tier.Credit), Task: tier.Tier, Note: "连登兑换"})
-		}
 	}
 	// 抽奖：按当前 chances 全抽完（兑换刚发的次数已在服务端累加）。
 	chances, err := s.cfg.Upstream.LotteryChances(a)

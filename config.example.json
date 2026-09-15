@@ -15,14 +15,14 @@
     "travel_hours": [9, 21],
     "activity_hours": [10],
     "keepalive_hours": [22],
-    "school_hours": [12],
-    "cat_hours": [1],
+    "blackcat_hours": [23],
     "checkin_enabled": true,
     "travel_enabled": true,
     "activity_enabled": true,
     "keepalive_enabled": true,
-    "school_enabled": true,
-    "cat_enabled": true
+    "blackcat_enabled": true,
+    "balance_refresh_enabled": true,
+    "balance_refresh_minutes": 5
   },
   "global": {
     "enabled": true,
@@ -36,9 +36,9 @@
     "user_agent": "",
     "client_version": "",
     "cli_version": "",
+    "client_name": "",
     "device_token": "",
     "device_token_file": "",
-    "client_name": "WorkBuddy",
     "passthrough_ip": false
   },
   "features": {

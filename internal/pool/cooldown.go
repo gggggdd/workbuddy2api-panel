@@ -6,18 +6,20 @@ import (
 	"time"
 )
 
-func (p *Pool) SetCredits(uid string, credits int64) {
+func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		e.credits = credits
+		e.creditsTotal = total
 		p.dirty.Store(true)
 	}
 }
 
-// SetCreditsDetailed 更新账号余额总量 + 快过架子集（签到时调用，供优先消耗快过期积分）。
-// expiring 会被钳到 [0, credits]：上游分桶异常时不污染权重。
-func (p *Pool) SetCreditsDetailed(uid string, credits, expiring int64) {
+// SetCreditsDetailed 更新账号余额/总额 + 快过架子集（签到与余额刷新时调用，
+// 供选号优先消耗快过期积分）。expiring 会被钳到 [0, credits]：上游分桶异常时
+// 不污染权重。
+func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
@@ -28,6 +30,7 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, expiring int64) {
 			expiring = credits
 		}
 		e.credits = credits
+		e.creditsTotal = total
 		e.creditsExpiring = expiring
 		p.dirty.Store(true)
 	}
@@ -195,15 +198,6 @@ func nextDay4AM(now time.Time) time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day()+1, 4, 0, 0, 0, now.Location())
 }
 
-// Disable 永久禁用（session 死亡），需人工重登后手工恢复或文件替换。
-func (p *Pool) reviveCoolingLocked(e *entry, credits int64) {
-	e.credits = credits
-	e.until = time.Time{}
-	e.coolKind = 0
-	e.reason = ""
-	e.softStreak = 0
-	e.modelCooldowns = nil // 冷却域清零时一并清模型级独立冷却（模型豁免随之消失）
-}
-
 // ReenableIfCredits 签到后解冻：仅当 remain > 0 且账号非禁用时，清冷却（余额恢复）。
 // 注意：不碰熔断器——熔断到期（breakerUntil 过期）或下次 chat 成功（NoteSuccess）才恢复。
+// reviveCoolingLocked 已迁至 transition.go（状态机迁移唯一权威实现）。

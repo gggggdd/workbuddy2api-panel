@@ -13,9 +13,7 @@ func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
-		e.disabled = true
-		e.reason = reason
-		p.dirty.Store(true)
+		p.disableLocked(e, reason)
 	}
 }
 
@@ -39,10 +37,8 @@ func (p *Pool) NoteSessionDead(uid string) bool {
 	if e.sessionDeadFails < sessionDeadThreshold {
 		return false
 	}
-	e.disabled = true
-	e.reason = sessionDeadReason
 	e.sessionDeadFails = 0
-	p.dirty.Store(true)
+	p.disableLocked(e, sessionDeadReason)
 	return true
 }
 
@@ -71,20 +67,46 @@ func (p *Pool) ReviveDisabled(uid string) {
 	}
 }
 
+// Revive 运维口径的"无条件恢复"：清禁用、冷却（含软退避计数）与熔断运行态。
+// 与 ReviveDisabled（只清禁用）和 ReenableIfCredits（只清冷却、不动熔断）的区别：
+// 本方法清除全部惩罚状态，供管理面板"解冻"按钮使用——人工判断该号可用时一键恢复。
+// uid 不存在返回 false（供调用方区分"账号不存在"与"已复活"）。
+func (p *Pool) Revive(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	e.disabled = false
+	e.until = time.Time{}
+	e.coolKind = 0
+	e.reason = ""
+	e.softStreak = 0
+	e.modelCooldowns = nil // 模型级限流豁免随冷却一并清（防泄漏到后续账号级限流）
+	e.sessionDeadFails = 0
+	e.fails = 0
+	e.retryCount = 0
+	e.breakerUntil = time.Time{}
+	p.dirty.Store(true)
+	return true
+}
+
 // reviveCoolingLocked 只清冷却（until/coolKind/reason/softStreak）并更新 credits，不动熔断器
 // （fails/retryCount/breakerUntil）。签到解冻走这里：签到成功只证明余额恢复与
 // billing 通道健康，不证明 chat 通道健康，熔断（连续 5xx 信号）不应被签到覆盖。
 // softStreak 属**冷却域**（与 until/coolKind 同域），故随冷却一并清零——与"解冻只清冷却
 // 不清熔断"的既有 C5 语义一致；硬冷却（CoolHard）本就不参与 streak，这里清的是历史软冷却累积。
 // 调用方必须已持有 p.mu。
-func (p *Pool) ReenableIfCredits(uid string, remain int64) {
+func (p *Pool) ReenableIfCredits(uid string, remain, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if e, ok := p.byUID[uid]; ok {
 		if remain > 0 && !e.disabled {
-			p.reviveCoolingLocked(e, remain)
+			p.reviveCoolingLocked(e, remain, total)
 		} else {
 			e.credits = remain
+			e.creditsTotal = total
 		}
 		p.dirty.Store(true)
 	}
@@ -100,61 +122,6 @@ func (p *Pool) NoteError(uid string) {
 		e.lastErr = time.Now()
 		p.recordBreakerFailureLocked(e)
 		p.dirty.Store(true)
-	}
-}
-
-// ModelCost 读取账号在某模型上的实测扣费观测（CostPer1k 与是否存在有效观测）。
-// 供测试/运维断言成本账本内容；无观测或观测过期（modelCostTTL）时 ok=false。
-func (p *Pool) ModelCost(uid, model string) (per1k float64, ok bool) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	e, exists := p.byUID[uid]
-	if !exists {
-		return 0, false
-	}
-	mc, ok := e.modelCostOf(model, time.Now())
-	if !ok {
-		return 0, false
-	}
-	return mc.CostPer1k, true
-}
-
-// NoteModelCost 记录一次实测扣费观测，更新该 (账号, 模型) 的成本账本。
-// credit 为上游 usage.credit（本次真实扣费），tokens 为本次请求的 token 总数
-// （prompt+completion，用于折算单位成本）。tokens<=0 时不记录：无法折算单价，
-// 记进去会污染账本。
-//
-// 用 EMA 平滑（alpha=0.3，约 5 次观测收敛）：单次异常值不主导选号决策。
-// 账本仅内存态——成本随上游活动（限免期/夜间免费/折扣）变化，持久化旧值
-// 反而是脏数据；重启后重新学习，代价只是前几次请求无偏好。
-func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
-	if uid == "" || model == "" || tokens <= 0 {
-		return
-	}
-	// 单价按每千 token 归一，消除请求长度差异。
-	per1k := credit / float64(tokens) * 1000
-	if per1k < 0 {
-		per1k = 0
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return
-	}
-	if e.modelCost == nil {
-		e.modelCost = make(map[string]modelCostEntry)
-	}
-	const alpha = 0.3
-	prev, seen := e.modelCost[model]
-	if !seen {
-		e.modelCost[model] = modelCostEntry{CostPer1k: per1k, LastSeen: time.Now(), Samples: 1}
-	} else {
-		e.modelCost[model] = modelCostEntry{
-			CostPer1k: prev.CostPer1k*(1-alpha) + per1k*alpha,
-			LastSeen:  time.Now(),
-			Samples:   prev.Samples + 1,
-		}
 	}
 }
 
@@ -178,6 +145,50 @@ func (p *Pool) NoteSuccess(uid string) {
 		e.sessionDeadFails = 0
 		p.dirty.Store(true)
 	}
+}
+
+// RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
+// usage 字段缺失时仍累计请求次数，但只累计明确存在的 token 字段。
+func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	usage := &e.tokenUsage
+	usage.RequestCount++
+	usage.LastUsedAt = time.Now()
+	if delta.Model != "" {
+		usage.LastModel = delta.Model
+	}
+	known := false
+	if delta.HasPromptTokens && delta.PromptTokens >= 0 {
+		usage.PromptTokens += delta.PromptTokens
+		known = true
+	}
+	if delta.HasCompletionTokens && delta.CompletionTokens >= 0 {
+		usage.CompletionTokens += delta.CompletionTokens
+		known = true
+	}
+	if delta.HasTotalTokens && delta.TotalTokens >= 0 {
+		usage.TotalTokens += delta.TotalTokens
+		known = true
+	}
+	if known {
+		usage.UsageCount++
+	}
+	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
+		usage.LastLatencyMs = delta.LatencyMs
+	}
+	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
+		speed := delta.TokensPerSecond
+		usage.LastTokensPerSecond = &speed
+	} else {
+		// 失败或缺少 completion_tokens 时不展示上一次请求的旧吞吐速度。
+		usage.LastTokensPerSecond = nil
+	}
+	p.dirty.Store(true)
 }
 
 // Status 查询单账号状态。
@@ -222,8 +233,7 @@ func (p *Pool) AvailableUIDs() []string {
 }
 
 // AvailableUIDsForModel 同 AvailableUIDs，但把健康口径换成 healthyForModel：
-// 在该模型上被 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入
-// （issue #31 模型豁免）。
+// 在该模型上被 6004 限流的账号不列入，而在**其他模型**被限流的账号照常列入（模型豁免）。
 // 供会话粘性按模型分配与命中校验；model 为空时等价于 AvailableUIDs。
 func (p *Pool) AvailableUIDsForModel(model string) []string {
 	p.mu.RLock()
@@ -295,8 +305,7 @@ func (p *Pool) CountsDetailed() (total, healthy, cooling, disabled, inFlightFull
 }
 
 // CountsDetailedForRealm 同 CountsDetailed，但仅统计 Realm()==realm 的账号；
-// realm=="" 退化为全池（现状语义，走同一遍历 helper 避免重复代码）。
-// 双 realm 共存时供 /status 按域分组暴露 CN/global 各自可用性。
+// realm=="" 不加谓词（= CountsDetailed）。供 /status 按域分组透出。
 func (p *Pool) CountsDetailedForRealm(realm string) (total, healthy, cooling, disabled, inFlightFull int) {
 	return p.countsDetailedForRealm(realm)
 }
@@ -326,34 +335,12 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 	return total, healthy, cooling, disabled, inFlightFull
 }
 
-// ServableNow 报告池当前是否可服务：存在至少一个（对任意模型）healthy 且未占满在途名额的账号。
+// ServableNow 报告池当前是否可服务：存在至少一个 healthy 且未占满在途名额的账号。
 // 与 CountsDetailed 的 healthy 口径不同：healthy 只看 disabled/until/breakerUntil（状态机权威判定），
 // 不看 inFlight；ServableNow 额外叠加在途维度，与 chat 的真实可达性（Pick 会跳过 inFlightFull 账号）对齐。
 // 专供 /healthz 用，避免"全账号 healthy 但都占满"时探活误报 200 而 chat 返回 503 的口径裂缝。
-//
-// 模型级豁免（issue #31 的探活侧补齐）：6004 模型级软冷却中的账号（modelExempt 形态）
-// 对触发模型不可用、对其他模型仍可选，探活与 chat 必须同口径，否则"全号被某模型限流
-// 但换模型可用"时 chat 实际 200 而 /healthz 误报 503。chat 侧按请求模型细粒度判定
-// （healthyForModel：全账号健康且该模型不在独立冷却内才放行，模型豁免作用于选号），
-// 探活侧没有请求模型上下文，取「存在豁免形态」的存在性语义——豁免账号（未禁用、
-// 未熔断、存在模型级冷却条目）至少还剩触发模型之外的模型可用，ServableNow 计入。
-// 注意与 chat 判定在"账号级 until 冷却 + 模型豁免并存"时并不完全重合：modelExempt
-// 不检查 until，而 healthyForModel 会先判 until 再查模型冷却；该混合形态现实中不可达
-// （plain Cooldown 会清空 modelCooldowns，6004 不写 until），此处仅为探活存在性语义，
-// 不构成 chat 选号路径。
 func (p *Pool) ServableNow() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	now := time.Now()
-	for _, e := range p.byUID {
-		if p.inFlightFull(e) {
-			continue
-		}
-		if e.healthy(now) || e.modelExempt() {
-			return true
-		}
-	}
-	return false
+	return p.ServableForRealm("")
 }
 
 // ServableForRealm 报告某 realm 是否可服务：存在至少一个该 realm 的 healthy 且未占满在途名额的账号。
@@ -370,6 +357,9 @@ func (p *Pool) ServableForRealm(realm string) bool {
 		if p.inFlightFull(e) {
 			continue
 		}
+		// 存在性语义：账号级 healthy，或处于模型级豁免形态（6004 单模型软冷却——
+		// 对触发模型不可用，对其他模型仍可选）。探活无请求模型上下文，取"存在可服务
+		// 模型"与 chat 实际可达性等价（issue #31 探活侧补齐）。
 		if e.healthy(now) || e.modelExempt() {
 			return true
 		}
@@ -395,7 +385,6 @@ func (p *Pool) List() []Status {
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
 	st := Status{
-		TokenUsage:      e.tokenUsage,
 		UID: uid,
 		// 限额台账（issue #36）：仅「带解析时间 6004 的模型级软冷却」仍在生效时非空，
 		// 每模型一行（modelCooldowns 内未到期的条目），多模型同时限流全部展示。
@@ -405,11 +394,13 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Realm:             e.a.Realm(),
 		Nickname:          e.a.Nickname,
 		Credits:           e.credits,
+		CreditsTotal:      e.creditsTotal,
 		Cooling:           now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:            e.reason,
 		Disabled:          e.disabled,
 		SuccessCount:      e.successCount,
 		ErrTotal:          e.errTotal,
+		TokenUsage:        e.tokenUsage,
 		LastSuccessTime:   e.lastSuccess,
 		LastErrTime:       e.lastErr,
 		Until:             e.until,
@@ -433,15 +424,18 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 	return st
 }
 
-// rateLimitedModelsLocked 构建单账号的限额台账行，从 modelCooldowns 遍历输出——
-// 每模型一行（含该模型的独立 until + 上游原始 resetAt），多模型同时 6004 全部展示。
-// 有效期判据 = 该模型的独立冷却 until 未过；随到期自然消失（与 /status 观感一致）。
-// 无模型级冷却（普通软冷却/硬冷却）→ nil（零回归）。调用方必须已持有 p.mu。
+// ---------------------------------------------------------------------------
+// 持久化
+// ---------------------------------------------------------------------------
+
+// rateLimitedModelsLocked 收集账号当前仍在限额的模型台账行（issue #36）。
+// modelCooldowns 未到期条目按模型名稳定排序输出；全部到期/空表返回 nil。
+// 调用方必须已持有锁（statusOf 只读路径持 RLock，本函数只读不写）。
 func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedModel {
 	if len(e.modelCooldowns) == 0 {
 		return nil
 	}
-	// 先排序模型名，保证 /status 输出稳定（map 遍历无序）。
+	// 先排序模型名，保证输出稳定（map 遍历无序）。
 	models := make([]string, 0, len(e.modelCooldowns))
 	for m := range e.modelCooldowns {
 		models = append(models, m)
@@ -467,52 +461,4 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 		return nil
 	}
 	return rows
-}
-
-// ---------------------------------------------------------------------------
-// 持久化
-// ---------------------------------------------------------------------------
-
-// RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
-// usage 字段缺失时仍累计请求次数，但只累计明确存在的 token 字段。
-func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	e, ok := p.byUID[uid]
-	if !ok {
-		return
-	}
-	usage := &e.tokenUsage
-	usage.RequestCount++
-	usage.LastUsedAt = time.Now()
-	if delta.Model != "" {
-		usage.LastModel = delta.Model
-	}
-	known := false
-	if delta.HasPromptTokens && delta.PromptTokens >= 0 {
-		usage.PromptTokens += delta.PromptTokens
-		known = true
-	}
-	if delta.HasCompletionTokens && delta.CompletionTokens >= 0 {
-		usage.CompletionTokens += delta.CompletionTokens
-		known = true
-	}
-	if delta.HasTotalTokens && delta.TotalTokens >= 0 {
-		usage.TotalTokens += delta.TotalTokens
-		known = true
-	}
-	if known {
-		usage.UsageCount++
-	}
-	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
-		usage.LastLatencyMs = delta.LatencyMs
-	}
-	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
-		speed := delta.TokensPerSecond
-		usage.LastTokensPerSecond = &speed
-	} else {
-		// 失败或缺少 completion_tokens 时不展示上一次请求的旧吞吐速度。
-		usage.LastTokensPerSecond = nil
-	}
-	p.dirty.Store(true)
 }

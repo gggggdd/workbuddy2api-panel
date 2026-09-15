@@ -8,15 +8,16 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
-	"workbuddy2api/internal/logfmt"
 )
 
+// Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知缺省账号级）。
+// 需要请求级轮换（tried）或分池（realm）时用 PickExcludingForRealm。
 func (p *Pool) Pick() *auth.Auth {
-	return p.PickExcluding(nil)
+	return p.pick(nil, "", "")
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
-// 挑选策略：healthy 账号中按三因子权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
+// 挑选策略：healthy 账号中按权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
 	return p.pick(tried, "", "")
@@ -29,24 +30,20 @@ func (p *Pool) PickExcludingForModel(tried map[string]bool, reqModel string) *au
 	return p.pick(tried, reqModel, "")
 }
 
-// pick 在 healthy 候选集中按三因子权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
-// 候选集是 top5 近似：先按三因子权重（weightOf）降序取前 5（credits 只是权重的一个因子，
-// 闲置补偿与成功率同样决定谁进短名单），再在 top5 内做防撞号过滤。
-// 并发防雪崩：跳过 lastUsed 距今 < minPickGap 的账号（除非 top5 全部刚被用过，
-// 此时退回最近最少使用 LRU 账号），迫使高并发请求发散，而不是全部撞同一高分账号。
-// minPickGap=0（测试用）时过滤恒通过，退化为纯加权随机。
-// reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效；PickExcluding 传 ""）。
-// realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域；PickExcluding 传 ""）。
-// 注意：模型豁免只进 normal 选号（候选 healthy 判定）；全冷却兜底不参与模型豁免——
-// 兜底本来就是在"无任何 direct 可用"时的降级，切模型可用性已在 normal 阶段体现。
+// PickExcludingForRealm 模型感知 + 分池选号：候选集先按 Realm()==realm 过滤
+// （realm 空 = 不过滤，退化为 PickExcludingForModel），再按模型健康口径判定。
+// 供 handler 在 global/cn 双域下分流（global 模型请求只路由 global 账号）。
+func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm string) *auth.Auth {
+	return p.pick(tried, reqModel, realm)
+}
+
+// pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
+// reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
+// realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
 func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
-	// 惰性清理过期的 6004 模型级冷却（map 不无限膨胀；status 只读遍历跳过过期项）。
-	for _, e := range p.byUID {
-		e.pruneExpiredModelCooldowns(now)
-	}
 	realmOK := func(e *entry) bool { return realm == "" || e.a.Realm() == realm }
 	healthyOf := func(e *entry) bool { return realmOK(e) && e.healthy(now) }
 	if reqModel != "" {
@@ -57,6 +54,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		if tried != nil && tried[uid] {
 			continue
 		}
+		e.pruneExpiredModelCooldowns(now) // 惰性清理过期模型级冷却（防 map 膨胀）
 		if !healthyOf(e) {
 			continue
 		}
@@ -84,42 +82,16 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		e *entry
 		w float64
 	}
-	// 成本分层：reqModel 非空时，按该模型的实测扣费把候选分层，只保留最优层。
-	//   0 = 已实测免费（限免期/夜间免费的号，最强偏好）
-	//   1 = 无观测（含观测过期）
-	//   2 = 已实测收费
-	// 为什么"无观测"排在"已实测收费"之前：新号的限免状态只能靠实测发现，
-	// 若已知收费的号恒压过未知号，那台免费的号永远轮不到，也就永远学不到。
-	// 为什么用硬过滤而非仅排序：pickWeighted 会在候选内加权随机，只排序的话
-	// 收费号仍有机会抽中，达不到"优先免费"的语义。
-	costTier := func(e *entry) (int, float64) {
-		mc, ok := e.modelCostOf(reqModel, now)
-		if !ok {
-			return 1, 0
-		}
-		if mc.CostPer1k <= 0 {
-			return 0, 0
-		}
-		return 2, mc.CostPer1k
-	}
-	bestTier := 2
-	for _, e := range cands {
-		if ti, _ := costTier(e); ti < bestTier {
-			bestTier = ti
-		}
-	}
-	ws := make([]weighted, 0, len(cands))
-	for _, e := range cands {
-		if ti, _ := costTier(e); ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now)})
-		}
+	ws := make([]weighted, len(cands))
+	for i, e := range cands {
+		ws[i] = weighted{e: e, w: p.weightOf(e, maxCredits, now)}
 	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
 	// 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的确定性语义，
 	// 见 TestPickDeterministicViaSetRandomSource）。权重全等或存在并列时，按字典序
-	// 截断会让 uid 靠后的账号永远进不了 top5（惊群测试 c00 集中 79/100 的根因：
-	// c05..c09 被字典序截断、LRU 兜底又只在 top5 内转）。洗牌用独立的 time-seeded
-	// 源，只在截断边界制造等权重随机次序，不影响加权抽签本身的确定性。
+	// 截断会让 uid 靠后的账号永远进不了 top5（等权重账号被字典序饿死、LRU 兜底
+	// 又只在 top5 内转——惊群集中单号的根因）。洗牌用独立的 time-seeded 源，
+	// 只在截断边界制造等权重随机次序，不影响加权抽签本身的确定性。
 	if len(ws) > 5 {
 		eq := false
 		for i := 1; i < len(ws); i++ {
@@ -134,11 +106,6 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		}
 	}
 	sort.SliceStable(ws, func(i, j int) bool {
-		_, ci := costTier(ws[i].e)
-		_, cj := costTier(ws[j].e)
-		if ci != cj {
-			return ci < cj // 收费层：单价低的在前
-		}
 		if ws[i].w != ws[j].w {
 			return ws[i].w > ws[j].w
 		}
@@ -157,8 +124,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	// 防并发撞号：在持锁内基于「上次选中时刻」过滤，但同一批并发 goroutine 会串行进入
 	// 本函数（写锁），每个进入者都把 lastUsed 置为 now —— 于是同一瞬间的第 2..N 个
 	// 进入者看到前一个账号 lastUsed==now（距今 0 < minPickGap），被自然挤向其他账号。
-	// 关键：lastUsed 在锁内赋值，使时间窗口判定在并发下可重入（此前 Acquire 在锁外，
-	// 多个 goroutine 在窗口内同时通过校验造成惊群，TestPickAntiThunderingHerd 实证）。
+	// 关键：lastUsed 在锁内赋值，使时间窗口判定在并发下可重入。
 	eligible := make([]*entry, 0, len(cands))
 	for _, e := range cands {
 		if now.Sub(e.lastUsed) >= minPickGap {
@@ -219,7 +185,7 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	if best == nil {
 		return nil
 	}
-	log.Printf("WARN: [pool] fallback_earliest_expiry uid=%s until=%s kind=%s", logfmt.UID8(best.a.UID), best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
+	log.Printf("pool: fallback_earliest_expiry uid=%s until=%s kind=%s", best.a.UID, best.expiry(now).Format(time.RFC3339), best.fallbackKind(now))
 	best.lastUsed = time.Now()
 	return best.a
 }
@@ -236,11 +202,6 @@ func (p *Pool) inFlightFull(e *entry) bool {
 // minPickGap 防并发撞号窗口：同一账号在该窗口内不重复被选中（除非 top5 全部刚被用过）。
 // 生产默认 100ms；纯加权分布测试可临时置 0 关闭防撞号。
 var minPickGap = 100 * time.Millisecond
-
-// expiringWeight 快过期积分占比的权重系数（三因子之外的第四因子）。
-// 取 8：略低于 credits 总量项（×10），足以在"快过期多"与"总量相近"的号之间拉开差距，
-// 又不至于压过总量项让"总量大但快过期少"的号被完全饿死。
-const expiringWeight = 8.0
 
 // pickWeighted 三因子加权随机（claude-api selectWeightedRandom 参考口径）：
 //
@@ -266,14 +227,8 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	var total int64
 	for i, e := range cands {
 		w := p.weightOf(e, maxCredits, now)
-		// 四舍五入并保底权重 ≥1：向零截断会让 w<1/scale 的低权重号权重归零，
-		// 彻底失去被抽中机会（候选少时加剧选号集中，惊群测试的放大因子之一）。
-		wi := int64(w*scale + 0.5)
-		if wi < 1 {
-			wi = 1
-		}
-		weights[i] = wi
-		total += wi
+		weights[i] = int64(w * scale)
+		total += weights[i]
 	}
 	rnd := rand.Int64N
 	if p.randInt64N != nil {
@@ -300,10 +255,10 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	if maxCredits > 0 {
 		w += float64(e.credits) / float64(maxCredits) * 10
 	}
-	// 1b. 快过期积分加成（issue:积分过期）：官方活动赠送的奖励积分按批过期，
-	// 不用就作废。creditsExpiring 占总量比例越高，越应优先被消耗——把"快过期
-	// 占比"作为一个独立的强权重项（×expiringWeight），让快过期积分多的号优先选。
-	// 与成本分层（costTier 优先免费）正交：那是按"实测扣费"分层，这是按"过期紧迫度"。
+	// 1b. 快过期积分加成：官方活动赠送的奖励积分按批过期，不用就作废。
+	// creditsExpiring 占总量比例越高，越应优先被消耗——把"快过期占比"作为独立的
+	// 强权重项（×expiringWeight），让快过期积分多的号优先选。与 credits 总量项
+	// 正交：那是按总量，这是按过期紧迫度。
 	if e.credits > 0 && e.creditsExpiring > 0 {
 		w += float64(e.creditsExpiring) / float64(e.credits) * expiringWeight
 	}
@@ -332,3 +287,8 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 }
 
 // SetCredits 更新账号余额。
+
+// expiringWeight 快过期积分占比的权重系数（三因子之外的第四因子）。
+// 取 8：略低于 credits 总量项（×10），足以在"快过期多"与"总量相近"的号之间拉开差距，
+// 又不至于压过总量项让"总量大但快过期少"的号被完全饿死。
+const expiringWeight = 8.0

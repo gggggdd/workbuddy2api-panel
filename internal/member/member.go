@@ -15,6 +15,8 @@ package member
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -25,8 +27,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"workbuddy2api/internal/httpauth"
 )
 
 // bucketSec 用量分桶粒度：15 分钟。5h 窗口取最近 20 桶、24h 取最近 96 桶，
@@ -246,15 +246,22 @@ func (s *Store) Remove(id string) bool {
 // 遍历全部成员且不做提前返回，使比较耗时不随"命中位置"变化；
 // 单次比较本身是常量时间的（sha256 摘要 + ConstantTimeCompare）。
 func (s *Store) Resolve(r *http.Request) *Member {
-	tok, ok := httpauth.BearerToken(r)
-	if !ok {
+	authz := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authz, "Bearer ") {
+		return nil
+	}
+	tok := strings.TrimPrefix(authz, "Bearer ")
+	if tok == "" {
 		return nil
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var hit *Member
 	for _, m := range s.members {
-		if httpauth.KeyEqual(tok, m.Key) {
+		// 常量时间比较（sha256 摘要 + subtle），与 httpauth.VerifyBearer 同口径
+		sumT := sha256.Sum256([]byte(tok))
+		sumK := sha256.Sum256([]byte(m.Key))
+		if subtle.ConstantTimeCompare(sumT[:], sumK[:]) == 1 {
 			hit = m
 		}
 	}

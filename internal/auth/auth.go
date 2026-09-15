@@ -4,7 +4,9 @@ package auth
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -30,11 +32,11 @@ type Auth struct {
 	//
 	// 命名注记：Go 不允许字段与方法同名，持久化字段用未导出 realm，计算访问器用
 	// 导出的 Realm()（跨包调用全部走方法）。Parse/SaveAtomic/login 在包内读写字段。
-	realm          string
-	UID            string
-	EnterpriseID   string
-	Nickname       string
-	FilePath       string // 来源文件；refresh 后原子写回此处
+	realm        string
+	UID          string
+	EnterpriseID string
+	Nickname     string
+	FilePath     string // 来源文件；refresh 后原子写回此处
 
 	// DeviceToken 设备风控 Token（X-Device-Token 头），来源 auth 文件的 device_token 键。
 	// 缺省为空 = 不注入该头（容器内无桌面端 Turing SDK 的常见部署）。
@@ -109,6 +111,25 @@ func (a *Auth) BackfillRealm() (bool, string) {
 // RealmStored 直读持久化的 realm 标识（可能为空 = 未 backfill 的旧文件，Realm() 会 fallback）。
 func (a *Auth) RealmStored() string { return a.realm }
 
+// BackfillRealmFor 显式写入 realm 标识（包外登录路径使用：panel login 已知用户选了
+// global，直接落盘 realm=global，不依赖 domain 后缀推断）。realm 需为 cn/global，
+// 非法值报错（防写脏）。返回是否发生变更。
+func BackfillRealmFor(a *Auth, realm string) (bool, error) {
+	if a == nil {
+		return false, fmt.Errorf("nil auth")
+	}
+	switch strings.TrimSpace(realm) {
+	case "cn", "global":
+	default:
+		return false, fmt.Errorf("realm must be cn/global, got %q", realm)
+	}
+	if a.realm == realm {
+		return false, nil
+	}
+	a.realm = realm
+	return true, nil
+}
+
 // IsGlobal 报告账号是否属于 global realm（= Realm() == "global"）。
 func (a *Auth) IsGlobal() bool { return a.Realm() == "global" }
 
@@ -154,8 +175,7 @@ func Parse(raw []byte) (*Auth, error) {
 				EnterpriseID string `json:"enterpriseId"`
 				Nickname     string `json:"nickname"`
 			} `json:"account"`
-			// DeviceToken 顶层 device_token（嵌套形与扁平形共用）。
-			// 放在 auth 段之外，手写时无需嵌进 auth 对象，降低配置门槛。
+			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
 			DeviceToken string `json:"device_token"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
@@ -242,7 +262,16 @@ func (a *Auth) SaveAtomic() error {
 	}
 	tmp := a.FilePath + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
+		// Docker bind-mount 权限问题的典型现场：容器内 app 用户（uid 10001）
+		// 对宿主机挂载目录无写权限。给出可操作指引而不是裸 syscall 错误。
+		msg := fmt.Sprintf("写入 %s 失败: %v", tmp, err)
+		if errors.Is(err, fs.ErrPermission) {
+			msg += "\n（Docker 部署：容器内用户对宿主机挂载目录无写权限。解法任选：" +
+				"1) 以本机 uid 运行容器：PUID=$(id -u) PGID=$(id -g) docker compose up -d；" +
+				"2) sudo chown -R 10001:10001 ./auths ./data ./config.json；" +
+				"3) compose 设 user: \"0:0\" 以 root 运行）"
+		}
+		return errors.New(msg)
 	}
 	return os.Rename(tmp, a.FilePath)
 }

@@ -12,15 +12,11 @@ import (
 
 const (
 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
-	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本
-	// （/tmp/wb-ua-fp/step1-fingerprint.md §1.2：WORKBUDDY_CLIENT_VERSION = 桌面端
-	// package.json version，5.5.4 分发包即 5.5.4）。config upstream.client_version
-	// 可覆盖（空 = 内置默认）。
+	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本（5.5.4）。
+	// config upstream.client_version 可覆盖（空 = 内置默认）。
 	defaultClientVersion = "5.5.4"
-	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI
-	// （step1 §1.4：cli/package.json publishConfig.customPackage version = 2.137.1
-	// → resolveBundledCliUserAgent() 返回 CLI/2.137.1）。config upstream.cli_version
-	// 可覆盖（空 = 内置默认）。
+	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI（2.137.1）。
+	// config upstream.cli_version 可覆盖（空 = 内置默认）。
 	defaultCliVersion = "2.137.1"
 
 	originRefererCN     = "https://www.codebuddy.cn"
@@ -54,14 +50,12 @@ func (c *Client) cliVersion() string {
 }
 
 // defaultWorkBuddyUAFor 组装默认客户端出站 UA（官方桌面端 RestOperations 层形状）：
-// `WorkBuddy/<clientVersion> <platform>/<clientVersion> CLI/<cliVersion>`
-// （step1 §1.3：applicationName/version + platform/version + CLI/<cliVersion>）。
+// `WorkBuddy/<clientVersion> <platform>/<clientVersion> CLI/<cliVersion>`。
 // 平台段（第二段）品牌按 realm 切换——CN 用 applicationName 同值 `WorkBuddy`，
-// global 用官方国际版 productName `WorkBuddy AI`（intl 项目逆向证据
-// ANALYSIS-global-chat-solutions.md：`WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`）。
+// global 用官方国际版 productName `WorkBuddy AI`（intl 项目逆向证据：
+// `WorkBuddy/5.5.2 WorkBuddy AI/5.5.2 CLI/5.5.2`）。
 // global 账号送错平台段（`WorkBuddy` 非 `WorkBuddy AI`）可能触发上游 403 code 11140
-// "request illegal" 风控。官方无任何 UA 随机化（step1 §4），故默认确定性。
-// realm 判定委托 auth.Realm()（含全局开关逃生门）。
+// "request illegal" 风控。官方无任何 UA 随机化，故默认确定性。
 func (c *Client) defaultWorkBuddyUAFor(a *auth.Auth) string {
 	platform := "WorkBuddy"
 	if a != nil && a.IsGlobal() {
@@ -86,12 +80,9 @@ func (c *Client) userAgent(a *auth.Auth) string {
 	return c.defaultWorkBuddyUAFor(a)
 }
 
-// billingUA 白名单类（billing/checkin/banner）出站 UA。
-// 语义对齐官方 application-manifest.js:27590-27601（banner 白名单接口显式头组）：
-// 这类接口用单段 `WorkBuddy/<clientVersion>`（不带 CLI 段——官方 banner 显式覆写 UA
-// 为 `WorkBuddy/<pkgVer>`，RestOperations 层的 CLI 扩展段被业务层固化覆盖掉）。
-// 默认（client_name 空）即生效（伪造官方桌面端指纹）；
-// 显式 client_name="SaaS" 则不设 UA（还原旧行为，Go 默认 UA）。
+// billingUA 白名单类（billing/checkin/banner）出站 UA：单段 `WorkBuddy/<clientVersion>`
+// （官方 banner 显式覆写形态，不带 CLI 段）。默认生效（伪造官方桌面端指纹）；
+// 显式 client_name="SaaS" 才不设 UA（还原旧行为，Go 默认 UA）。
 func (c *Client) billingUA() string {
 	if c == nil || c.attributionClientName() == "SaaS" {
 		return ""
@@ -102,8 +93,6 @@ func (c *Client) billingUA() string {
 // resolveDeviceToken 解析本次请求的 X-Device-Token 取值。
 // 优先级：auth.Auth.DeviceToken（每号）> Client.DeviceToken（config 全局）> 文件兜底。
 // 三者皆空/读失败则返回空串（调用方不注入该头，优雅降级）。
-// 为什么不放进 CommonHeaders：鉴权/刷新类头（refresh / FetchModels）给设备 token
-// 无意义且可能被上游风控误判为异常客户端；只在 chat/billing 业务请求注入。
 func (c *Client) resolveDeviceToken(a *auth.Auth) string {
 	if a != nil && a.DeviceToken != "" {
 		return a.DeviceToken
@@ -128,13 +117,12 @@ func (c *Client) injectDeviceToken(req *http.Request, a *auth.Auth) {
 func (c *Client) CommonHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Content-Type", "application/json")
 	// Accept 非流式默认 application/json（D6：去掉宽松的 text/plain, */*）。
-	// chat 路径在 ChatHeaders 覆盖为流式 event-stream。
+	// chat 流式路径在 ChatHeaders 覆盖为 event-stream。
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Requested-With", "XMLHttpRequest")
 	origin := originRefererFor(a)
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Referer", origin+"/")
-	// User-Agent 按账号 realm 切换品牌段（global → `WorkBuddy AI`，见 defaultWorkBuddyUAFor）。
 	req.Header.Set("User-Agent", c.userAgent(a))
 	// X-CodeBuddy-Request: 1（官方客户端风控闸门头，所有 API 请求必带，D1）。
 	req.Header.Set("X-CodeBuddy-Request", "1")
@@ -152,23 +140,9 @@ func acceptLanguageFor(a *auth.Auth) string {
 }
 
 // injectCodeBuddyRequest 在 req 注入 X-CodeBuddy-Request: 1。
-// billing 域未走 CommonHeaders，单独注入保证全出站覆盖。
+// billing 域未走 CommonHeaders，单独注入保证全出站覆盖（D1）。
 func (c *Client) injectCodeBuddyRequest(req *http.Request) {
 	req.Header.Set("X-CodeBuddy-Request", "1")
-}
-
-// injectGlobalChatHeaders global 账号（无企业 ID）的 chat 专属声明头，对齐 intl 项目
-// （ANALYSIS-global-chat-solutions.md）：
-//   - X-No-Enterprise-Id: 1  个人账号无企业 ID，显式声明（避免上游按缺省/可疑判定）
-//   - X-Domain: www.workbuddy.ai  显式声明国际版域（与 Origin/Referer 同域）
-//
-// 仅 global realm 注入；CN 账号走既有 X-No-Department-Info 等分支，零回归。
-func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
-	if a == nil || !a.IsGlobal() {
-		return
-	}
-	req.Header.Set("X-No-Enterprise-Id", "1")
-	req.Header.Set("X-Domain", "www.workbuddy.ai")
 }
 
 // ChatMeta 一次 chat 出站的会话头族元数据（issue #35：后台按 X-Conversation-Request-ID
@@ -186,7 +160,7 @@ type ChatMeta struct {
 // 缺省字段用 X-No-* 约定（与 CodeBuddy 官方 CLI 一致）。
 // clientIP 为本次请求的客户端 IP（按参数传递，不读共享字段——避免并发串扰）；
 // PassthroughIP=false 或 clientIP 为空时不注入 IP 头。
-// meta 为会话头族元数据（CN/global 同构，纯新增，不改既有头），见 injectConversationHeaders。
+// meta 为会话头族元数据（纯新增，不改既有头），见 injectConversationHeaders。
 func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, meta ChatMeta) {
 	c.CommonHeaders(req, a)
 	// chat 流式 Accept 覆盖 CommonHeaders 的非流式默认（D6）。
@@ -220,18 +194,28 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	} else {
 		c.injectGlobalChatHeaders(req, a)
 	}
-	// 用量归属头：真实桌面端发 X-Agent-Purpose="conversation" + X-IDE-Name/Type/X-Product
-	// 识别 client，避免上游用量统计里 client/agentPurpose 为空。来源 xiaofan6ya/converter.py。
-	// 默认（ClientName 空）即伪造 WorkBuddy 桌面端头组（见 injectAttribution）；
-	// 显式 ClientName="SaaS" 还原旧行为（仅 X-Product="SaaS"）。
+	// 用量归属头：默认伪造 WorkBuddy 桌面端指纹（client_name="SaaS" 还原旧行为）。
 	c.injectAttribution(req)
-	// 客户端 IP 透传：仅当 PassthroughIP=true 且本次请求 clientIP 参数非空（见 handler 设置）。
-	// 缺省 false（反代安全边界：不把内网/代理 IP 暴露给上游）。
+	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
-	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入（见 resolveDeviceToken）。
+	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
 	c.injectDeviceToken(req, a)
-	// 会话头族（对话/请求/消息/B3 链路）：纯新增，CN/global 同构，见 injectConversationHeaders。
+	// 会话头族（对话/请求/消息/B3 链路），见 injectConversationHeaders。
 	c.injectConversationHeaders(req, meta)
+}
+
+// injectGlobalChatHeaders global 账号（无企业 ID）的 chat 专属声明头，对齐 intl 项目
+// （ANALYSIS-global-chat-solutions.md）：
+//   - X-No-Enterprise-Id: 1  个人账号无企业 ID，显式声明（避免上游按缺省/可疑判定）
+//   - X-Domain: www.workbuddy.ai  显式声明国际版域（与 Origin/Referer 同域）
+//
+// 仅 global realm 注入；CN 账号走既有 X-No-Department-Info 等分支，零回归。
+func (c *Client) injectGlobalChatHeaders(req *http.Request, a *auth.Auth) {
+	if a == nil || !a.IsGlobal() {
+		return
+	}
+	req.Header.Set("X-No-Enterprise-Id", "1")
+	req.Header.Set("X-Domain", "www.workbuddy.ai")
 }
 
 // injectConversationHeaders 注入官方客户端会话头族（issue #35 后台聚合）。
@@ -275,7 +259,7 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	req.Header.Set("X-B3-Sampled", "1")
 }
 
-// validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（全新大小写均可）。
+// validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。
 // 官方客户端生成的 conversationRequestId 是 32 位 hex（UUID 去横线），入站透传值
 // 可能是任意形状（含横线/超长/非 hex），直接塞进 B3 头会破坏链路关联（issue #35）。
 func validTraceID(s string) bool {
@@ -283,8 +267,8 @@ func validTraceID(s string) bool {
 		return false
 	}
 	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+		ch := s[i]
+		if !((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')) {
 			return false
 		}
 	}
@@ -303,9 +287,8 @@ func (c *Client) attributionClientName() string {
 // injectAttribution 注入用量归属头（X-Agent-Purpose / X-IDE-* / X-Product）。
 // 仅在 chat/completions 路径生效（ChatHeaders 调用）。
 //
-// 默认（ClientName 空）即伪造官方 WorkBuddy 桌面端指纹：X-Agent-Purpose="conversation"
-// + X-IDE-Name/Type/Product="WorkBuddy" + X-IDE-Version=client_version。该头组与官方
-// banner 白名单头组完全同形（application-manifest.js:27590-27601），上游用量归因从此
+// 默认（ClientName 空）即对齐官方 WorkBuddy 桌面端指纹：X-Agent-Purpose="conversation"
+// + X-IDE-Name/Type/Product="WorkBuddy" + X-IDE-Version=client_version，上游用量归因
 // 不再出现 client/agentPurpose 为空的「网关特征」。显式 ClientName="SaaS" 还原旧行为
 // （仅 X-Product="SaaS"，不设 X-IDE-*）；配其他值则四头跟随该值。
 func (c *Client) injectAttribution(req *http.Request) {
@@ -321,9 +304,7 @@ func (c *Client) injectAttribution(req *http.Request) {
 	req.Header.Set("X-Product", name)
 }
 
-// injectClientIP 在 PassthroughIP 开启时把 clientIP 参数透传给上游。
-// 三个等价头（X-Forwarded-For/X-Real-IP/X-Client-IP）一并设，与桌面端透传一致。
-// 按**参数传递**而非读共享字段：避免并发请求交叉污染对方 IP（issue：ClientIP 竞态）。
+// injectClientIP 在 PassthroughIP 开启时把 clientIP 参数透传给上游（三等价头）。
 func (c *Client) injectClientIP(req *http.Request, clientIP string) {
 	if c == nil || !c.PassthroughIP || clientIP == "" {
 		return
@@ -334,15 +315,12 @@ func (c *Client) injectClientIP(req *http.Request, clientIP string) {
 }
 
 // ExtractClientIP 从入站请求提取客户端 IP 首段（X-Forwarded-For 首段，回落 X-Real-IP）。
-// 供 handler 在 PassthroughIP 开启时按请求取值后传入 ChatStream（chat 路径专属，不跨请求）。
-// 取不到返回空串（handler 据此跳过透传）。
 func ExtractClientIP(r *http.Request) string {
 	if r == nil {
 		return ""
 	}
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		for i := 0; i < len(xff); i++ {
-			// 取逗号前首段并 trim 空白。
 			if xff[i] == ',' {
 				return strings.TrimSpace(xff[:i])
 			}
@@ -356,17 +334,14 @@ func ExtractClientIP(r *http.Request) string {
 }
 
 // BillingHeaders billing 接口请求头。
-// UA 语义（对齐官方白名单头组，application-manifest.js:27590-27601）：
-//  1. 显式配置 c.UserAgent 优先（用户自定义值，全路径生效）；
-//  2. 未配且归属名非 SaaS（含默认 WorkBuddy）→ 单段 `WorkBuddy/<clientVersion>`
-//     （官方 banner/check-in 显式覆写 UA 的形态，不带 CLI 段）；
-//  3. 显式 client_name="SaaS" → 不设置（Go 客户端自带默认 UA，还原旧行为）。
+// UA 语义：默认**不设置**（保持现状，Go 客户端自带默认 UA）；仅当显式配置
+// c.UserAgent 非空才覆盖——避免默认路径给 billing 引入新的 UA 指纹。
 func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
 	c.injectCodeBuddyRequest(req)
-	// Accept-Language 按 realm 切（D5）：billing 域未走 CommonHeaders，单独注入。
+	// Accept-Language 按 realm 切（D5，billing 域未走 CommonHeaders，单独注入）。
 	req.Header.Set("Accept-Language", acceptLanguageFor(a))
 	if c != nil && c.UserAgent != "" {
 		req.Header.Set("User-Agent", c.UserAgent)
@@ -383,7 +358,7 @@ func (c *Client) BillingHeaders(req *http.Request, a *auth.Auth) {
 	if a.Domain != "" {
 		req.Header.Set("X-Domain", a.Domain)
 	}
-	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入（见 resolveDeviceToken）。
+	// 设备风控头：billing 域（report/travel/balance/checkin）同样注入。
 	c.injectDeviceToken(req, a)
 }
 

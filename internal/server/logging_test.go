@@ -12,17 +12,21 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// captureStdout 重定向 os.Stdout 并捕获 fn 期间的全部输出。
+// captureStdout 重定向 os.Stdout（连同 chatLogOut，见 SetChatLogOutput 的注入点）
+// 并捕获 fn 期间的全部输出。
 func captureStdout(t *testing.T, fn func()) string {
 	t.Helper()
 	old := os.Stdout
+	oldOut := chatLogOut
 	r, w, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	os.Stdout = w
+	chatLogOut = w
 	fn()
 	os.Stdout = old
+	chatLogOut = oldOut
 	_ = w.Close()
 	raw, _ := io.ReadAll(r)
 	return string(raw)
@@ -38,16 +42,19 @@ func withChatLog(t *testing.T) {
 }
 
 func TestChatStatsReaderTokensFromUsage(t *testing.T) {
-	// 起点回拨 1ms：内存流（strings.Reader）瞬时返回，用 time.Now() 作起点会让
-	// ttfb=time.Since(start) 在同一时钟滴答内测得 0（Windows 精度 ~0.5ms 尤甚）。
-	// 生产 SSE 是网络流 ttfb 必然 >0；此处回拨起点模拟"已过一段时间"的可分辨测量。
-	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now().Add(-time.Millisecond))
+	r := newChatStatsReaderSince(strings.NewReader(sseOK), time.Now())
+	// 保证 TTFB 跨过时钟粒度：Windows 上纯内存读取不足 1ms，time.Since 可能取 0。
+	time.Sleep(3 * time.Millisecond)
 	if _, err := io.Copy(io.Discard, r); err != nil {
 		t.Fatalf("copy: %v", err)
 	}
 	toks, ok := r.Tokens()
 	if !ok || toks != 1 {
 		t.Fatalf("tokens=%d ok=%v, want 1/true (from usage, not rune count)", toks, ok)
+	}
+	usage := r.Usage()
+	if !usage.HasPromptTokens || usage.PromptTokens != 1 || !usage.HasCompletionTokens || usage.CompletionTokens != 1 || !usage.HasTotalTokens || usage.TotalTokens != 2 {
+		t.Fatalf("usage=%+v, want prompt=1 completion=1 total=2", usage)
 	}
 	if r.TTFB() <= 0 {
 		t.Errorf("ttfb=%v want >0", r.TTFB())
@@ -72,59 +79,6 @@ func TestChatStatsReaderLastFrameUsageWins(t *testing.T) {
 	toks, ok := r.Tokens()
 	if !ok || toks != 12 {
 		t.Fatalf("tokens=%d ok=%v, want 12 (last frame wins)", toks, ok)
-	}
-}
-
-// TestChatStatsReaderCreditMissing (P0, RED): usage 存在但 credit 字段缺失时
-// Credit() 必须返回 ok=false——缺失≠免费，不能把缺观测当 0 扣费记入账本
-// （否则收费的 global 号可能被误判 tier0 免费被永久优先）。
-func TestChatStatsReaderCreditMissing(t *testing.T) {
-	sse := "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n" +
-		"data: [DONE]\n\n"
-	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
-	_, _ = io.Copy(io.Discard, r)
-	if toks, ok := r.Tokens(); !ok || toks != 5 {
-		t.Fatalf("tokens=%d ok=%v want 5/true (usage still供 token)", toks, ok)
-	}
-	credit, ok := r.Credit()
-	if ok {
-		t.Errorf("Credit()=(%v,true) want ok=false: usage 无 credit 字段 ≠ 0 成本", credit)
-	}
-}
-
-// TestChatStatsReaderCreditExplicitZero (P0, RED/GREEN): usage 显式 credit:0 是合法免费观测，
-// Credit() 必须 ok=true 且 credit==0——真 0 不许丢（显式 0 与字段缺失语义不同）。
-func TestChatStatsReaderCreditExplicitZero(t *testing.T) {
-	sse := "data: {\"usage\":{\"prompt_tokens\":500,\"completion_tokens\":500,\"credit\":0}}\n\n" +
-		"data: [DONE]\n\n"
-	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
-	_, _ = io.Copy(io.Discard, r)
-	credit, ok := r.Credit()
-	if !ok || credit != 0 {
-		t.Errorf("Credit()=(%v,%v) want (0,true): 显式 credit:0 是合法免费观测", credit, ok)
-	}
-}
-
-// TestChatStatsReaderJSONNullCredit 回归保护：usage.credit 显式 null 也算缺失
-// （null ≠ 0），不得被当作免费观测。
-func TestChatStatsReaderJSONNullCredit(t *testing.T) {
-	sse := "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"credit\":null}}\n\n" +
-		"data: [DONE]\n\n"
-	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
-	_, _ = io.Copy(io.Discard, r)
-	if _, ok := r.Credit(); ok {
-		t.Error("usage.credit=null 应视为缺失（ok=false）")
-	}
-}
-
-// TestChatStatsReaderNoUsage 末帧完全无 usage → Credit() ok=false（现状已对，回归保护）。
-func TestChatStatsReaderCreditNoUsage(t *testing.T) {
-	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n" +
-		"data: [DONE]\n\n"
-	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
-	_, _ = io.Copy(io.Discard, r)
-	if _, ok := r.Credit(); ok {
-		t.Error("无 usage 帧 Credit() 应 ok=false")
 	}
 }
 

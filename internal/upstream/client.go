@@ -3,7 +3,6 @@
 package upstream
 
 import (
-	"cmp"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -18,7 +17,6 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
-	"workbuddy2api/internal/logfmt"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -102,6 +100,25 @@ var softRateMarkers = []string{
 
 var sessionDeadMarkers = []string{"Offline user session not found", "12153"}
 
+// accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
+//
+// 定位：这类错误是**账号本身状态**决定的本机故障，不是请求格式、不是临时限流、
+// 也不是内容误报——继续重试只会反复刷上游风控/配额检查，必须把该账号冷却轮换。
+//   - "request illegal"（code 11140）→ 上游 auth/auth_forbidden，账号级授权风控，
+//     需重新 OAuth 登录才能恢复，短冷却只能阻止继续送死。
+//   - code 14017（"trial not activated" / "The trial version is not yet activated"）→
+//     上游 quota/quota_not_activated，register 未完成的试用未激活账号，同样账号级。
+//
+// 注意 11140 **不能**按 code 判定：该 code 也承载模型级限流文案（"The model provider
+// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（下方 softRateMarkers
+// 后判定）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案）。
+// 14017 文案唯一（无软限流歧义），可安全收录。
+var accountFaultMarkers = []string{
+	"request illegal",
+	"trial not activated",
+	"trial version is not yet activated",
+}
+
 // contentBlockedMarkers 内容策略拦截关键词（大小写不敏感子串匹配）。
 //
 // 定位：上游按逐字精确指纹审核，system 来源的模板句（如 Claude Code/Codex
@@ -158,32 +175,12 @@ func contentBlockedKeyword(body string) string {
 // "Unmarshal chat params failed..."（code 11101）。这是"发给上游的 body 有问题"，
 // 与账号健康无关——不罚号，但仍轮转（commit B）。
 var badParamsMarkerMsg = "Unmarshal chat params failed"
-var badParamsMarkerCode = `"code":11101`
 
 // alreadyCheckinMarkers "今天已签到"关键词（上游对重复签到返回 code!=0，
 // 实测 code=10001/14001 "今天已签到"/"今日已签到"）。只对 *Error.Msg 做包含匹配，
 // 网络层/解析层错误不在此识别（见 IsAlreadyCheckin）。
 var alreadyCheckinMarkers = []string{"已签到", "already"}
-
-// accountFaultMarkers 账号级授权/配额故障关键词（大小写不敏感子串匹配）。
-//
-// 定位：这类错误是**账号本身状态**决定的本机故障，不是请求格式、不是临时限流、
-// 也不是内容误报——继续重试只会反复刷上游风控/配额检查，必须把该账号冷却轮换。
-//   - "request illegal"（code 11140）→ 上游 auth/auth_forbidden，账号级授权风控
-//     （实测 global 账号：同一规范化请求 A1 403/11140 vs A2 429/14017，差异全由账号
-//     数据决定）。需重新 OAuth 登录才能恢复，短冷却只能阻止继续送死。
-//   - code 14017（"trial not activated" / "The trial version is not yet activated"）→
-//     上游 quota/quota_not_activated，register 未完成的试用未激活账号，同样账号级。
-//
-// 注意 11140 **不能**按 code 判定：该 code 也承载模型级限流文案（"The model provider
-// is rate-limiting requests."），那种场景必须保持 ErrSoftRate（上方 softRateMarkers
-// 先命中）。故此处只收 msg 关键词 "request illegal"（auth_forbidden 的真实文案），
-// 120 与 private 均落同一分类。14017 文案唯一（无软限流歧义），可安全收录。
-var accountFaultMarkers = []string{
-	"request illegal",
-	"trial not activated",
-	"trial version is not yet activated",
-}
+var badParamsMarkerCode = `"code":11101`
 
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
@@ -332,10 +329,14 @@ type Client struct {
 	IdleTimeout time.Duration
 
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
-	// 键按 realm 分层（map[realm]map[model][]efforts）：CN 探测结果不得被 global 同模型名
-	// 请求复用（同名不同档位会错误降级，C-2）。global 侧暂无 efforts 探测 → 桶缺失即透传。
+	// 按 realm 分层桶（cn/global）：同模型名跨域探测的 effort 集合可能不同，
+	// 混桶会互相污染（C-2）。
 	effortsMu sync.RWMutex
 	efforts   map[string]map[string][]string
+	// defaultEfforts 缓存各模型 reasoning.defaultEffort（FetchModels 刷新），供
+	// thinking.go 补档：缺显式 effort 时优先用模型声明默认档，空串回退硬编码 high。
+	// 与 efforts 同 realm 分层桶（同 C-2 隔离原则），共用 effortsMu。
+	defaultEfforts map[string]map[string]string
 
 	// globalModels 缓存 global 模型名目录探测结果（成功 ∩ 静态 overlay；
 	// 1h TTL + 5min 负缓存），见 global_models.go。按实例持有，测试新建 Client 即隔离。
@@ -344,51 +345,39 @@ type Client struct {
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
 	SanitizeFingerprints bool
 
-	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认 WorkBuddy
-	// 三段式与 billingUA 单段式）。空 = 默认官方形态：chat/refresh/FetchModels 走
-	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing/checkin 走 `WorkBuddy/<ver>`
-	// （仅当 client_name 非空，见 billingUA）。
-	// issue #42 深挖：官网「使用端」列基于出站请求的 UA/X-Product 服务端归因，
-	// 官方 WorkBuddy 桌面 UA 见 defaultWorkBuddyUA。默认值已对齐官方（A 段变更），
-	// 用户仍可显式配置完全自定义的 UA。
+	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
+	// 空 = 默认官方形态：chat/refresh/FetchModels 走
+	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`
+	// （仅当 client_name 非空）。
 	UserAgent string
 
-	// WebBaseCN fork 特性：activity/tasks 域的 Web 基址覆盖（成长任务/领奖走 copilot web 域）。
-	WebBaseCN string
-
-	// DeviceToken 设备风控 Token（X-Device-Token 头）兜底来源：config upstream.device_token。
-	// 仅当 auth.Auth.DeviceToken 为空时才取此值；两者皆空则不注入该头。
-	// 容器内无桌面端 Turing SDK，这是把外部（宿主/桌面端）生成的 token 注入的入口。
-	// 另见 DeviceTokenFile 缓存读取：宿主可把 token 落 /app/data/device_token 共用。
-	DeviceToken string
-
-	// DeviceTokenFile 宿主落盘的 device token 文件路径（可选，空 = 不读文件）。
-	// 读取频率限 5 分钟一次缓存（见 device_token.go），>1KB 或读失败则忽略。
-	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
-	DeviceTokenFile string
-
-	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
-	// 空（默认）= "WorkBuddy"：伪造官方桌面端指纹（X-IDE-* 四头 + X-Agent-Purpose，
-	// 见 injectAttribution / attributionClientName）。显式配 "SaaS" 还原旧行为
-	// （仅 X-Product="SaaS"，不设 X-IDE-*）；配其他值则四头跟随该值。
-	ClientName string
-
-	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + B 段的
-	// X-IDE-Version）。空 = 内置默认 defaultClientVersion（对齐官方 5.5.4 分发包）。
-	// config upstream.client_version 覆盖。
+	// ClientVersion WorkBuddy 客户端版本段（出站 UA 的 `WorkBuddy/<ver>` + X-IDE-Version）。
+	// 空 = 内置默认（对齐官方 5.5.4 分发包）。
 	ClientVersion string
 
-	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认 defaultCliVersion
-	// （对齐官方内置 CLI 2.137.1）。config upstream.cli_version 覆盖。
+	// CliVersion 出站 UA 中 `CLI/<ver>` 段版本。空 = 内置默认（官方内置 CLI 2.137.1）。
 	CliVersion string
 
+	// ClientName 用量归属头取值（X-Product / X-IDE-Name / X-IDE-Type / X-IDE-Version）。
+	// 空 = 旧行为：X-Product="SaaS"，不设 X-IDE-*（向后兼容，不突变归因）。
+	ClientName string
+
 	// PassthroughIP 是否透传客户端 IP 给上游（X-Forwarded-For/X-Real-IP 首段）。
-	// 缺省 false（反代安全边界）；handler 在 chat 路径按请求把 clientIP 参数传入 ChatStream，
-	// 由 ChatHeaders 注入（不再挂共享字段，杜绝并发串扰）。
+	// 缺省 false（反代安全边界）；handler 在 chat 路径按请求把 clientIP 传入 ChatStream。
 	PassthroughIP bool
+
+	// DeviceToken 设备风控 Token（X-Device-Token 头）全局兜底来源：config upstream.device_token。
+	// 解析优先级：auth.Auth.DeviceToken > DeviceToken（config）> DeviceTokenFile（文件）。
+	DeviceToken string
+
+	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
+	DeviceTokenFile string
 
 	ChatBaseCN    string
 	BillingBaseCN string
+	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
+	// （Web 成长中心用；CLI 域 copilot.tencent.com 的同名路径返回 400）。
+	WebBaseCN string
 
 	// ChatBaseGlobal / BillingBaseGlobal 国际版（global realm）上游 base。
 	// 空 = 缺省默认 https://www.workbuddy.ai（D5）。
@@ -396,15 +385,9 @@ type Client struct {
 	BillingBaseGlobal string
 
 	// GlobalEnabled 是否启用 global realm 路由（config global.enabled，缺省 true）。
-	// false 即显式逃生门：即使用户 auth 写了 realm=global 也**不**路由到 global base——
+	// false 时即便用户 auth 写了 realm=global 也**不**路由到 global base——
 	// chatBase/billingBase 返回 CN base，路径也走 CN（双保险，与 auth.Realm() 的开关闸呼应）。
 	GlobalEnabled bool
-
-	// UsageBaseCN / UsageBaseGlobal 积分消耗明细（get-user-request-usage）所在主机：
-	// 官网 usercenter 同源，与 billing base 不同（CN 实测仅在 www.workbuddy.cn 提供，
-	// codebuddy.cn 同路径 404/400）。空 = 回落默认。
-	UsageBaseCN     string
-	UsageBaseGlobal string
 }
 
 // New 生产默认值。配置连接池减少 TLS 握手。
@@ -422,7 +405,10 @@ func New() *Client {
 		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
-		UsageBaseCN:          "https://www.workbuddy.cn",
+		WebBaseCN:            "https://www.workbuddy.cn",
+		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
+		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
+		GlobalEnabled: true,
 	}
 }
 
@@ -459,53 +445,27 @@ func (c *Client) globalOn(a *auth.Auth) bool {
 	return c.GlobalEnabled && a != nil && a.Realm() == "global"
 }
 
-func (c *Client) chatBase(a *auth.Auth) string {
+// 路径常量：CN 现状路径（chatCompletionsPath）与 global 双候选路径。
+const (
+	chatCompletionsPath   = "/v2/chat/completions"
+	globalChatConsolePath = "/console/chat/completions"
+)
+
+// chatPaths 按 realm 返回 chat 端点路径候选序列：
+// global → [console, v2]（404/405 时 fallback）；cn → [v2]（现状逐字，零回归）。
+func (c *Client) chatPaths(a *auth.Auth) []string {
 	if c.globalOn(a) {
-		return c.globalChatBase()
+		return []string{globalChatConsolePath, chatCompletionsPath}
 	}
-	return c.ChatBaseCN
+	return []string{chatCompletionsPath}
 }
 
-// prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
-// 显式传 realm 使 effort 降级按域取桶：CN 探测信息不得作用到 global 请求（C-2）。
-func (c *Client) prepareBody(body []byte, realm string) []byte {
-	return PrepareBodyOptWithEfforts(body, c.SanitizeFingerprints, c.effortsSnapshot(realm))
-}
-
-// effortsSnapshot 返回指定 realm 的 effort 能力缓存副本；该域无探测 → nil（透传不降级）。
-func (c *Client) effortsSnapshot(realm string) map[string][]string {
-	c.effortsMu.RLock()
-	defer c.effortsMu.RUnlock()
-	bucket, ok := c.efforts[realmKey(realm)]
-	if !ok || len(bucket) == 0 {
-		return nil
-	}
-	cp := make(map[string][]string, len(bucket))
-	for k, v := range bucket {
-		cp[k] = v
-	}
-	return cp
-}
-
-// realmKey 归一化 efforts 缓存键：cn/global。空 realm 视为 cn（老调用/无前缀模型名）。
-func realmKey(realm string) string {
-	if realm == "" {
-		return "cn"
-	}
-	return realm
-}
-
-func (c *Client) billingBase(a *auth.Auth) string {
-	if c.globalOn(a) {
-		return c.globalBillingBase()
-	}
-	return c.BillingBaseCN
-}
+func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
 
 // billing 域端点路径（billingBase + path）。balance/checkin 与 report（report.go）同域，
 // 统一走 billingJSON 发请求。
 const (
-	billingMeterPath   = "/billing/meter/get-user-resource"    // global 首选（R9：国际版无 /v2 前缀）
+	billingMeterPath   = "/billing/meter/get-user-resource"    // global 首选（国际版无 /v2 前缀）
 	dailyCheckinPath   = "/billing/meter/daily-checkin"        // global 首选
 	billingMeterPathV2 = "/v2/billing/meter/get-user-resource" // CN 现状 / global fallback
 	dailyCheckinPathV2 = "/v2/billing/meter/daily-checkin"
@@ -528,6 +488,83 @@ func (c *Client) checkinMeterPaths(a *auth.Auth) []string {
 		return []string{dailyCheckinPath, dailyCheckinPathV2}
 	}
 	return []string{dailyCheckinPathV2}
+}
+
+func (c *Client) chatBase(a *auth.Auth) string {
+	if c.globalOn(a) {
+		return c.globalChatBase()
+	}
+	return c.ChatBaseCN
+}
+
+// prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
+// prepareBody 组装出站请求体（脱敏开关由 Client.SanitizeFingerprints 控制）。
+// realm 为账号 Realm()（cn/global），供 efforts 缓存分桶（跨域 effort 集合不互相污染）。
+func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []byte {
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints,
+		c.effortsSnapshot(realm), c.defaultEffortsSnapshot(realm))
+	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
+	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
+	body = InjectPromptCacheKey(body, uid, conversationID)
+	return body
+}
+
+// effortsSnapshot 返回 effort 能力缓存副本；nil 表示未知（透传不降级）。
+func (c *Client) effortsSnapshot(realm string) map[string][]string {
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	bucket, ok := c.efforts[realmKey(realm)]
+	if !ok || len(bucket) == 0 {
+		return nil
+	}
+	cp := make(map[string][]string, len(bucket))
+	for k, v := range bucket {
+		cp[k] = v
+	}
+	return cp
+}
+
+// defaultEffortsSnapshot 返回指定 realm 的模型 defaultEffort 缓存副本；
+// 该域无探测或无声明默认档 → nil（thinking.go 回退硬编码 high）。
+func (c *Client) defaultEffortsSnapshot(realm string) map[string]string {
+	c.effortsMu.RLock()
+	defer c.effortsMu.RUnlock()
+	bucket, ok := c.defaultEfforts[realmKey(realm)]
+	if !ok || len(bucket) == 0 {
+		return nil
+	}
+	cp := make(map[string]string, len(bucket))
+	for k, v := range bucket {
+		cp[k] = v
+	}
+	return cp
+}
+
+// realmKey 归一化 efforts 缓存键：cn/global。空 realm 视为 cn（老调用/无前缀模型名）。
+func realmKey(realm string) string {
+	if realm == "" {
+		return "cn"
+	}
+	return realm
+}
+
+func (c *Client) billingBase(a *auth.Auth) string {
+	if c.globalOn(a) {
+		return c.globalBillingBase()
+	}
+	return c.BillingBaseCN
+}
+
+// webBase 返回官网域（任务领奖类接口；未注入时回落默认）。
+// realm 感知：global 账号切国际站 workbuddy.ai，CN 用 workbuddy.cn。
+func (c *Client) webBase(a *auth.Auth) string {
+	if c.globalOn(a) {
+		return defaultGlobalBase
+	}
+	if c.WebBaseCN != "" {
+		return c.WebBaseCN
+	}
+	return "https://www.workbuddy.cn"
 }
 
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
@@ -556,9 +593,9 @@ func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	return env.Data, nil
 }
 
-// refreshIOTimeout 单次 refresh 网络调用的总时长上限。
-// 远小于 HTTP.Client.Timeout(120s)：refresh 持锁窗口内做网络 I/O，超时越短，
-// 单账号 hang 对该账号相关操作的阻塞越短（issue:持锁 120s I/O → 池级停滞）。
+// RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
+// 调用方负责 SaveAtomic。全程持 a 锁，防止并发 SaveAtomic 读半更新 token。
+// refreshIOTimeout 刷新端点网络 I/O 上限（两段式锁外执行，防上游 hang 长占锁）。
 const refreshIOTimeout = 30 * time.Second
 
 // RefreshToken 刷新 access token；成功时更新 a 的字段（缺省值保留旧值），
@@ -641,28 +678,9 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	return nil
 }
 
-// chatPath 按 realm 返回 chat 端点路径（不含 base）：
-// global → /console/chat/completions（404/405 时由 ChatStream fallback /v2/chat/completions）；
-// cn → /v2/chat/completions（现状逐字，零回归）。
-func (c *Client) chatPath(a *auth.Auth) string {
-	if c.globalOn(a) {
-		return globalChatConsolePath
-	}
-	return chatCompletionsPath
-}
-
-// 路径常量：CN 现状路径（chatCompletionsPath）与 global 双候选路径。
-const (
-	chatCompletionsPath   = "/v2/chat/completions"
-	globalChatConsolePath = "/console/chat/completions"
-)
-
-// chatFallbackHTTPStatus global chat fallback 只在 404/405 时发生（R9：上游新旧路径分叉）。
-func chatFallbackHTTPStatus(status int) bool { return status == 404 || status == 405 }
-
 // ChatStream 发 chat 请求并返回原始 SSE body 流（调用方负责 Close）。
 // 等价于 ChatStreamContext(context.Background(), ...)：不带调用方取消语义。
-// 新调用方应优先用 ChatStreamContext 传入请求 ctx（客户端断连即中断在途调用、释放租约）。
+// 需要客户端断开联动的调用方用 ChatStreamContext 传入请求 ctx。
 //
 // global realm：先打 /console/chat/completions，404/405 时同一 base 二次换 /v2/chat/completions
 // （上游新旧路径分叉，PLAN R9 fallback 顺序）。cn：/v2/chat/completions 现状不变。
@@ -670,17 +688,19 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, clientIP string, meta Cha
 	return c.ChatStreamContext(context.Background(), a, body, clientIP, meta)
 }
 
-// ChatStreamContext 同 ChatStream，但从 ctx 派生请求 context：调用方（handler）传入
-// r.Context() 后，客户端断连/请求取消会立即中断在途上游调用、释放连接与账号在途名额，
-// 不再空转到 IdleTimeout。ctx 为 nil 时回落 Background。
+// ChatStreamContext 同 ChatStream，但出站请求挂在调用方的 reqCtx 上：
+// handler 传 r.Context() → 客户端断开时上游请求随之取消（不再白白消耗账号积分
+// 与上游连接继续生成无人消费的流）。成功流的 cancel 仍由 monitorBody 的 Close
+// 接管（reqCtx 取消与显式 Close 任一触发即断）。
+// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
+// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
 func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byte, clientIP string, meta ChatMeta) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	var cancel context.CancelFunc
-	// global 首次路径 404/405 时换 fallback 路径重试；ensureConsoleSystem 在 prepareBody 后统一套用
-	// 全局脚本：首条消息非 system 时前置兜底 system（防 console 域上游 code 11-128）。
-	prepared := c.prepareBody(body, a.Realm())
+	// global 首次路径 404/405 时换 fallback 路径重试。
+	prepared := c.prepareBody(body, a.Realm(), a.UID, meta.ConversationID)
 	if c.globalOn(a) {
 		prepared = ensureConsoleSystem(prepared)
 	}
@@ -698,7 +718,7 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		resp, err := c.chatHTTP().Do(req)
 		if err != nil {
 			cancel()
-			log.Printf("ERR: [upstream] chat_stream uid=%s: transport error: %v", logfmt.UID8(a.UID), err)
+			log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -706,8 +726,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 			resp.Body.Close()
 			cancel()
 			kind := Classify(resp.StatusCode, string(raw))
-			log.Printf("WARN: [upstream] chat_stream uid=%s: upstream %d %s body=%s",
-				logfmt.UID8(a.UID), resp.StatusCode, kind, truncate(string(raw), 200))
+			log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
+				a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 			// global 首次路径 404/405 → 换 fallback 路径重试；其余状态码直接返回。
 			if attempt < len(c.chatPaths(a))-1 && chatFallbackHTTPStatus(resp.StatusCode) {
 				continue
@@ -723,53 +743,48 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	return nil, 0, nil, nil
 }
 
-// chatPaths 返回按 realm 的 chat 路径候选序列：
-// global → [console, /v2]（向 Fallback 迭代）；cn → [/v2]（单元素，现状）。
-func (c *Client) chatPaths(a *auth.Auth) []string {
-	if c.globalOn(a) {
-		return []string{globalChatConsolePath, chatCompletionsPath}
-	}
-	return []string{chatCompletionsPath}
-}
-
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
 type ModelInfo struct {
 	ID                 string
 	Name               string
 	ContextWindow      int64    // = maxInputTokens
-	MaxTokens          int64    // = maxOutputTokens
+	MaxTokens          int64    // = maxOutputTokens（思考与最终回答共享此预算，上游无独立思考上限字段）
 	MaxAllowedSize     int64    // = maxAllowedSize（单请求体大小上限，通常等于 maxInputTokens）
 	Efforts            []string // reasoning.supportedEfforts（空=未知/固定档）
 	DefaultEffort      string   // reasoning.defaultEffort（新模型键）或 reasoning.effort（老模型键）；空=未返回
 	CanDisableThinking bool     // reasoning.canDisableThinking：思考可关（off 档可用）
 	SupportsReasoning  bool     // supportsReasoning：模型支持思考
+	SupportsImages     bool     // 顶层 supportsImages（多模态能力，透出到 /v1/models）
 	Credits            string   // credits：积分倍率（如 "x0.79"）
 }
 
-// 模型目录端点路径常量（按 realm 切）：
-// CN 现状 /console/enterprises/personal/models 逐字保留（零回归）；
-// global 走 /v2/enterprises/personal/models（PR #20 实测 /console 500、/v2 200 含
-// credits 倍率的完整模型表）。modelsPath 按 globalOn 分发。
-const (
-	cnModelsPath     = "/console/enterprises/personal/models"
-	globalModelsPath = "/v2/enterprises/personal/models"
-)
-
-// modelsPath 按 realm 返回动态模型目录端点路径（不含 base）。
-// CN → /console/enterprises/personal/models（现状，零回归）；
-// global → /v2/enterprises/personal/models（国际版实测可用路径，见 global_models.go
-// probe 家族）：governed by globalOn（config global.enabled + 账号 realm 双闸）。
-func (c *Client) modelsPath(a *auth.Auth) string {
-	if c.globalOn(a) {
-		return globalModelsPath
+// nonChatModel 判定是否非对话模型（应从模型列表过滤掉）。
+// 来源：harness buddy.ts:547-555。三类规则：
+//   - id 前缀 nes-/completion-/codewise-：嵌入/补全/代码专用模型，选了报 code=11102。
+//   - maxOutputTokens ≤ 256：tiny 输出非对话模型。
+//   - tags 含 text-to-image：图片生成模型，非本网关用途。
+func nonChatModel(id string, maxOutputTokens int64, tags []string) bool {
+	id = strings.ToLower(strings.TrimSpace(id))
+	for _, p := range [...]string{"nes-", "completion-", "codewise-"} {
+		if strings.HasPrefix(id, p) {
+			return true
+		}
 	}
-	return cnModelsPath
+	if maxOutputTokens > 0 && maxOutputTokens <= 256 {
+		return true
+	}
+	for _, t := range tags {
+		if t == "text-to-image" {
+			return true
+		}
+	}
+	return false
 }
 
 // FetchModels 调上游动态模型接口。
 // 字段名与上游实际返回对齐：maxInputTokens（非 contextWindow）、maxOutputTokens（非 maxTokens）。
 func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
-	url := c.chatBase(a) + c.modelsPath(a)
+	url := c.chatBase(a) + "/console/enterprises/personal/models"
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -789,19 +804,22 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		Code int `json:"code"`
 		Data struct {
 			Models []struct {
-				ID              string `json:"id"`
-				Name            string `json:"name"`
-				MaxInputTokens  int64  `json:"maxInputTokens"`
-				MaxOutputTokens int64  `json:"maxOutputTokens"`
-				Disabled        bool   `json:"disabled"`
-				Reasoning       struct {
-					Effort             string   `json:"effort"`
-					DefaultEffort      string   `json:"defaultEffort"`
+				ID                string   `json:"id"`
+				Name              string   `json:"name"`
+				MaxInputTokens    int64    `json:"maxInputTokens"`
+				MaxOutputTokens   int64    `json:"maxOutputTokens"`
+				MaxAllowedSize    int64    `json:"maxAllowedSize"`
+				Disabled          bool     `json:"disabled"`
+				Credits           string   `json:"credits"`
+				SupportsReasoning bool     `json:"supportsReasoning"`
+				SupportsImages    bool     `json:"supportsImages"`
+				Tags              []string `json:"tags"`
+				Reasoning         struct {
+					Effort             string   `json:"effort"`        // 老模型键（auto/hy3/glm-5.2 系）
+					DefaultEffort      string   `json:"defaultEffort"` // 新模型键（glm-5.3 系只返回这个）
 					CanDisableThinking bool     `json:"canDisableThinking"`
 					SupportedEfforts   []string `json:"supportedEfforts"`
 				} `json:"reasoning"`
-				MaxAllowedSize int64  `json:"maxAllowedSize"`
-				Credits        string `json:"credits"`
 			} `json:"models"`
 			Agents []struct {
 				Name   string   `json:"name"`
@@ -825,124 +843,85 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	if len(cliIDs) == 0 {
 		return nil, fmt.Errorf("no cli agent models found")
 	}
-	type dynModel struct {
-		ID                 string
-		Name               string
-		MaxInputTokens     int64
-		MaxOutputTokens    int64
-		MaxAllowedSize     int64
-		Disabled           bool
-		Efforts            []string
-		DefaultEffort      string
-		CanDisableThinking bool
-		SupportsReasoning  bool
-		Credits            string
+	type parsed struct {
+		mi       ModelInfo
+		disabled bool
 	}
-	dynMap := make(map[string]dynModel, len(env.Data.Models))
+	dynMap := make(map[string]parsed, len(env.Data.Models))
 	for _, m := range env.Data.Models {
-		dynMap[m.ID] = dynModel{
-			ID:                 m.ID,
-			Name:               m.Name,
-			MaxInputTokens:     m.MaxInputTokens,
-			MaxOutputTokens:    m.MaxOutputTokens,
-			MaxAllowedSize:     m.MaxAllowedSize,
-			Disabled:           m.Disabled,
-			Efforts:            m.Reasoning.SupportedEfforts,
-			DefaultEffort:      cmp.Or(m.Reasoning.DefaultEffort, m.Reasoning.Effort),
-			CanDisableThinking: m.Reasoning.CanDisableThinking,
-			SupportsReasoning:  m.Reasoning.Effort != "" || m.Reasoning.DefaultEffort != "" || m.Reasoning.CanDisableThinking,
-			Credits:            m.Credits,
-		}
-	}
-	out := make([]ModelInfo, 0, len(cliIDs))
-	for _, id := range cliIDs {
-		m, ok := dynMap[id]
-		if !ok || m.Disabled {
+		// 非对话模型（nes-/completion-/codewise- 前缀、maxOutputTokens≤256、
+		// tags 含 text-to-image）根本不进返回列表（来源：harness buddy.ts:547-555）。
+		if nonChatModel(m.ID, m.MaxOutputTokens, m.Tags) {
 			continue
 		}
-		out = append(out, ModelInfo{
+		def := m.Reasoning.Effort
+		if def == "" {
+			def = m.Reasoning.DefaultEffort // 新旧双键兼容：glm-5.3 系只返回 defaultEffort
+		}
+		dynMap[m.ID] = parsed{ModelInfo{
 			ID:                 m.ID,
 			Name:               m.Name,
 			ContextWindow:      m.MaxInputTokens,
 			MaxTokens:          m.MaxOutputTokens,
 			MaxAllowedSize:     m.MaxAllowedSize,
-			Efforts:            m.Efforts,
-			DefaultEffort:      m.DefaultEffort,
-			CanDisableThinking: m.CanDisableThinking,
+			Efforts:            m.Reasoning.SupportedEfforts,
+			DefaultEffort:      def,
+			CanDisableThinking: m.Reasoning.CanDisableThinking,
 			SupportsReasoning:  m.SupportsReasoning,
+			SupportsImages:     m.SupportsImages,
 			Credits:            m.Credits,
-		})
+		}, m.Disabled}
+	}
+	out := make([]ModelInfo, 0, len(cliIDs))
+	for _, id := range cliIDs {
+		if pm, ok := dynMap[id]; ok && !pm.disabled {
+			out = append(out, pm.mi)
+		}
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	// 刷新 effort 能力缓存（供请求体降级；无 supportedEfforts 的模型不入缓存）。
 	cache := make(map[string][]string, len(out))
+	defCache := make(map[string]string, len(out))
 	for _, mi := range out {
 		if len(mi.Efforts) > 0 {
 			cache[mi.ID] = mi.Efforts
 		}
-	}
-	if len(cache) == 0 {
-		return out, nil
+		if mi.DefaultEffort != "" {
+			defCache[mi.ID] = mi.DefaultEffort
+		}
 	}
 	// 按探测账号的 realm 写入对应桶：CN 探测只进 cn 桶，global 同模型名不被污染（C-2）。
 	c.effortsMu.Lock()
 	if c.efforts == nil {
 		c.efforts = make(map[string]map[string][]string)
 	}
+	if c.defaultEfforts == nil {
+		c.defaultEfforts = make(map[string]map[string]string)
+	}
 	c.efforts[realmKey(a.Realm())] = cache
+	c.defaultEfforts[realmKey(a.Realm())] = defCache
 	c.effortsMu.Unlock()
 	return out, nil
 }
 
-// billingMeterJSON 按 realm 候选路径发 billing/meter 域请求，ErrNotFound 时换下一候选路径
-// （global：/billing/meter/* → /v2/billing/meter/*；cn：单路径 /v2/billing/meter/* 现状）。
-func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
-	var lastErr error
-	for i, p := range paths {
-		data, err := c.billingJSON(a, method, p, body)
-		if err != nil {
-			lastErr = err
-			var ue *Error
-			if i < len(paths)-1 && errors.As(err, &ue) && ue.Kind == ErrNotFound {
-				continue // /billing/meter/* 404 → 换 /v2/billing/meter/*
-			}
-			return nil, err
-		}
-		return data, nil
-	}
-	return nil, lastErr
+// UserResource 查询账号积分余额与总额度（所有套餐聚合）。remain 负值钳 0；
+// total 取与 remain 同源的额度字段（CycleCapacitySize 优先，无周期额度退
+// CapacitySize），上游缺 size 的套餐按 remain 兜底，保证百分比不超 100%。
+func (c *Client) UserResource(a *auth.Auth) (remain, total int64, err error) {
+	remain, total, _, err = c.UserResourceDetailed(a, 0)
+	return remain, total, err
 }
 
-// UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
-func (c *Client) UserResource(a *auth.Auth) (remain int64, err error) {
-	remain, _, err = c.UserResourceDetailed(a, 0)
-	return remain, err
-}
-
-// CreditBuckets 按到期紧迫度拆分的积分余额（供 pool 优先消耗快过期积分）。
-// 背景（issue:积分过期）：套餐/奖励积分按 PackageEndTime 分批过期，总量口径的
-// remain 会让"明天就作废"的积分与"30 天后才过期"的积分被无差别选号，
-// 导致快过期积分没优先用掉、白白作废。拆桶后选号可优先消耗 Expiring。
-type CreditBuckets struct {
-	// Expiring 在 soon 窗口内（<= now+soon）即将过期的可用积分。
-	Expiring int64
-	// Stable 其余有效积分（到期时间更远或无到期时间）。
-	Stable int64
-}
-
-// Total 返回两桶合计可用积分（= UserResource 的 remain 口径）。
-func (b CreditBuckets) Total() int64 { return b.Expiring + b.Stable }
-
-// packageEndLayout 上游 PackageEndTime 的时间格式（与请求体过滤串同口径）。
+// packageEndLayout 上游套餐到期时间的墙钟格式（UTC+8，与 softRateResetLoc 同口径）。
 const packageEndLayout = "2006-01-02 15:04:05"
 
-// UserResourceDetailed 同 UserResource，但按到期时间把余额拆成 CreditBuckets。
-// soon>0 时把到期时间 <= now+soon 的套餐余额计入 Expiring；soon<=0 时全部归 Stable。
-// PackageEndTime 解析失败/缺失的套餐保守归入 Stable（不误标为快过期而插队）。
-// 单套餐取数口径（Cycle* 优先）与 UserResource 完全一致，保证向后兼容。
-func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain int64, buckets CreditBuckets, err error) {
+// UserResourceDetailed 在 UserResource 基础上额外返回「快过期」积分子集：
+// soon > 0 且套餐 PackageEndTime 解析成功且到期时刻 ≤ now+soon 的余额计入 expiring
+// （pool 据此优先消耗，避免官方活动赠送的奖励积分到期作废）；soon ≤ 0 时 expiring
+// 恒 0（禁用分桶，行为与引入前一致）。expiring 是 remain 的一部分。
+func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -954,7 +933,7 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain 
 	}
 	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
 	if err != nil {
-		return 0, CreditBuckets{}, err
+		return 0, 0, 0, err
 	}
 	var resp struct {
 		Response struct {
@@ -973,145 +952,36 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain 
 		} `json:"Response"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, CreditBuckets{}, fmt.Errorf("resource parse: %w", err)
+		return 0, 0, 0, fmt.Errorf("resource parse: %w", err)
 	}
 	for _, acct := range resp.Response.Data.Accounts {
-		var r int64
+		var r, size int64
 		switch {
 		case acct.CycleCapacitySize > 0:
-			r = acct.CycleCapacityRemain
+			r, size = acct.CycleCapacityRemain, acct.CycleCapacitySize
 		case acct.CycleCapacityRemain > 0 || acct.CycleCapacityUsed > 0:
-			r = acct.CycleCapacityRemain
+			r, size = acct.CycleCapacityRemain, acct.CycleCapacitySize
 		default:
-			r = acct.CapacityRemain
+			r, size = acct.CapacityRemain, acct.CapacitySize
 		}
 		if r < 0 {
 			r = 0
 		}
+		if size < r {
+			size = r
+		}
 		remain += r
-		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → Expiring。
+		total += size
+		// 分桶：仅 soon>0 且能解析出有效到期时间、且确实在窗口内 → expiring。
 		if soon > 0 && r > 0 && acct.PackageEndTime != "" {
-			// 上游时间为 UTC+8 墙钟（与 softRateResetLoc 同口径，官网展示时区）。
 			if end, perr := time.ParseInLocation(packageEndLayout, acct.PackageEndTime, softRateResetLoc); perr == nil {
 				if !end.After(now.Add(soon)) {
-					buckets.Expiring += r
-					continue
+					expiring += r
 				}
 			}
 		}
-		buckets.Stable += r
 	}
-	return remain, buckets, nil
-}
-
-// ResourceSummary 查询账号积分套餐的完整聚合口径（remain=剩余可花积分、used=已用、
-// size=总量、packs=套餐数），供运维工具（cmd/credit）按 realm 展示真实余额。
-// 与 UserResource 的差异：UserResource 只取 remain；本方法额外聚合 used/size/packs，
-// 且 TotalDosage 作 size 下限（与 cmd/credit 历史口径一致，见其 packageRemainUsed）。
-//
-// realm 感知继承 billingMeterPaths：global 账号打 workbuddy.ai /billing/meter/*（404
-// fallback /v2），CN 账号维持 /v2/billing/meter/get-user-resource（现状逐字，零回归）。
-func (c *Client) ResourceSummary(a *auth.Auth) (remain, used, size int64, packs int, err error) {
-	now := time.Now()
-	body := map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
-		"ProductCode":              "p_tcaca",
-		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
-	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-	var resp struct {
-		Response struct {
-			Data struct {
-				TotalDosage int64 `json:"TotalDosage"`
-				Accounts    []struct {
-					PackageName         string `json:"PackageName"`
-					CapacitySize        int64  `json:"CapacitySize"`
-					CapacityRemain      int64  `json:"CapacityRemain"`
-					CapacityUsed        int64  `json:"CapacityUsed"`
-					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-				} `json:"Accounts"`
-			} `json:"Data"`
-		} `json:"Response"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return 0, 0, 0, 0, fmt.Errorf("resource parse: %w", err)
-	}
-	for _, acct := range resp.Response.Data.Accounts {
-		r, u, s := packageRemainUsed(respAccount{
-			CapacityRemain:      acct.CapacityRemain,
-			CapacityUsed:        acct.CapacityUsed,
-			CapacitySize:        acct.CapacitySize,
-			CycleCapacityRemain: acct.CycleCapacityRemain,
-			CycleCapacityUsed:   acct.CycleCapacityUsed,
-			CycleCapacitySize:   acct.CycleCapacitySize,
-		})
-		remain += r
-		used += u
-		size += s
-	}
-	packs = len(resp.Response.Data.Accounts)
-	// TotalDosage 作 size 下限（历史口径：已消耗的不该比总剂量小）。
-	if size > 0 {
-		if derived := size - remain; derived > used {
-			used = derived
-		}
-	}
-	if dosage := resp.Response.Data.TotalDosage; dosage > size {
-		size = dosage
-		if derived := size - remain; derived > used {
-			used = derived
-		}
-	}
-	return remain, used, size, packs, nil
-}
-
-// respAccount 供 packageRemainUsed 解析的套餐字段（与 cmd/credit resourcePackage 同构）。
-type respAccount struct {
-	CapacityRemain      int64
-	CapacityUsed        int64
-	CapacitySize        int64
-	CycleCapacityRemain int64
-	CycleCapacityUsed   int64
-	CycleCapacitySize   int64
-}
-
-// packageRemainUsed 聚合单套餐的 remain/used/size（历史口径见 cmd/credit/billing.go，
-// 迁移至此作为单一事实来源）。Cycle 期套餐优先：用 CycleCapacity 三字段，
-// used 取 CycleUsed 与 size-remain 的较大者；否则回退 Capacity 三字段。
-func packageRemainUsed(a respAccount) (remain, used, size int64) {
-	if a.CycleCapacitySize > 0 {
-		remain = a.CycleCapacityRemain
-		size = a.CycleCapacitySize
-		if remain < 0 {
-			remain = 0
-		}
-		if remain > size {
-			remain = size
-		}
-		used = size - remain
-		if a.CycleCapacityUsed > used {
-			used = a.CycleCapacityUsed
-			if size >= used {
-				remain = size - used
-			}
-		}
-		return remain, used, size
-	}
-	remain = a.CapacityRemain
-	used = a.CapacityUsed
-	size = a.CapacitySize
-	if used == 0 && size > remain {
-		used = size - remain
-	}
-	return remain, used, size
+	return remain, total, expiring, nil
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
@@ -1136,76 +1006,6 @@ func IsAlreadyCheckin(err error) bool {
 	return false
 }
 
-// UsageRec 一条积分消耗明细（按请求）。
-type UsageRec struct {
-	RequestTime string  // "2006-01-02 15:04:05"（上游本地 = CST）
-	Credit      float64 // 本次扣减积分（如 0.12）
-	Model       string
-}
-
-// UsageRecords 拉取账号在 [begin, end] 内的按请求积分消耗明细
-// （POST /billing/meter/get-user-request-usage，官网「积分消耗明细」同源；
-// 注意在 UsageBaseCN 主机、无 /v2 前缀，与 get-user-resource 的 /v2 路径不同）。
-// 带分页与上限保护：单账号/区间最多 maxUsagePages×pageSize 条，超出截断（趋势聚合仍成样）。
-func (c *Client) UsageRecords(a *auth.Auth, begin, end time.Time) ([]UsageRec, error) {
-	const (
-		pageSize     = 100
-		maxUsagePage = 10 // 1000 条/账号/区间封顶；响应含提示词快照，控制带宽
-	)
-	var out []UsageRec
-	total := 0
-	for page := 1; page <= maxUsagePage; page++ {
-		body := map[string]any{
-			"startTime": begin.Format("2006-01-02") + " 00:00:00",
-			"endTime":   end.Format("2006-01-02") + " 23:59:59",
-			"pageNum":   page,
-			"pageSize":  pageSize,
-		}
-		raw, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-			c.UsageBaseCN+"/billing/meter/get-user-request-usage", bytes.NewReader(raw))
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		c.BillingHeaders(req, a)
-		data, err := c.doJSON(req)
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		var shape struct {
-			Total int `json:"total"`
-			Data  []struct {
-				RequestTime string      `json:"requestTime"`
-				Credit      json.Number `json:"credit"`
-				Model       string      `json:"model"`
-			} `json:"data"`
-		}
-		err = json.Unmarshal(data, &shape)
-		cancel()
-		if err != nil {
-			return nil, fmt.Errorf("request usage parse: %w", err)
-		}
-		total = shape.Total
-		for _, r := range shape.Data {
-			v, err := r.Credit.Float64()
-			if err != nil {
-				continue
-			}
-			out = append(out, UsageRec{RequestTime: r.RequestTime, Credit: v, Model: r.Model})
-		}
-		if len(shape.Data) == 0 || len(out) >= total {
-			break
-		}
-	}
-	return out, nil
-}
-
 func truncate(s string, n int) string {
 	s = strings.TrimSpace(s)
 	if len(s) > n {
@@ -1214,14 +1014,12 @@ func truncate(s string, n int) string {
 	return s
 }
 
-
-// ─── 以下为本仓库特性适配层（账本 ledger / 采样器 usage / 面板进度条） ───────────
+// ─── 本仓库特性适配层（账本 ledger / 采样器 usage / 面板进度条） ───
 
 // UserResourceRT 双返回值版余额查询：remain 剩余、total 总额度（百分比展示用）。
-// 上游 UserResource 只返回 remain；total 走 ResourceSummary 的 size 聚合口径。
+// origin client 的 UserResourceDetailed 就是 4 值口径（remain,total,expiring,err）。
 func (c *Client) UserResourceRT(a *auth.Auth) (remain, total int64, err error) {
-	remain, _, size, _, err := c.ResourceSummary(a)
-	return remain, size, err
+	return c.UserResource(a)
 }
 
 // UserUsage 账号的计费用量聚合（usage 采样器依赖）。
@@ -1231,13 +1029,57 @@ type UserUsage struct {
 	Size   int64 // 总量
 }
 
-// UserResourceDetail 完整形态：除剩余外返回已用与总量。
+// UserResourceDetail 完整形态：除剩余外返回已用与总量（usage 采样器依赖 Used 单调差值）。
 func (c *Client) UserResourceDetail(a *auth.Auth) (UserUsage, error) {
-	remain, used, size, _, err := c.ResourceSummary(a)
+	now := time.Now()
+	body := map[string]any{
+		"PageNumber":               1,
+		"PageSize":                 100,
+		"ProductCode":              "p_tcaca",
+		"Status":                   []int{0, 3},
+		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
+		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
+	}
+	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
 	if err != nil {
 		return UserUsage{}, err
 	}
-	return UserUsage{Remain: remain, Used: used, Size: size}, nil
+	var resp struct {
+		Response struct {
+			Data struct {
+				Accounts []struct {
+					CapacitySize        int64 `json:"CapacitySize"`
+					CapacityRemain      int64 `json:"CapacityRemain"`
+					CapacityUsed        int64 `json:"CapacityUsed"`
+					CycleCapacitySize   int64 `json:"CycleCapacitySize"`
+					CycleCapacityRemain int64 `json:"CycleCapacityRemain"`
+					CycleCapacityUsed   int64 `json:"CycleCapacityUsed"`
+				} `json:"Accounts"`
+			} `json:"Data"`
+		} `json:"Response"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return UserUsage{}, fmt.Errorf("resource parse: %w", err)
+	}
+	var out UserUsage
+	for _, acct := range resp.Response.Data.Accounts {
+		var r, used int64
+		switch {
+		case acct.CycleCapacitySize > 0:
+			r = acct.CycleCapacityRemain
+			used = acct.CycleCapacityUsed
+		default:
+			r = acct.CapacityRemain
+			used = acct.CapacityUsed
+		}
+		if r < 0 {
+			r = 0
+		}
+		out.Remain += r
+		out.Used += used
+		out.Size += acct.CapacitySize
+	}
+	return out, nil
 }
 
 // DailyCheckinCredit 签到并解析奖励积分。返回 (本次到账 credit, 签到后余额, err)。
@@ -1287,10 +1129,3 @@ func anyToF(v any) float64 {
 	return 0
 }
 
-// webBase fork 特性：成长任务 Web 域基址（默认官方站点，可被 WebBaseCN 覆盖）。
-func (c *Client) webBase() string {
-	if c.WebBaseCN != "" {
-		return c.WebBaseCN
-	}
-	return "https://www.workbuddy.cn"
-}

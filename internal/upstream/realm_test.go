@@ -142,7 +142,7 @@ func TestGlobalBillingUsesBillingMeterThenV2Fallback(t *testing.T) {
 	defer chatSrv.Close()
 
 	c := globalTestClient(t, chatSrv, billSrv)
-	remain, err := c.UserResource(globalAcct())
+	remain, _, err := c.UserResource(globalAcct())
 	if err != nil {
 		t.Fatalf("global billing: %v", err)
 	}

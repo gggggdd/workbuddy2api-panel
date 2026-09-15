@@ -10,6 +10,7 @@ package upstream
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"time"
@@ -38,6 +39,26 @@ func (c *Client) billingJSON(a *auth.Auth, method, path string, body any) (json.
 	}
 	c.BillingHeaders(req, a)
 	return c.doJSON(req)
+}
+
+// billingMeterJSON 仅对 /billing/meter 族端点（get-user-resource / daily-checkin）
+// 按 realm 走双路径 fallback：global 先无 /v2 前缀，ErrNotFound 时二次换有 /v2 前缀
+// （上游新旧路径分叉）；cn 单路径（有 /v2）现状不变。仅 global realm 才有多路径。
+func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, body any) (json.RawMessage, error) {
+	var lastErr error
+	for i, path := range paths {
+		data, err := c.billingJSON(a, method, path, body)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		// 仅 404 换路径（路径不存在才值得 fallback）；其他错误直接返回。
+		var ue *Error
+		if !errors.As(err, &ue) || ue.Kind != ErrNotFound || i == len(paths)-1 {
+			return nil, err
+		}
+	}
+	return nil, lastErr
 }
 
 // chatRequestEvent 客户端 chat_request_send 事件完整形状（与 probe_active.py chat_event 对齐）。
@@ -85,63 +106,9 @@ type chatRequestEvent struct {
 // conversationID 由调用方生成（如 wb2api-<ms>），无需真实会话——服务端不校验一致性。
 // requestID 为本轮请求独立标识（多轮同会话上报时各条不同）；空时回落 conversationID。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
-//
-// 与 issue #35 会话头族（X-Conversation-Request-ID）保持独立：本接口是 growth 域
-// 活跃上报（仅点亮连登/first_buddy，每号每天 1 次），event.requestId 是事件级标识，
-// 后台按 growth 事件去重，不走 chat 后台的 X-Conversation-Request-ID 聚合——对齐
-// 官方 chat_request_send 事件形状（probe_active.py），刻意不复用聚合主键。
 func (c *Client) ReportChatActivity(a *auth.Auth, conversationID, requestID string) error {
-	if requestID == "" {
-		requestID = conversationID
-	}
-	now := time.Now().UnixMilli()
-	ev := chatRequestEvent{
-		EventCode:             "chat_request_send",
-		Timestamp:             now,
-		ReportDelay:           0,
-		Mode:                  "craft",
-		ConversationID:        conversationID,
-		RequestID:             requestID,
-		InputLength:           12,
-		RequestModelID:        "deepseek-v4-flash",
-		RequestModelName:      "DeepSeek V4 Flash",
-		IsPlan:                false,
-		IsAutoExecuteTerminal: false,
-		IsAutoModify:          false,
-		CodebaseEnable:        false,
-		MaxToken:              0,
-		MaxSteps:              0,
-		Temperature:           0,
-		MaxRetries:            0,
-		MentionContexts:       []any{},
-		KnowledgeID:           []any{},
-		KnowledgeName:         []any{},
-		CodebaseID:            "",
-		MentionContextCount:   0,
-		Command:               "",
-		ExpertID:              "",
-		RecommendID:           "",
-		SkillID:               "",
-		SkillCount:            0,
-		TotalCount:            0,
-		FileURI:               "",
-		PresentAt:             now,
-		TraceID:               "",
-		RootRequestID:         conversationID,
-		ParentConversationID:  conversationID,
-		AgentName:             "default",
-		AgentType:             "conversation",
-		UserID:                a.UID,
-	}
-	raw, err := json.Marshal([]chatRequestEvent{ev})
-	if err != nil {
-		return err
-	}
-	_, err = c.billingJSON(a, http.MethodPost, reportPath, json.RawMessage(raw))
-	return err
+	return c.ReportChatActivityModel(a, conversationID, requestID, "deepseek-v4-flash", "DeepSeek V4 Flash")
 }
-
-// ─── 本仓库特性适配：带模型的活跃上报（夜猫子 glm-5.2 补足用，fork 独有） ───
 
 // ReportChatActivityModel 同上，但可指定上报携带的模型：供「体验某模型」类任务
 // 对齐实际模型（如 Model_chat_GLM5.2 需 requestModelId=glm-5.2 与独立 requestID）。

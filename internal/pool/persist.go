@@ -4,11 +4,9 @@ package pool
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"workbuddy2api/internal/auth"
@@ -18,7 +16,7 @@ var flushInterval = 5 * time.Second
 
 // persistLogEvery 连续落盘失败每 N 次打一条提醒（flusher 5s 一把 ≈ 1 分钟一次），
 // 避免磁盘持续满/权限丢失时日志刷屏。
-const persistLogEvery = 100
+const persistLogEvery = 12
 
 // snapshot 池状态快照（Redis 镜像用）。与本地 state.json 同源（stateFile），
 // 额外带 savedAt 时间戳供"择新恢复"（比较本地与 Redis 快照的新旧）。
@@ -43,14 +41,14 @@ func (p *Pool) RestoreFromSnapshot() {
 	raw, ok := store.LoadState()
 	if !ok {
 		if localErr == nil {
-			log.Printf("[pool] 恢复来源=本地 state.json（无 Redis 快照）")
+			log.Printf("pool: 恢复来源=本地 state.json（无 Redis 快照）")
 		}
 		return
 	}
 	var snap snapshot
 	if json.Unmarshal(raw, &snap) != nil || snap.SavedAt.IsZero() {
 		// 快照无 savedAt：无法比较新旧，本地优先。
-		log.Printf("[pool] 恢复来源=本地 state.json（Redis 快照无 saved_at）")
+		log.Printf("pool: 恢复来源=本地 state.json（Redis 快照无 saved_at）")
 		return
 	}
 	if localErr == nil && !localInfo.ModTime().After(snap.SavedAt) {
@@ -59,46 +57,36 @@ func (p *Pool) RestoreFromSnapshot() {
 		p.applySnapshotLocked(snap)
 		p.mu.Unlock()
 		p.dirty.Store(true)
-		log.Printf("[pool] 恢复来源=Redis 快照 (saved_at=%s)", snap.SavedAt.Format(time.RFC3339))
+		log.Printf("pool: 恢复来源=Redis 快照 (saved_at=%s)", snap.SavedAt.Format(time.RFC3339))
 		return
 	}
-	log.Printf("[pool] 恢复来源=本地 state.json（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
+	log.Printf("pool: 恢复来源=本地 state.json（较新于 Redis 快照 %s）", snap.SavedAt.Format(time.RFC3339))
 }
 
-// startFlusher 启动后台周期落盘 goroutine（每 flushInterval 检查 dirty 标志）。
-// goroutine 在 p.Close 关闭 stopCh 时退出；此前若无人 Close，goroutine 会持续运行
-// （issue:goroutine 泄漏——New 每调一次泄漏一个，且无停止机制）。
+// Acquire 为账号占一个在途名额；false 表示该账号已达上限（或不存在）。
+// 必须在成功 Pick 后调用；调用方负责 defer Release。
 func (p *Pool) startFlusher() {
-	interval := flushInterval // 在启动 goroutine 前同步读取，避免与测试对 flushInterval 的恢复写竞争
-	p.stopCh = make(chan struct{})
+	stopCh := make(chan struct{})
+	// 在启动 goroutine 前同步写入（避免与测试对 flushInterval 的恢复写竞争）；
+	// stopCh 同步登记，Close 才能可靠停止（New 与 startFlusher 之间无并发窗口）。
+	p.stopCh = stopCh
+	interval := flushInterval
 	go func() {
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
 			select {
-			case <-p.stopCh:
-				return
 			case <-t.C:
 				p.mu.Lock()
 				if p.dirty.Swap(false) {
 					p.saveLocked()
 				}
 				p.mu.Unlock()
+			case <-stopCh:
+				return
 			}
 		}
 	}()
-}
-
-// Close 停止后台落盘 goroutine 并做最后一次落盘（幂等）。
-// 进程退出前应调用（main 的优雅停机路径），替代裸 Flush——既停 goroutine 又补落盘。
-// stateFp 为空（未起 flusher）时仅做一次 Flush。
-func (p *Pool) Close() {
-	p.closeOnce.Do(func() {
-		if p.stopCh != nil {
-			close(p.stopCh)
-		}
-	})
-	p.Flush()
 }
 
 // Flush 同步把内存状态落盘（幂等：无变更不写盘）。供进程退出前调用。
@@ -136,6 +124,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		p.byUID[uid] = &entry{
 			a:            &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
 			credits:      s.Credits,
+			creditsTotal: s.CreditsTotal,
 			disabled:     s.Disabled,
 			reason:       s.Reason,
 			until:        s.Until,
@@ -144,6 +133,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			errTotal:     errTotal,
 			lastErr:      s.LastErr,
 			lastSuccess:  s.LastSuccess,
+			tokenUsage:   s.TokenUsage,
 			softStreak:   s.SoftStreak,
 		}
 	}
@@ -178,7 +168,7 @@ func (p *Pool) saveLocked() {
 	}
 	if p.persistFails > 0 {
 		// 从连续失败中恢复：打一条恢复日志，避免"错误打完却无人知道已恢复"。
-		log.Printf("[pool] state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
+		log.Printf("pool: state.json 落盘恢复（此前连续失败 %d 次）", p.persistFails)
 		p.persistFails = 0
 	}
 	// 同步镜像一份快照到 Redis（fire-and-forget），与本地 state.json 并存作恢复备份。
@@ -191,43 +181,17 @@ func (p *Pool) saveLocked() {
 }
 
 // notePersistFail 记录一次本地 state.json 落盘失败，并按节流规则决定是否打日志：
-// 首败（状态成功→失败）打一条详细 WARN：包含路径、err、目录权限/属主、当前 uid/gid、
-// 修复建议（chown 或改用 named volume）；随后每 persistLogEvery 次再复报一条，避免刷屏。
+// 首败（状态成功→失败）打完整错误、每 persistLogEvery 次连续失败打一条提醒、
+// 其余连续失败静默（flusher 5s 一把，磁盘持续满时不刷屏）。
 // 恢复成功的日志由 saveLocked 在成功路径统一打。与 redisstore 三处异步写的
 // "失败仅打日志、不向上抛"范式对齐，但落盘失败对运维是盲区，故多一层节流（notification）。
 func (p *Pool) notePersistFail(err error) {
 	if p.persistFails == 0 {
-		log.Printf("WARN: [pool] state.json 落盘失败（首次详报）: path=%s err=%v %s",
-			p.stateFp, err, persistFailDiag(p.stateFp))
+		log.Printf("pool: state.json 落盘失败: %v", err)
 	} else if p.persistFails%persistLogEvery == 0 {
-		log.Printf("ERR: [pool] state.json 连续落盘失败 %d 次: path=%s err=%v",
-			p.persistFails, p.stateFp, err)
+		log.Printf("pool: state.json 连续落盘失败 %d 次: %v", p.persistFails, err)
 	}
 	p.persistFails++
-}
-
-// persistFailDiag 收集落盘失败时的环境诊断信息：目录是否存在、权限/属主、
-// 当前进程 uid/gid，并给出对齐修复建议。供首错详报，定位 issue #52 这类
-// bind mount 目录属主不匹配导致不可写的场景。
-func persistFailDiag(stateFp string) string {
-	dir := filepath.Dir(stateFp)
-	var b strings.Builder
-	info, statErr := os.Stat(dir)
-	switch {
-	case statErr != nil:
-		fmt.Fprintf(&b, "stat_dir=%s err=%v（目录不存在或不可访问）", dir, statErr)
-	case info == nil:
-		fmt.Fprintf(&b, "stat_dir=%s info=nil", dir)
-	default:
-		mode := info.Mode().Perm()
-		fmt.Fprintf(&b, "dir=%s mode=%o owner_uid=%d owner_gid=%d",
-			dir, mode, statUID(info), statGID(info))
-	}
-	if uid, gid := os.Getuid(), os.Getgid(); uid >= 0 && gid >= 0 {
-		fmt.Fprintf(&b, " proc_uid=%d proc_gid=%d", uid, gid)
-	}
-	b.WriteString(" fix=chown -R 10001:10001 ./data 或改用 named volume（见 docker-compose.yml）")
-	return b.String()
 }
 
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
@@ -236,6 +200,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 	for uid, e := range p.byUID {
 		sf.Accounts[uid] = stateAccount{
 			Credits:      e.credits,
+			CreditsTotal: e.creditsTotal,
 			Disabled:     e.disabled,
 			Reason:       e.reason,
 			Until:        e.until,
@@ -244,6 +209,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			ErrTotal:     e.errTotal,
 			LastSuccess:  e.lastSuccess,
 			LastErr:      e.lastErr,
+			TokenUsage:   e.tokenUsage,
 			SoftStreak:   e.softStreak,
 		}
 	}
