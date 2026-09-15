@@ -231,10 +231,15 @@ func main() {
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
 		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		Members:      members,
+		Ledger:       lgr,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// usage 采样器：5h/24h 消耗看板数据源（fork 特性）。
+	go usageTracker.Start(ctx)
 	go sch.Run(ctx)
 
 	srv := &http.Server{
