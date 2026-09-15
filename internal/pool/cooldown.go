@@ -33,6 +33,26 @@ func (p *Pool) SetCreditsDetailed(uid string, credits, expiring int64) {
 	}
 }
 
+// SetCreditsDetailed 更新账号余额/总额 + 快过架子集（签到与余额刷新时调用，
+// 供选号优先消耗快过期积分）。expiring 会被钳到 [0, credits]：上游分桶异常时
+// 不污染权重。
+func (p *Pool) SetCreditsDetailed(uid string, credits, total, expiring int64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		if expiring < 0 {
+			expiring = 0
+		}
+		if expiring > credits {
+			expiring = credits
+		}
+		e.credits = credits
+		e.creditsTotal = total
+		e.creditsExpiring = expiring
+		p.dirty.Store(true)
+	}
+}
+
 // Cooldown 冷却账号至 now+d（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）。
 // 冷却入口同时是熔断器的失败信号：喂入 fails，达到阈值按指数退避熔断（与 until 正交）。
 //

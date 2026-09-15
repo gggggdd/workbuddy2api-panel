@@ -34,3 +34,16 @@ docs/
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
 !README.md
+<<<<<<< HEAD
+=======
+
+# Windows binaries
+/wb2api.exe
+/login.exe
+/credit.exe
+
+# 本地验证工具（判据逆向过程脚本，结论沉淀于 data/desktop-task-protocol.md）
+/cmd/desktopverify*/
+*.zip
+server.exe
+>>>>>>> fork/main

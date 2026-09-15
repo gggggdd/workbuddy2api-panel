@@ -173,4 +173,8 @@ func TurnRequestID(turnKey string) string {
 	}
 	sum := sha256.Sum256([]byte(turnSalt + "|" + turnKey))
 	return hex.EncodeToString(sum[:16])
+<<<<<<< HEAD
 }
+=======
+}
+>>>>>>> fork/main
