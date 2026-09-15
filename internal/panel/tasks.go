@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/ledger"
 )
 
 // acceptBatchGap 批量接受的批间节流（对齐脚本 1.05s 口径，避免上游风控）。
@@ -139,6 +140,11 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 		log.Printf("panel: 领取任务奖励 uid=%s code=%s（已领取过，无新增）", uid, body.TaskCode)
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "already_claimed": true, "message": "该奖励此前已领取"})
 		return
+	}
+	// 账本：手动领取同样要入账（此前仅自动任务路径记，手动点「领取」的积分会丢）。
+	if p.cfg.Ledger != nil && credit > 0 {
+		p.cfg.Ledger.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+			Kind: ledger.KindTask, Delta: float64(credit), Task: body.TaskCode, Note: "任务奖励（手动领取）"})
 	}
 	log.Printf("panel: 领取任务奖励 uid=%s code=%s +%d分 +%d能", uid, body.TaskCode, credit, energy)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credit": credit, "energy": energy})

@@ -24,8 +24,8 @@ import (
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/server"
 	"workbuddy2api/internal/session"
-	"workbuddy2api/internal/usage"
 	"workbuddy2api/internal/upstream"
+	"workbuddy2api/internal/usage"
 )
 
 // appVersion 网关版本（fork 版）。
@@ -135,16 +135,17 @@ func main() {
 	members := member.NewStore(member.DefaultPath(cfg.StateFile))
 
 	sch := scheduler.New(scheduler.Config{
-		Pool:                p,
-		Upstream:            up,
-		CheckinHours:        cfg.Schedule.CheckinHours,
-		TravelHours:         cfg.Schedule.TravelHours,
-		ActivityHours:       cfg.Schedule.ActivityHours,
-		KeepaliveHours:      cfg.Schedule.KeepaliveHours,
-		CheckinDisabled:     !cfg.Schedule.CheckinEnabled,
-		TravelDisabled:      !cfg.Schedule.TravelEnabled,
-		ActivityDisabled:    !cfg.Schedule.ActivityEnabled,
-		KeepaliveDisabled:   !cfg.Schedule.KeepaliveEnabled,
+		Pool:              p,
+		Upstream:          up,
+		Ledger:            lgr,
+		CheckinHours:      cfg.Schedule.CheckinHours,
+		TravelHours:       cfg.Schedule.TravelHours,
+		ActivityHours:     cfg.Schedule.ActivityHours,
+		KeepaliveHours:    cfg.Schedule.KeepaliveHours,
+		CheckinDisabled:   !cfg.Schedule.CheckinEnabled,
+		TravelDisabled:    !cfg.Schedule.TravelEnabled,
+		ActivityDisabled:  !cfg.Schedule.ActivityEnabled,
+		KeepaliveDisabled: !cfg.Schedule.KeepaliveEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -203,21 +204,21 @@ func main() {
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		Panel:        pn,
-		Live:         live,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		Pool:          p,
+		Upstream:      up,
+		APIKey:        cfg.APIKey,
+		Panel:         pn,
+		Live:          live,
+		PromptMode:    cfg.Prompt.Mode,
+		PromptText:    cfg.PromptText,
 		GlobalEnabled: cfg.Global.Enabled,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
-		MaxBodyBytes: int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
-		Members:      members,
-		Ledger:       lgr,
+		Session:       sessRouter,
+		StickyCount:   sessCount,
+		RedisMode:     redisMode,
+		SoftCooldown:  cfg.SoftRateDur,
+		MaxBodyBytes:  int64(cfg.Server.MaxBodyMB) << 20, // MB → 字节
+		Members:       members,
+		Ledger:        lgr,
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -339,8 +340,6 @@ func mergeConfigMaps(cur, incoming map[string]any) map[string]any {
 	}
 	return cur
 }
-
-
 
 func mergedJSON(m map[string]any) []byte {
 	b, err := json.Marshal(m)

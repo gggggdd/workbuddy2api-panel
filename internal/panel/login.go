@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/ledger"
 )
 
 const (
@@ -266,6 +267,12 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	} else {
 		if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 			checkinMsg = err.Error()
+		} else if p.cfg.Ledger != nil {
+			// 账本：新号登录签到同样入账（与定时/手动签到同口径）。
+			if credit, _, cerr := p.cfg.Upstream.DailyCheckinCredit(a); cerr == nil && credit > 0 {
+				p.cfg.Ledger.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+					Kind: ledger.KindCheckin, Delta: credit, Note: "每日签到（登录）"})
+			}
 		}
 	}
 	if rm, tt, err := p.cfg.Upstream.UserResource(a); err == nil {

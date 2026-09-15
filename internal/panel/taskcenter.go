@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/ledger"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -411,6 +412,12 @@ func (p *Panel) runGrowthQueued(a *auth.Auth, code string) (string, error) {
 	if after != nil && after.Claimable {
 		if credit, energy, cerr := p.cfg.Upstream.ClaimReward(a, code); cerr == nil && (credit > 0 || energy > 0) {
 			msg += fmt.Sprintf("；自动领奖 +%d 分 +%d 能", credit, energy)
+			// 账本：队列领奖此前只拼进日志、不入账——面板「一键完成」的任务积分
+			// 长期缺失即源于此。与 autotask.go 自动任务路径同口径补上。
+			if p.cfg.Ledger != nil && credit > 0 {
+				p.cfg.Ledger.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
+					Kind: ledger.KindTask, Delta: float64(credit), Task: code, Note: "任务奖励"})
+			}
 		}
 	}
 	if after != nil {

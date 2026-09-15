@@ -10,7 +10,8 @@ let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
-let refTimer, usgTimer = null;
+let refTimer = null;
+let usgTimer = null;
 
 const $ = id => document.getElementById(id);
 
@@ -131,7 +132,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', members: '成员管理', ledger: '积分明细', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -140,6 +141,8 @@ function go(v) {
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
+  if (v === 'members') loadMembers();
+  if (v === 'ledger') loadLedger();
   if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
@@ -876,6 +879,8 @@ function startQueuePolling() {
   }, 3000);
 }
 
+
+/* ===== 以下三块自旧版补回：积分使用量 / 成员管理 / 积分明细 ===== */
 /* ── 积分使用量看板 ───────────────────────────────────────────────── */
 // 消耗来自上游账单口径的 used 计数采样（涵盖定时任务等非网关请求的消耗）。
 // 上游计费有分钟级延迟且为整数分，故数值存在小幅采样误差。
@@ -915,3 +920,147 @@ async function loadUsage(quiet) {
   }
 }
 
+
+/* ── 成员管理 ─────────────────────────────────────────────────────── */
+// 成员密钥仅可访问 /v1/chat/completions 与 /v1/models；用量按每次响应的
+// usage.credit 归因（两位小数，极小请求可能记 0）。
+function fmtCredit(v) {
+  const n = Number(v || 0);
+  return (Math.round(n * 100) / 100).toFixed(2);
+}
+function copyText(txt, okMsg) {
+  navigator.clipboard.writeText(txt)
+    .then(() => toast(okMsg || '已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+}
+async function loadMembers() {
+  const tb = $('memBody');
+  tb.innerHTML = '<tr><td colspan="9"><div class="empty">加载中…</div></td></tr>';
+  try {
+    const d = await api('members');
+    const s = d.summary || {}, list = d.members || [];
+    $('mCount').textContent = s.count || 0;
+    $('mTotal').textContent = fmtCredit(s.total_credit);
+    $('m5h').textContent = fmtCredit(s.window_5h);
+    $('m24h').textContent = fmtCredit(s.window_24h);
+    $('mReq').textContent = s.requests || 0;
+    $('memNote').textContent = s.error ? '落盘异常：' + s.error : '消耗按请求归因';
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">还没有成员</div>' +
+        '点击右上角「添加成员」为每位使用者签发独立密钥，即可分别监控用量</div></td></tr>';
+      return;
+    }
+    const maxC = Math.max(0.01, ...list.map(m => m.window_24h || 0));
+    tb.innerHTML = list.map(m => {
+      const short = m.id.length > 14 ? m.id.slice(0, 14) + '…' : m.id;
+      const note = m.note ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(m.note) + '</div>' : '';
+      return '<tr title="成员 ID: ' + esc(m.id) + '">' +
+        '<td class="mark" aria-hidden="true"><i></i></td>' +
+        '<td class="who"><div class="nm">' + esc(m.name) + '</div><div class="id">' + esc(short) + '</div>' + note + '</td>' +
+        '<td class="cred"><code style="font-size:11.5px">' + esc(m.key_masked) + '</code>' +
+          '<div class="hint" style="font-size:11px;color:var(--ink-3);margin-top:3px">…' + esc(m.key_hint) + '</div></td>' +
+        '<td class="num">' + fmtCredit(m.window_5h) + '</td>' +
+        '<td class="cred"><div class="n">' + fmtCredit(m.window_24h) + '</div><div class="bar"><i style="width:' +
+          Math.round((m.window_24h || 0) / maxC * 100) + '%"></i></div></td>' +
+        '<td class="num">' + fmtCredit(m.total_credit) + '</td>' +
+        '<td class="num">' + m.requests + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + m.errors + '</span></td>' +
+        '<td class="num" style="color:var(--ink-3)">' + ago(m.last_used) + '</td>' +
+        '<td class="acts">' +
+          '<button class="xs ghost" data-m="copy" data-i="' + esc(m.id) + '">复制密钥</button>' +
+          '<button class="xs ghost" data-m="rotate" data-i="' + esc(m.id) + '">重置密钥</button>' +
+          '<button class="xs ghost" data-m="reset" data-i="' + esc(m.id) + '">清零用量</button>' +
+          '<button class="xs ghost danger" data-m="remove" data-i="' + esc(m.id) + '">删除</button>' +
+        '</td></tr>';
+    }).join('');
+    window.__members = list;
+  } catch (e) {
+    tb.innerHTML = '<tr><td colspan="9"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    $('memNote').textContent = e.message;
+  }
+}
+
+$('btnMemReload').onclick = () => loadMembers();
+$('btnMemAdd').onclick = async () => {
+  const name = prompt('成员名称（用于区分使用者，例如：张三）');
+  if (name === null) return;
+  const note = prompt('备注（可选，例如：实验室台式机）') || '';
+  try {
+    const r = await api('members', { method: 'POST', body: JSON.stringify({ name, note }) });
+    // 明文密钥只在创建/重置时回显一次，之后列表仅显示掩码。
+    prompt('成员已创建。请立即复制密钥（仅显示这一次）：', r.key);
+    loadMembers();
+  } catch (e) { toast(e.message, 'err'); }
+};
+
+$('memBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-m]');
+  if (!b) return;
+  const id = b.dataset.i, act = b.dataset.m;
+  const m = (window.__members || []).find(x => x.id === id);
+  if (act === 'copy') {
+    if (!m) return;
+    // 列表里是掩码；明文仅在创建/重置时可得，故提示用户重置以获取。
+    copyText(m.key || '', m.key ? '密钥已复制' : '');
+    return;
+  }
+  if (act === 'rotate') {
+    if (!confirm('重置密钥后旧密钥立即失效，使用该密钥的同学将无法继续访问。确认重置？')) return;
+    try {
+      const r = await api('members/' + encodeURIComponent(id) + '/rotate', { method: 'POST' });
+      prompt('新密钥（仅显示这一次）：', r.key);
+      loadMembers();
+    } catch (e) { toast(e.message, 'err'); }
+    return;
+  }
+  if (act === 'reset') {
+    if (!confirm('清空该成员的用量统计？成员与密钥保留。')) return;
+    try { await api('members/' + encodeURIComponent(id) + '/reset', { method: 'POST' }); toast('已清零', 'ok'); loadMembers(); }
+    catch (e) { toast(e.message, 'err'); }
+    return;
+  }
+  if (act === 'remove') {
+    if (!confirm('删除该成员？其密钥立即失效，用量记录一并丢失，不可恢复。')) return;
+    try { await api('members/' + encodeURIComponent(id) + '/remove', { method: 'POST' }); toast('已删除', 'ok'); loadMembers(); }
+    catch (e) { toast(e.message, 'err'); }
+  }
+});
+
+
+/* ── 积分明细（账本） ─────────────────────────────────────────────── */
+const LG_KIND = { chat: '对话消耗', checkin: '签到', task: '任务奖励', travel: '猫猫旅行', gift: '新手礼包', compensation: '补偿', adjust: '校准' };
+const lgFmt = n => (n >= 0 ? '+' : '') + (Math.round(n * 100) / 100);
+function lgTime(iso) { const d = new Date(iso); return isNaN(d) ? iso : d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
+function lgDetail(e) {
+  const parts = [];
+  if (e.kind === 'chat') { if (e.model) parts.push(e.model); if (e.member) parts.push('成员:' + e.member); if (e.tok) parts.push(e.tok + 'tok'); }
+  else { if (e.task) parts.push(e.task); if (e.note) parts.push(e.note); }
+  return parts.join(' · ') || '—';
+}
+async function loadLedger() {
+  const hours = $('lgHours').value;
+  try {
+    const [sum, det] = await Promise.all([
+      api('ledger/summary?hours=' + hours),
+      api('ledger?hours=' + hours + '&kind=' + $('lgKind').value + '&limit=300')
+    ]);
+    const net = (sum.inflow || 0) - (sum.outflow || 0);
+    $('lgIn').textContent = '+' + (Math.round((sum.inflow || 0) * 100) / 100);
+    $('lgOut').textContent = '−' + (Math.round((sum.outflow || 0) * 100) / 100);
+    $('lgNet').textContent = lgFmt(net);
+    $('lgNet').style.color = net >= 0 ? 'var(--ok, green)' : 'var(--bad, red)';
+    let cnt = 0; (sum.accounts || []).forEach(a => cnt += a.chat_count || 0);
+    $('lgCount').textContent = cnt + ' 次';
+    const sb = $('lgSumBody');
+    sb.innerHTML = (sum.accounts || []).length
+      ? sum.accounts.map(a => '<tr><td>' + esc(a.nick || a.uid.slice(0, 8)) + '</td><td class="num" style="color:var(--ok,#2a9d5c)">' + lgFmt(a.inflow) + '</td><td class="num" style="color:var(--bad,#c0392b)">' + lgFmt(-a.outflow) + '</td><td class="num">' + lgFmt(a.net) + '</td><td class="num">' + (a.chat_count || 0) + '</td></tr>').join('')
+      : '<tr><td colspan="5" style="color:var(--ink-3)">范围内暂无流水（功能上线后开始记账）</td></tr>';
+    const tb = $('lgBody');
+    tb.innerHTML = (det.entries || []).length
+      ? det.entries.map(e => '<tr><td class="num">' + lgTime(e.at) + '</td><td>' + esc(e.nick || (e.uid || '').slice(0, 8)) + '</td><td>' + (LG_KIND[e.kind] || e.kind) + '</td><td class="num" style="color:' + (e.delta >= 0 ? 'var(--ok,#2a9d5c)' : 'var(--bad,#c0392b)') + '">' + lgFmt(e.delta) + '</td><td style="color:var(--ink-3)">' + esc(lgDetail(e)) + '</td></tr>').join('')
+      : '<tr><td colspan="5" style="color:var(--ink-3)">范围内暂无流水（功能上线后开始记账）</td></tr>';
+  } catch (e) {
+    $('lgSumBody').innerHTML = '<tr><td colspan="5" style="color:var(--bad)">加载失败：' + esc(String(e)) + '</td></tr>';
+  }
+}
+$('lgHours').onchange = loadLedger;
+$('lgKind').onchange = loadLedger;
+$('btnLgRefresh').onclick = loadLedger;

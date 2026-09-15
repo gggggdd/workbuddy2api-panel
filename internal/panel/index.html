@@ -348,6 +348,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#accounts" data-view="accounts" class="on">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>
         账号池</a></li>
+      <li><a href="#members" data-view="members">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="6" cy="5.5" r="2.3"/><path d="M1.8 13.2c.5-2.3 2.2-3.6 4.2-3.6s3.7 1.3 4.2 3.6"/><path d="M11.4 4.4a2 2 0 1 1 0 4"/><path d="M11.6 13.2c-.2-.9-.5-1.7-1-2.3 2 .1 3.4 1.3 3.8 3.2"/></svg>
+        成员管理</a></li>
+      <li><a href="#ledger" data-view="ledger">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h8.5a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H3z"/><path d="M3 8h9.5M5.5 5.2h3M5.5 10.8h3"/></svg>
+        积分明细</a></li>
       <li><a href="#taskscenter" data-view="taskscenter">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
         任务中心</a></li>
@@ -391,7 +397,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
 
-<div class="box">
+      <div class="box">
         <header>
           <h3>积分使用量</h3>
           <span class="grow"></span>
@@ -435,6 +441,51 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 成员管理 -->
+    <section class="view" id="view-members" hidden>
+      <div class="stats">
+        <div class="stat"><div class="v" id="mCount">-</div><div class="k">成员总数</div></div>
+        <div class="stat"><div class="v" id="mTotal">-</div><div class="k">累计消耗</div></div>
+        <div class="stat"><div class="v" id="m5h">-</div><div class="k">近 5 小时</div></div>
+        <div class="stat"><div class="v" id="m24h">-</div><div class="k">近 24 小时</div></div>
+        <div class="stat"><div class="v" id="mReq">-</div><div class="k">请求总数</div></div>
+      </div>
+      <div class="box">
+        <header>
+          <h3>成员</h3>
+          <span class="grow"></span>
+          <span class="note" id="memNote"></span>
+          <button class="xs" id="btnMemReload">刷新</button>
+          <button class="xs primary" id="btnMemAdd">添加成员</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th class="mark" aria-hidden="true"></th>
+            <th>成员</th><th>密钥</th><th>近 5 小时</th><th>近 24 小时</th>
+            <th>累计消耗</th><th>请求 / 失败</th><th>最近使用</th><th class="c-acts"></th>
+          </tr></thead>
+          <tbody id="memBody"></tbody>
+        </table>
+        </div>
+      </div>
+      <div class="box">
+        <header><h3>接入方式</h3></header>
+        <div class="pad">
+          <div class="hint" style="line-height:1.7">
+            成员用各自的密钥接入，与管理员密钥指向同一网关：<br>
+            <code>Base URL：http://&lt;主机&gt;:7863/v1</code><br>
+            <code>API Key：成员密钥（wb- 开头）</code><br>
+            <br>
+            成员密钥<b>仅可访问</b> <code>/v1/chat/completions</code> 与 <code>/v1/models</code>；
+            账号池、配置、日志与其他成员信息均不可见。<br>
+            用量按每次响应的 <code>usage.credit</code> 归因，精度两位小数——极小请求可能记 0，
+            适合相对观测而非精确结算。
+          </div>
         </div>
       </div>
     </section>
@@ -643,6 +694,47 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button type="submit" class="primary" id="btnCfgSave">保存配置</button>
         </div>
       </form>
+    </section>
+
+    <!-- 日志 -->
+    <section class="view" id="view-ledger" hidden>
+      <div class="stats" style="margin-bottom:14px">
+        <div class="stat"><div class="v" id="lgIn">-</div><div class="k">入账合计</div></div>
+        <div class="stat"><div class="v" id="lgOut">-</div><div class="k">消耗合计</div></div>
+        <div class="stat"><div class="v" id="lgNet">-</div><div class="k">净变动</div></div>
+        <div class="stat"><div class="v" id="lgCount">-</div><div class="k">流水条数</div></div>
+      </div>
+      <div class="box" style="margin-bottom:14px">
+        <header><h3>分账号汇总</h3><span class="grow"></span>
+          <select class="xs" id="lgHours" style="background:var(--bg-2);border:1px solid var(--line);border-radius:6px;padding:2px 6px">
+            <option value="24">近 24 小时</option>
+            <option value="168">近 7 天</option>
+            <option value="720">近 30 天</option>
+            <option value="0">全部</option>
+          </select>
+        </header>
+        <table class="acc md"><thead><tr>
+          <th>账号</th><th>入账 +</th><th>消耗 −</th><th>净额</th><th>请求数</th>
+        </tr></thead><tbody id="lgSumBody"><tr><td colspan="5" style="color:var(--ink-3)">加载中…</td></tr></tbody></table>
+      </div>
+      <div class="box">
+        <header><h3>积分流水</h3><span class="grow"></span>
+          <select class="xs" id="lgKind" style="background:var(--bg-2);border:1px solid var(--line);border-radius:6px;padding:2px 6px">
+            <option value="">全部类型</option>
+            <option value="chat">对话消耗</option>
+            <option value="checkin">签到</option>
+            <option value="task">任务奖励</option>
+            <option value="travel">猫猫旅行</option>
+            <option value="gift">新手礼包</option>
+            <option value="compensation">补偿</option>
+            <option value="adjust">校准</option>
+          </select>
+          <button class="xs" id="btnLgRefresh">刷新</button>
+        </header>
+        <table class="acc md"><thead><tr>
+          <th>时间</th><th>账号</th><th>类型</th><th>变动</th><th>详情</th>
+        </tr></thead><tbody id="lgBody"><tr><td colspan="5" style="color:var(--ink-3)">加载中…</td></tr></tbody></table>
+      </div>
     </section>
 
     <!-- 日志 -->

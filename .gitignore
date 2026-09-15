@@ -22,6 +22,10 @@ __pycache__/
 
 # Backups (contains auth tokens)
 backups/
+*.bak
+*.bak-*
+*.bak_*
+config.json.bak*
 
 # IDE
 .idea/

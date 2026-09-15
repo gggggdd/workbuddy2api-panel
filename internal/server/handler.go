@@ -188,8 +188,6 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-
-
 // authResult 鉴权结果。
 type authResult struct {
 	ok       bool
@@ -205,7 +203,6 @@ func memberOf(r *http.Request) string {
 }
 
 type memberCtxKey struct{}
-
 
 func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	total, healthy, _, _, _ := h.cfg.Pool.CountsDetailed()
@@ -458,6 +455,29 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	st := newChatStat(time.Now(), body, peek.Stream)
 	defer st.done()
 
+	// 成员用量记账：局部变量 + defer 闭包，任何出口（成功/失败/panic）都记一次请求。
+	// 成功时 charged 为该次 usage.credit，失败时只计 Errors（不记消耗）。
+	mid := memberOf(r)
+	charged := 0.0
+	succeeded := false
+	if mid != "" && h.cfg.Members != nil {
+		defer func() { h.cfg.Members.Record(mid, charged, succeeded) }()
+	}
+	// 积分账本（去处）：请求收尾时按 (账号, 模型, 成员) 记一笔消耗。
+	// 成功才记；失败请求不计消耗。choreUID 在轮换循环里落到最终成功号。
+	var choreUID, choreNick, choreModel string
+	if h.cfg.Ledger != nil {
+		defer func() {
+			if succeeded && charged > 0 && choreUID != "" {
+				h.cfg.Ledger.Append(ledger.Entry{
+					At: time.Now(), UID: choreUID, Nick: choreNick,
+					Kind: ledger.KindChat, Delta: -charged,
+					Model: choreModel, Member: mid,
+				})
+			}
+		}()
+	}
+
 	tried := map[string]bool{}
 	var lastErr error
 
@@ -590,6 +610,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		st.uid = acct.UID
+		choreUID, choreNick, choreModel = acct.UID, acct.Nickname, peek.Model
 		tried[acct.UID] = true
 
 		// 占用在途名额：Pick 已跳过满额账号，此处 CAS 兜底并发抢名额的竞态。
@@ -682,6 +703,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			charged, _ = stats.Credit()
+			succeeded = true
 			rc.Close()
 			return
 		}
@@ -698,6 +721,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
+		charged = completionCredit(resp)
+		succeeded = true
 		return
 	}
 	msg := "all accounts unavailable (cooling/disabled)"
