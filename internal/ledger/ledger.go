@@ -38,13 +38,17 @@ type Entry struct {
 	Member  string    `json:"member,omitempty"`  // chat: 成员密钥 ID（管理员/直连为空）
 	Balance float64   `json:"balance,omitempty"` // 记账后该账号已知余额（可得时填）
 	Note    string    `json:"note,omitempty"`    // 备注（如 adjust 的差额说明）
+	// Ref 幂等键：非空时，同 Ref 的条目只入账一次。用于「按上游权威记录回补」
+	// 这种可重复执行的同步（每次拉全量，靠 Ref 去重），空 = 不去重。
+	Ref string `json:"ref,omitempty"`
 }
 
 // Store 账本。并发安全；写入内存 + 去抖落盘（合并写，避免高频 chat 拖慢请求路径）。
 type Store struct {
 	mu      sync.Mutex
 	entries []Entry
-	max     int        // 上限（滚动丢弃最旧）
+	refs    map[string]bool // 已入账的 Entry.Ref（幂等同步去重用）；空 Ref 不入此表
+	max     int             // 上限（滚动丢弃最旧）
 	dirty   bool
 	path    string     // 持久化文件；空 = 纯内存
 	saveMu  sync.Mutex // 落盘串行化
@@ -55,7 +59,7 @@ func New(path string, maxN int) *Store {
 	if maxN <= 0 {
 		maxN = 20000
 	}
-	s := &Store{max: maxN, path: path}
+	s := &Store{max: maxN, path: path, refs: map[string]bool{}}
 	if path != "" {
 		s.load()
 	}
@@ -76,6 +80,12 @@ func (s *Store) load() {
 		return
 	}
 	s.entries = st.Entries
+	// 重建幂等键索引：重启后重复同步同一条上游记录不得再入账。
+	for _, e := range s.entries {
+		if e.Ref != "" {
+			s.refs[e.Ref] = true
+		}
+	}
 	log.Printf("ledger: 恢复 %d 条积分流水", len(s.entries))
 }
 
@@ -101,6 +111,28 @@ func (s *Store) Append(e Entry) {
 	s.mu.Unlock()
 
 	go s.saveSoon()
+}
+
+// AppendOnce 幂等入账：e.Ref 非空且已入过账则丢弃并返回 false。
+// 供「按上游权威记录回补」使用——该同步每次拉全量、可重复执行，
+// 靠 Ref 去重；Ref 为空时退化为普通 Append（返回 true）。
+func (s *Store) AppendOnce(e Entry) bool {
+	if e.Delta == 0 {
+		return false
+	}
+	if e.Ref != "" {
+		s.mu.Lock()
+		dup := s.refs[e.Ref]
+		if !dup {
+			s.refs[e.Ref] = true
+		}
+		s.mu.Unlock()
+		if dup {
+			return false
+		}
+	}
+	s.Append(e)
+	return true
 }
 
 // saveSoon 落盘去抖：500ms 内的连续写入合并为一次。

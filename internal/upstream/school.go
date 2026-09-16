@@ -121,6 +121,61 @@ func (c *Client) SchoolDraw(a *auth.Auth) (prizeCode string, credit int, err err
 	return out.PrizeCode, out.CreditAmount, nil
 }
 
+// SchoolReward 开学季「我的奖励」条目（上游服务端权威积分记录）。
+type SchoolReward struct {
+	Type      string `json:"type"`       // credit | voucher
+	GrantedAt string `json:"granted_at"` // "2006-01-02 15:04:05"（本地时区，无 TZ 后缀）
+	Amount    int    `json:"amount"`     // 积分增量（type=credit 时有效）
+}
+
+// SchoolRewards 拉取账号的开学季奖励记录（GET /rewards，只读，按时间倒序）。
+//
+// 这是上游服务端自己记的账，比客户端埋点可靠：任务领奖与转盘积分都落在这里，
+// 且可回补网关停机期间漏记的部分。实测 data = {items[],has_more,page,page_size,total}，
+// 单账户记录量小（活动期每日数条），一页 page_size 足够，按 has_more 兜底翻页。
+func (c *Client) SchoolRewards(a *auth.Auth) ([]SchoolReward, error) {
+	var all []SchoolReward
+	for page := 1; page <= 10; page++ {
+		var out struct {
+			Items   []SchoolReward `json:"items"`
+			HasMore bool           `json:"has_more"`
+		}
+		path := fmt.Sprintf("/rewards?page=%d&page_size=100", page)
+		if err := c.schoolJSON(a, http.MethodGet, path, nil, &out); err != nil {
+			return nil, err
+		}
+		all = append(all, out.Items...)
+		if !out.HasMore || len(out.Items) == 0 {
+			break
+		}
+	}
+	return all, nil
+}
+
+// SchoolPrizeCredits 返回转盘奖品里「发积分」的面额集合（GET /config 的 prizes[]）。
+//
+// 用途：/rewards 只给 (type=credit, amount)，不区分来自任务还是转盘。转盘面额
+// （实测 6/66）与任务面额（实测 50/100）不重叠，故可按金额判定来源。拉取失败
+// 返回空集合——调用方退化为全部按任务归类，不阻断入账。
+func (c *Client) SchoolPrizeCredits(a *auth.Auth) map[int]bool {
+	var out struct {
+		Prizes []struct {
+			Type         string `json:"type"`
+			CreditAmount int    `json:"credit_amount"`
+		} `json:"prizes"`
+	}
+	if err := c.schoolJSON(a, http.MethodGet, "/config", nil, &out); err != nil {
+		return nil
+	}
+	amt := map[int]bool{}
+	for _, p := range out.Prizes {
+		if p.Type == "credit" && p.CreditAmount > 0 {
+			amt[p.CreditAmount] = true
+		}
+	}
+	return amt
+}
+
 // ---- 开学季 chat_3_times / expert_use（2026-09-14 判据破解）----
 // 判据 = v2/report 埋点计数（与成长任务同一事件管道，三账号实测）：
 //   - chat_3_times：3 条 chat_request_send 即 3/3（conversationId 任意、桌面/mp

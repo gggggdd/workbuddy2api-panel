@@ -6,6 +6,9 @@ import "time"
 // （*Store 天然实现该接口。）
 type LedgerStore interface {
 	Append(e Entry)
+	// AppendOnce 幂等入账：Ref 非空且已入过账则丢弃并返回 false。
+	// 供可重复执行的上游权威记录同步使用（每次拉全量，靠 Ref 去重）。
+	AppendOnce(e Entry) bool
 	List(q Query) []Entry
 	Summarize(q Query) []AccountSummary
 	Totals(q Query) (inflow, outflow float64)

@@ -60,6 +60,8 @@ func (s *Scheduler) schoolAccount(a *auth.Auth) {
 		log.Printf("school %s: tasks: %v", a.UID, err)
 		return
 	}
+	// 权威记录对账放在活动期判断之前：活动结束后仍可回补漏记的历史奖励。
+	s.syncSchoolRewards(a)
 	if !inPeriod {
 		return // 活动已结束，静默
 	}
@@ -80,21 +82,67 @@ func (s *Scheduler) schoolAccount(a *auth.Auth) {
 			return
 		}
 		log.Printf("school %s: 🎲 %s +%dc", a.UID, prizeCode, credit)
-		// 账本：转盘积分入账（实物券 credit=0 不入账）。
-		if lg := s.lg(); lg != nil && credit > 0 {
-			lg.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
-				Kind: ledger.KindLottery, Delta: float64(credit), Task: prizeCode, Note: "开学季转盘"})
-		}
 		time.Sleep(2 * time.Second)
 	}
+	// 抽完再对账一次：本轮新发的积分立即落账，秒级可见（不必等下一轮）。
+	s.syncSchoolRewards(a)
 }
 
-// schoolRecordTask 开学季任务奖励入账。积分金额取自任务条目的 reward_credit
-// （/tasks 给出），领奖响应只回抽奖次数、不回积分。
-func (s *Scheduler) schoolRecordTask(a *auth.Auth, taskCode string, credit int) {
-	if lg := s.lg(); lg != nil && credit > 0 {
-		lg.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
-			Kind: ledger.KindTask, Delta: float64(credit), Task: taskCode, Note: "开学季任务"})
+// rewardTimeLayout 上游 /rewards 的 granted_at 形状（本地时区，无 TZ 后缀）。
+const rewardTimeLayout = "2006-01-02 15:04:05"
+
+// syncSchoolRewards 按上游权威记录（GET /rewards）对账入账。
+//
+// 为什么不用客户端埋点：任务领奖响应只回抽奖次数、转盘响应字段随活动期变化，
+// 客户端拼出的金额既可能漏（网关停机/异常路径）也可能错（字段改名）。
+// 上游 /rewards 是服务端自己记的账，含全部 credit 条目，可回补历史——
+// 本方法每次拉全量、用 Entry.Ref 幂等去重，可安全重复执行。
+//
+// 来源分类：amount 命中转盘奖品面额（/config prizes 的 credit_amount）记 lottery，
+// 其余记 task。两者在本活动内面额不重叠（转盘 6/66，任务 50/100），故可判定；
+// 若未来出现重叠，按 task 归类并保留上游原始时间与金额，不做臆测。
+func (s *Scheduler) syncSchoolRewards(a *auth.Auth) {
+	if s.lg() == nil {
+		return
+	}
+	rewards, err := s.cfg.Upstream.SchoolRewards(a)
+	if err != nil {
+		log.Printf("school %s: rewards: %v", a.UID, err)
+		return
+	}
+	if len(rewards) == 0 {
+		return
+	}
+	lotteryAmounts := s.cfg.Upstream.SchoolPrizeCredits(a)
+	added, seen := 0, map[string]int{}
+	for _, rw := range rewards {
+		if rw.Type != "credit" || rw.Amount <= 0 {
+			continue // 实物券等无积分条目不入账
+		}
+		// 同 (时刻,金额) 去重键加序号：上游同一秒可能出现同额多笔，
+		// 按列表（时间倒序）稳定序编号，保证重复执行时键一致。
+		base := fmt.Sprintf("school|%s|%s|%d", a.UID, rw.GrantedAt, rw.Amount)
+		seq := seen[base]
+		seen[base]++
+		ref := fmt.Sprintf("%s|%d", base, seq)
+
+		kind, note := ledger.KindTask, "开学季任务"
+		if lotteryAmounts[rw.Amount] {
+			kind, note = ledger.KindLottery, "开学季转盘"
+		}
+		at := time.Now()
+		if t, perr := time.ParseInLocation(rewardTimeLayout, rw.GrantedAt, time.Local); perr == nil {
+			at = t
+		}
+		if s.lg().AppendOnce(ledger.Entry{
+			At: at, UID: a.UID, Nick: a.Nickname,
+			Kind: kind, Delta: float64(rw.Amount), Note: note, Ref: ref,
+		}) {
+			added++
+		}
+	}
+	if added > 0 {
+		log.Printf("school %s: 账本按上游记录入账 %d 笔", a.UID, added)
 	}
 }
 
@@ -122,7 +170,6 @@ func (s *Scheduler) schoolShareTask(a *auth.Auth) {
 		return
 	}
 	log.Printf("school %s: ★ 分享任务完成，+%dc +%d 抽奖次数", a.UID, share.RewardCredit, granted)
-	s.schoolRecordTask(a, "share_invite", share.RewardCredit)
 }
 
 // schoolPollDone 轮询任务是否达标（异步计分，最多 schoolPollLoops 次）。
@@ -173,7 +220,6 @@ func (s *Scheduler) schoolChatTimesTask(a *auth.Auth) {
 		return
 	}
 	log.Printf("school %s: ★ 对话任务完成，+%dc +%d 抽奖次数", a.UID, t.RewardCredit, granted)
-	s.schoolRecordTask(a, "chat_3_times", t.RewardCredit)
 }
 
 // schoolExpertTask 完成 expert_use：viewed → 专家事件链 → 轮询 → 领奖。
@@ -209,7 +255,6 @@ func (s *Scheduler) schoolExpertTask(a *auth.Auth) {
 		return
 	}
 	log.Printf("school %s: ★ 专家任务完成，+%dc +%d 抽奖次数", a.UID, t.RewardCredit, granted)
-	s.schoolRecordTask(a, "expert_use", t.RewardCredit)
 }
 
 // schoolDesktopTask 完成 desktop_chat_1_time：viewed 激活 → 真实 chat → 六事件链。
@@ -248,7 +293,6 @@ func (s *Scheduler) schoolDesktopTask(a *auth.Auth) {
 		if t2 := findSchoolTask(tasks2, "desktop_chat_1_time"); t2 != nil && t2.Progress >= t2.TargetCount {
 			if granted, err := s.cfg.Upstream.SchoolClaimTask(a, "desktop_chat_1_time"); err == nil {
 				log.Printf("school %s: ★ 桌面端体验任务完成 +%dc +%d 抽奖", a.UID, t2.RewardCredit, granted)
-				s.schoolRecordTask(a, "desktop_chat_1_time", t2.RewardCredit)
 			}
 			return
 		}
