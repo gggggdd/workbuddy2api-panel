@@ -131,7 +131,7 @@ func main() {
 	up.GlobalEnabled = cfg.Global.Enabled
 
 	usageTracker := usage.New(p, up, usage.DefaultPath(cfg.StateFile))
-	lgr := ledger.New(ledger.DefaultPath(cfg.StateFile), 20000)
+	lgr := ledger.New(ledger.DefaultPath(cfg.StateFile), ledger.DefaultMax)
 	members := member.NewStore(member.DefaultPath(cfg.StateFile))
 
 	sch := scheduler.New(scheduler.Config{

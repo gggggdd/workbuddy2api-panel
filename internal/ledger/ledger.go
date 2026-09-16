@@ -54,10 +54,28 @@ type Store struct {
 	saveMu  sync.Mutex // 落盘串行化
 }
 
-// New 创建账本。maxN <=0 时默认 20000 条；path 为空则不持久化。
+// DefaultMax 流水保留上限：超出后丢弃最旧记录（溢出部分不保留）。
+//
+// 取值取向：账本定位是「近期流水」，不是长期存档——chat 消耗约 1000 条/天，
+// 保留 1000 条即约一天窗口，足够排查「这次请求扣了多少」，且让落盘文件与
+// 面板列表都保持在可读长度。长期统计请用 cmd/credit（按上游 TotalDosage 对账）。
+const DefaultMax = 1000
+
+// snapshot 账本落盘格式。
+//
+// Refs 单独持久化：幂等键不能只从存活条目重建——条目被上限裁掉后若 Ref 一起
+// 消失，可重复执行的上游同步（school rewards）会在下一轮把同一条记录又补回来，
+// 截断就形同虚设，且旧奖励会以「最新条目」的数组位置重新出现在列表顶部。
+// 目前仅开学季同步写 Ref（活动期内约 150 条），规模可控。
+type snapshot struct {
+	Entries []Entry  `json:"entries"`
+	Refs    []string `json:"refs,omitempty"`
+}
+
+// New 创建账本。maxN <=0 时取 DefaultMax；path 为空则不持久化。
 func New(path string, maxN int) *Store {
 	if maxN <= 0 {
-		maxN = 20000
+		maxN = DefaultMax
 	}
 	s := &Store{max: maxN, path: path, refs: map[string]bool{}}
 	if path != "" {
@@ -72,20 +90,30 @@ func (s *Store) load() {
 	if err != nil {
 		return // 首次运行无文件，正常
 	}
-	var st struct {
-		Entries []Entry `json:"entries"`
-	}
+	var st snapshot
 	if err := json.Unmarshal(raw, &st); err != nil {
 		log.Printf("ledger: 恢复失败（忽略，账本重开）: %v", err)
 		return
 	}
-	s.entries = st.Entries
-	// 重建幂等键索引：重启后重复同步同一条上游记录不得再入账。
-	for _, e := range s.entries {
+	// 幂等键先从「落盘 Refs + 全部条目」重建，再截断——两处顺序不能换：
+	// 被上限裁掉的条目也必须留住去重键，否则下一轮上游同步会把它们当成
+	// 没记过的新记录补回来（还会以数组末尾位置冒到列表顶部），截断即失效。
+	for _, ref := range st.Refs {
+		s.refs[ref] = true
+	}
+	for _, e := range st.Entries {
 		if e.Ref != "" {
 			s.refs[e.Ref] = true
 		}
 	}
+	entries := st.Entries
+	// 上限收缩（如旧文件留下更多条）时按同一规则截断：只保留最新的 max 条。
+	// 不截断的话，调小上限后旧数据会一直滞留，直到被新记录逐条挤出去。
+	if n := len(entries); n > s.max {
+		entries = append([]Entry(nil), entries[n-s.max:]...)
+		log.Printf("ledger: 恢复 %d 条，按上限 %d 截断", n, s.max)
+	}
+	s.entries = entries
 	log.Printf("ledger: 恢复 %d 条积分流水", len(s.entries))
 }
 
@@ -100,12 +128,12 @@ func (s *Store) Append(e Entry) {
 	s.mu.Lock()
 	s.entries = append(s.entries, e)
 	if n := len(s.entries); n > s.max {
-		// 滚动丢弃最旧的 1/8，避免频繁截断
-		cut := s.max / 8
-		if cut < 1 {
-			cut = 1
-		}
-		s.entries = append([]Entry(nil), s.entries[n-cut:]...)
+		// 溢出即裁掉最旧的，保留最新 max 条（与 load 的截断规则一致）。
+		//
+		// 注意不要写回「丢弃 1/8」的滚动步长：那种写法在 n 刚过 max 时
+		// 起点是 n-cut，保留条数只有 cut（max/8），会把账本砸到 1/8。
+		// 这里保留条数有明确上界，语义与「只保留 max 条」一致，便于推理。
+		s.entries = append([]Entry(nil), s.entries[n-s.max:]...)
 	}
 	s.dirty = true
 	s.mu.Unlock()
@@ -147,15 +175,20 @@ func (s *Store) saveSoon() {
 	}
 	entries := make([]Entry, len(s.entries))
 	copy(entries, s.entries)
+	// 幂等键随盘保存（含已被上限裁掉的条目）：否则重启后同步会把裁掉的奖励补回来。
+	// 规模有界——仅开学季权威同步写 Ref（活动期内每号每日数条），长期不增长。
+	refs := make([]string, 0, len(s.refs))
+	for r := range s.refs {
+		refs = append(refs, r)
+	}
 	s.dirty = false
 	s.mu.Unlock()
+	sort.Strings(refs) // 稳定输出，避免同一集合因 map 顺序不同而反复重写
 
 	if s.path == "" {
 		return
 	}
-	raw, err := json.MarshalIndent(struct {
-		Entries []Entry `json:"entries"`
-	}{entries}, "", " ")
+	raw, err := json.MarshalIndent(snapshot{Entries: entries, Refs: refs}, "", " ")
 	if err != nil {
 		return
 	}
