@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -179,6 +180,11 @@ func main() {
 		SoftCooldown:         cfg.SoftRateDur,
 		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
 	})
+	// chatHandler 前置声明：panel 的 SaveConfig 闭包要拿到 handler 以热应用
+	// server.max_body_mb，而 handler 的 Config.Panel 又依赖 pn——装配循环用
+	// 变量前置 + saveConfig 内 nil 保护解开（SaveConfig 只在请求期被调，彼时
+	// handler 必已就位）。
+	var chatHandler *server.Handler
 	pn := panel.New(panel.Config{
 		Pool:        p,
 		Upstream:    up,
@@ -197,7 +203,7 @@ func main() {
 			return Load(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
-			return saveConfig(raw, *cfgPath, live, p, up, sch)
+			return saveConfig(raw, *cfgPath, live, p, up, sch, chatHandler)
 		},
 	})
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
@@ -220,6 +226,7 @@ func main() {
 		Members:       members,
 		Ledger:        lgr,
 	})
+	chatHandler = h
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -261,12 +268,50 @@ func main() {
 	log.Printf("bye")
 }
 
+// writeConfigFile 把配置写入 path。
+//
+// 优先「先写 tmp 再 rename」原子替换（避免写一半崩溃留下残缺配置）。但
+// Docker 部署常把 config.json 作为单文件 bind mount 挂进容器
+// （docker-compose.yml: ./config.json:/app/config.json），而 Linux 不允许
+// rename 覆盖挂载点——会返回 EBUSY（"device or resource busy"），导致面板
+// 「保存配置」永远失败。此时回退为原地写入：挂载点是文件，open+truncate
+// 是允许的（只有换 inode 的 rename 被禁）。
+//
+// 回退的代价：原地写入不是原子的（写到一半崩溃会留下残缺文件）。但配置文件
+// 很小（数 KB，单次 write 基本不会被拆开），且这比"完全存不上"强得多；
+// 非挂载点路径仍走原子替换，不受影响。
+func writeConfigFile(path string, out []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err == nil {
+		return nil
+	} else if !isCrossDeviceOrBusy(err) {
+		return fmt.Errorf("replace config: %w", err)
+	}
+	// 挂载点：rename 不可用，原地覆盖（清掉刚写的 tmp）。
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("write config in place (bind mount): %w", err)
+	}
+	os.Remove(tmp)
+	return nil
+}
+
+// isCrossDeviceOrBusy rename 失败的「换个写法还能救」判定：挂载点返回 EBUSY
+// （Linux），跨设备返回 EXDEV（不同文件系统）。
+func isCrossDeviceOrBusy(err error) bool {
+	return errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.EXDEV)
+}
+
 // saveConfig 面板保存配置：校验 → 落盘 → 热应用 → 返回需重启的字段列表。
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
 //   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval
+//   - server.max_body_mb → handler.SetMaxBodyBytes（issue #17：面板改完即时生效，不再"静默不生效还重启也不提示"）
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
 //   - listen / auth_dir / state_file / upstream.* / upstash.* / session_sticky.*（TTL 类）
@@ -274,7 +319,7 @@ func main() {
 // 落盘用"先写 tmp 再 rename"原子替换，且优先保留磁盘上的原始 JSON 结构（只改
 // 面板表单覆盖到的键），避免把用户手写的注释性字段/未知键洗掉——这里直接整体
 // 序列化校验后的配置，未知键在 json.Unmarshal 时已丢失，故先合并原始 map。
-func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler) ([]string, error) {
+func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up *upstream.Client, sch *scheduler.Scheduler, srv *server.Handler) ([]string, error) {
 	// 1) 解析原始 JSON 为 map（保留用户手写的未知键），再叠加面板提交的键。
 	oldRaw, err := os.ReadFile(path)
 	if err != nil {
@@ -300,12 +345,8 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return nil, fmt.Errorf("write config: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, fmt.Errorf("replace config: %w", err)
+	if err := writeConfigFile(path, out); err != nil {
+		return nil, err
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
@@ -324,6 +365,11 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
 		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
+	// srv 为 nil 仅出现在装配未完成的窗口（SaveConfig 只在请求期被调，理论不可达），
+	// 跳过热应用即可——下次重启仍会从落盘的 config.json 读到新值。
+	if srv != nil {
+		srv.SetMaxBodyBytes(int64(newCfg.Server.MaxBodyMB) << 20)
+	}
 
 	return restartRequiredFields(newCfg), nil
 }

@@ -306,7 +306,7 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `api_key` | 空 | 网关鉴权密钥；**空 = 不鉴权直接放行**（公网必须设置） |
 | `auth_dir` | `./auths` | 账号凭证目录 |
 | `state_file` | `./data/state.json` | 账号池状态持久化文件 |
-| `server.max_body_mb` | `8` | 聊天请求体大小上限（MB，0 / 负数启动报错）。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游 |
+| `server.max_body_mb` | `8` | 聊天请求体大小上限（MB，0 / 负数启动报错）。超限直接返回 **413 `request_body_too_large`**，不再把半截请求喂给上游。**面板在线修改即时生效** |
 | `cooldown.soft_rate` | `600s` | 软限流（429 / 限流文案）冷却基数；同一账号连续触发按 2 倍指数退避 |
 | `cooldown.soft_rate_max` | `2h` | 软冷却指数退避封顶 |
 | `schedule.checkin_hours` | `[9, 21]` | 每日本地时区整点签到 + 余额查询解冻。空数组 / `null` = 未配置回落默认（不是禁用） |
@@ -669,11 +669,17 @@ http://127.0.0.1:7863/panel/
 请求体超过 `server.max_body_mb`（默认 8 MB）时网关直接返回 `413 request_body_too_large`：
 
 ```json
-{"error":{"message":"请求体超过 8 MB 上限：请压缩内容或调大 server.max_body_mb 配置后重试","type":"api_error","code":"request_body_too_large"}}
+{"error":{"message":"请求体超过 8 MB 上限：多图/长上下文会话易触发（历史图片每轮以 base64 重发）；请压缩图片或调大 server.max_body_mb（面板修改即时生效）后重试","type":"api_error","code":"request_body_too_large"}}
 ```
 
-- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转
-- 收到 `413` 即表示是请求体本身超限（多图 / 超长上下文场景），调大 `server.max_body_mb` 即可（`WB2A_MAX_BODY_MB` 环境变量同样生效）
+- 该错误在**网关侧**判出，**不会**打上游、**不会**罚账号、**不会**轮转——**这不是 WorkBuddy 上游的限制**，是网关自身的默认上限
+- 为什么多图容易触发：客户端（Claude Code / Codex / ZCode 等 agent）每轮都会把**历史全部图片**以 base64 重新塞进请求体，几张 MB 级截图叠两三轮就会破 8 MB
+- 收到 `413` 即表示是请求体本身超限：面板「配置 → 请求体上限」在线调大**保存后即时生效，无需重启**；直接改 `config.json` 或设 `WB2A_MAX_BODY_MB` 环境变量则需要重启进程
+- **Docker 部署额外注意**：`config.json` 以单文件方式挂进容器（`./config.json:/app/config.json`）。两种部署细节会让「保存配置」失败：
+  1. 挂载点不允许 rename 覆盖——网关已内置回退（rename 失败时改原地写入），无需处理；
+  2. 但挂载文件的属主必须是容器运行用户，否则原地写入也会 `permission denied`。报错形如
+     `write config in place (bind mount): open /app/config.json: permission denied`，
+     用 `sudo chown 10001:10001 ./config.json` 或 `PUID/PGID`（见下文 Docker 权限小节）修复。
 - 要么放行要么明确 `413`，网关不再把半截请求体喂给上游
 
 ### Docker 部署登录后报「写入 auths/…json.tmp 失败： permission denied」？
