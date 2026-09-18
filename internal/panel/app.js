@@ -1,6 +1,11 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
+// URL ?key= 自动写入（分享直达与自动化测试）
+try {
+  const urlKey = new URLSearchParams(location.search).get('key');
+  if (urlKey) localStorage.setItem(LS_KEY, urlKey);
+} catch (e) { /* ignore */ }
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
@@ -1704,3 +1709,10 @@ async function loadLedger() {
 $('lgHours').onchange = loadLedger;
 $('lgKind').onchange = loadLedger;
 $('btnLgRefresh').onclick = loadLedger;
+
+/* ─── fork 辅助函数（成员/账本视图依赖）─── */
+
+function fmtCredit(v) {
+  const n = Number(v || 0);
+  return (Math.round(n * 100) / 100).toFixed(2);
+}
