@@ -15,15 +15,15 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
 
 	"workbuddy2api/internal/httpauth"
-	"workbuddy2api/internal/livecfg"
 	"workbuddy2api/internal/ledger"
 	"workbuddy2api/internal/member"
-	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/livecfg"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/scheduler"
 	"workbuddy2api/internal/upstream"
@@ -33,8 +33,9 @@ import (
 // Config 面板依赖（main 装配注入）。
 type Config struct {
 	Pool      *pool.Pool
+	Ledger    ledger.LedgerStore // 积分账本（nil = 明细接口空）
+	Members   *member.Store      // 成员密钥（nil = 成员接口 501）
 	Upstream  *upstream.Client
-	Ledger    ledger.LedgerStore // 积分账本（可选；nil = 明细接口返回空）
 	Scheduler *scheduler.Scheduler // 手动触发签到/保活；nil 时对应接口返回 501
 	AuthDir   string               // OAuth 登录完成后凭证落盘目录
 	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
@@ -56,16 +57,13 @@ type Config struct {
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
 
-	// Usage 积分使用量采样器（5h / 24h 窗口看板）；nil 时接口返回 501。
-	Usage UsageStats
+	// Usage 逐请求用量记录器（nil = 用量接口返回 501）。
+	Usage *usage.Recorder
 
-	// Members 成员密钥与用量（成员管理页）；nil 时相关接口返回 501。
-	Members *member.Store
-}
-
-// UsageStats 使用量看板数据源（*usage.Tracker 满足此接口；用接口避免 panel 反向依赖）。
-type UsageStats interface {
-	Stats() usage.Stats
+	// ProbeFile 模型输出上限探测结果文件（scripts/probe_max_tokens.py --panel-out
+	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
+	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
+	ProbeFile string
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -76,7 +74,7 @@ type Panel struct {
 	started time.Time
 	logs    *Ring
 
-	// logins 进行中的 OAuth 设备授权会话（state → 创建时刻）。
+	// logins 进行中的 OAuth 设备授权会话（state → 会话信息）。
 	// poll 成功或超时（loginTTL）后剔除；面板常驻进程，容量天然有界。
 	loginMu sync.Mutex
 	logins  map[string]loginSession
@@ -122,7 +120,7 @@ func (p *Panel) unlockAccount(uid string) {
 // 防止"开了添加账号弹窗就走开"的会话永久滞留。
 const loginTTL = 15 * time.Minute
 
-// loginSession 进行中的 OAuth 设备授权会话（fork: 支持双域选 realm）。
+// loginSession 进行中的 OAuth 会话：创建时刻 + realm（cn/global，用于落盘与端点切换）。
 type loginSession struct {
 	created time.Time
 	realm   string // "cn" / "global"，缺省 cn
@@ -138,7 +136,7 @@ func New(cfg Config) *Panel {
 		mux:     http.NewServeMux(),
 		started: time.Now(),
 		logs:    NewRing(500),
-		logins:  make(map[string]loginSession),
+		logins:  map[string]loginSession{},
 	}
 	p.routes()
 	return p
@@ -153,15 +151,9 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
-	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usageStats))
-	p.mux.HandleFunc("GET /panel/api/members", p.withAuth(p.membersList))
-	p.mux.HandleFunc("POST /panel/api/members", p.withAuth(p.memberAdd))
-	p.mux.HandleFunc("POST /panel/api/members/{id}/update", p.withAuth(p.memberUpdate))
-	p.mux.HandleFunc("POST /panel/api/members/{id}/rotate", p.withAuth(p.memberRotate))
-	p.mux.HandleFunc("POST /panel/api/members/{id}/reset", p.withAuth(p.memberReset))
-	p.mux.HandleFunc("POST /panel/api/members/{id}/remove", p.withAuth(p.memberRemove))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
+	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/revive", p.withAuth(p.accountRevive))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/disable", p.withAuth(p.accountDisable))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
@@ -184,10 +176,20 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
-	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
-	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("GET /panel/api/ledger", p.withAuth(p.ledgerHandler))
 	p.mux.HandleFunc("GET /panel/api/ledger/summary", p.withAuth(p.ledgerSummary))
+	p.mux.HandleFunc("GET /panel/api/members", p.withAuth(p.membersList))
+	p.mux.HandleFunc("POST /panel/api/members", p.withAuth(p.memberAdd))
+	p.mux.HandleFunc("POST /panel/api/members/{id}/update", p.withAuth(p.memberUpdate))
+	p.mux.HandleFunc("POST /panel/api/members/{id}/rotate", p.withAuth(p.memberRotate))
+	p.mux.HandleFunc("POST /panel/api/members/{id}/reset", p.withAuth(p.memberReset))
+	p.mux.HandleFunc("POST /panel/api/members/{id}/remove", p.withAuth(p.memberRemove))
+	p.mux.HandleFunc("POST /panel/api/usage/save", p.withAuth(p.usageSave))
+	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
+	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
+	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -244,147 +246,9 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// ledgerHandler 积分明细流水：?uid=&kind=&member=&hours=&limit=
-func (p *Panel) ledgerHandler(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Ledger == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"entries": []any{}})
-		return
-	}
-	q := r.URL.Query()
-	qry := ledger.Query{
-		UID:    q.Get("uid"),
-		Kind:   ledger.Kind(q.Get("kind")),
-		Member: q.Get("member"),
-		Limit:  500,
-	}
-	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 && n <= 20000 {
-		qry.Limit = n
-	}
-	if h, err := strconv.ParseFloat(q.Get("hours"), 64); err == nil && h > 0 {
-		qry.Since = time.Now().Add(-time.Duration(h * float64(time.Hour)))
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"entries": p.cfg.Ledger.List(qry)})
-}
-
-// ledgerSummary 分账号汇总：?hours=（默认 24h；0=全部）
-func (p *Panel) ledgerSummary(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Ledger == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"accounts": []any{}, "inflow": 0, "outflow": 0})
-		return
-	}
-	q := r.URL.Query()
-	qry := ledger.Query{}
-	if h, err := strconv.ParseFloat(q.Get("hours"), 64); err == nil && h > 0 {
-		qry.Since = time.Now().Add(-time.Duration(h * float64(time.Hour)))
-	}
-	in, out := p.cfg.Ledger.Totals(qry)
-	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts": p.cfg.Ledger.Summarize(qry),
-		"inflow":   in,
-		"outflow":  out,
-	})
-}
-
-// logsHandler 返回日志环形缓冲快照。
-
+// logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。
 func (p *Panel) logsHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"entries": p.logs.Snapshot()})
-}
-
-// usageStats 积分使用量看板：返回 5h / 24h 窗口的消耗统计。
-// 数据来自后台采样器（不触发上游查询），采样器未装配时 501。
-func (p *Panel) usageStats(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Usage == nil {
-		writeErr(w, http.StatusNotImplemented, "usage tracker not available")
-		return
-	}
-	writeJSON(w, http.StatusOK, p.cfg.Usage.Stats())
-}
-
-// membersList 成员列表 + 汇总。
-func (p *Panel) membersList(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Members == nil {
-		writeErr(w, http.StatusNotImplemented, "member store not available")
-		return
-	}
-	sum, list := p.cfg.Members.Stats()
-	writeJSON(w, http.StatusOK, map[string]any{"summary": sum, "members": list})
-}
-
-// memberAdd 新建成员，返回新签发的密钥（仅此一次明文回显，之后列表脱敏）。
-func (p *Panel) memberAdd(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Members == nil {
-		writeErr(w, http.StatusNotImplemented, "member store not available")
-		return
-	}
-	var body struct{ Name, Note string }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
-		return
-	}
-	m := p.cfg.Members.Add(body.Name, body.Note)
-	log.Printf("panel: member added id=%s name=%q", m.ID, m.Name)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": m.ID, "key": m.Key})
-}
-
-// memberUpdate 改成员名称/备注。
-func (p *Panel) memberUpdate(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Members == nil {
-		writeErr(w, http.StatusNotImplemented, "member store not available")
-		return
-	}
-	var body struct{ Name, Note string }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid body")
-		return
-	}
-	if !p.cfg.Members.Update(r.PathValue("id"), body.Name, body.Note) {
-		writeErr(w, http.StatusNotFound, "member not found")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-// memberRotate 重新签发密钥（旧密钥立即失效）。
-func (p *Panel) memberRotate(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Members == nil {
-		writeErr(w, http.StatusNotImplemented, "member store not available")
-		return
-	}
-	key, ok := p.cfg.Members.Rotate(r.PathValue("id"))
-	if !ok {
-		writeErr(w, http.StatusNotFound, "member not found")
-		return
-	}
-	log.Printf("panel: member key rotated id=%s", r.PathValue("id"))
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "key": key})
-}
-
-// memberReset 清零用量计数（保留成员与密钥）。
-func (p *Panel) memberReset(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Members == nil {
-		writeErr(w, http.StatusNotImplemented, "member store not available")
-		return
-	}
-	if !p.cfg.Members.ResetUsage(r.PathValue("id")) {
-		writeErr(w, http.StatusNotFound, "member not found")
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-// memberRemove 删除成员（密钥立即失效，已记账数据一并消失）。
-func (p *Panel) memberRemove(w http.ResponseWriter, r *http.Request) {
-	if p.cfg.Members == nil {
-		writeErr(w, http.StatusNotImplemented, "member store not available")
-		return
-	}
-	if !p.cfg.Members.Remove(r.PathValue("id")) {
-		writeErr(w, http.StatusNotFound, "member not found")
-		return
-	}
-	log.Printf("panel: member removed id=%s", r.PathValue("id"))
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 // models 实时查询上游模型列表与 reasoning 实际档位（直连上游，不读路由层 1h 缓存）：
@@ -403,24 +267,84 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]map[string]any, 0, len(infos))
 	for _, mi := range infos {
-		out = append(out, map[string]any{
-			"id":                mi.ID,
-			"name":              mi.Name,
-			"context_length":    mi.ContextWindow,
-			"max_output_tokens": mi.MaxTokens,
-			"supported_efforts": mi.Efforts,
-		})
-	}
-		// fork：追加国际版静态模型名单（无 global 账号也可展示，标注 realm）
-	if auth.GlobalEnabled() {
-		for _, id := range upstream.GlobalModelNames {
-			out = append(out, map[string]any{
-				"id":   "global:" + id,
-				"name": "国际版 " + id,
-			})
+		entry := map[string]any{
+			"id":                   mi.ID,
+			"name":                 mi.Name,
+			"default_effort":       mi.DefaultEffort,
+			"supported_efforts":    mi.Efforts,
+			"can_disable_thinking": mi.CanDisableThinking,
+			"supports_reasoning":   mi.SupportsReasoning,
+			"supports_images":      mi.SupportsImages,
+			"credits":              mi.Credits,
+			"description":          mi.Description,
+			"tags":                 mi.Tags,
+			"vendor":               mi.Vendor,
+			"is_default":           mi.IsDefault,
+			"supports_tool_call":   mi.SupportsToolCall,
+			"only_reasoning":       mi.OnlyReasoning,
+			"reasoning_effort":     mi.ReasoningEffort,
+			"reasoning_summary":    mi.ReasoningSummary,
 		}
+		if mi.MaxAllowedSize > 0 {
+			entry["max_allowed_size"] = mi.MaxAllowedSize
+		}
+		// 与 /v1/models 同口径：context_length / max_output_tokens 走四级查找链
+		// （上游动态值 → 静态知识表 → model.json → models.dev → 1M 兜底），
+		// effort 档位走 EffortListing（远端权威 ∪ CN 静态兜底表）——面板展示的
+		// 数值即客户端实际拿到的数值，两侧不再漂移。
+		entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, p.cfg.Upstream.HTTP)
+		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, p.cfg.Upstream.HTTP); ok {
+			entry["max_output_tokens"] = mo
+		}
+		if efforts, def := upstream.EffortListing("cn", mi.ID, mi.Efforts, mi.DefaultEffort); efforts != nil {
+			entry["supported_efforts"] = efforts
+			if def != "" {
+				entry["default_effort"] = def
+			}
+		}
+		out = append(out, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// modelProbes 返回模型输出上限的探测结果（scripts/probe_max_tokens.py --panel-out
+// 写入的契约文件），供前端在「模型与档位」的实测列做风险标注。
+//
+// 设计边界：纯只读透传——文件缺失/未配置返回空集（面板退化为无标注，与历史行为
+// 一致），网关自身不解析字段语义、不据此做任何路由或出站决策；上游改了限制后
+// 重跑一次工具、下次查询即刷新，无需重启网关。
+func (p *Panel) modelProbes(w http.ResponseWriter, r *http.Request) {
+	out := map[string]any{"probes": map[string]json.RawMessage{}, "exists": false}
+	if p.cfg.ProbeFile == "" {
+		writeJSON(w, http.StatusOK, out)
+		return
+	}
+	raw, err := os.ReadFile(p.cfg.ProbeFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			writeJSON(w, http.StatusOK, out)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "read probes: "+err.Error())
+		return
+	}
+	var f struct {
+		Version int                        `json:"version"`
+		Probes  map[string]json.RawMessage `json:"probes"`
+	}
+	if err := json.Unmarshal(raw, &f); err != nil {
+		writeErr(w, http.StatusBadGateway, "parse probes: "+err.Error())
+		return
+	}
+	if f.Probes == nil {
+		f.Probes = map[string]json.RawMessage{}
+	}
+	out["probes"] = f.Probes
+	out["exists"] = true
+	if fi, err := os.Stat(p.cfg.ProbeFile); err == nil {
+		out["updated_at"] = fi.ModTime().Format(time.RFC3339)
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +358,7 @@ func (p *Panel) accountRevive(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	p.cfg.Pool.ReviveDisabled(uid)
+	p.cfg.Pool.Revive(uid)
 	log.Printf("panel: revive uid=%s（人工清除禁用/冷却/熔断）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -451,9 +375,8 @@ func (p *Panel) accountDisable(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// accountCheckin 单号签到：DailyCheckinCredit 一次 POST 完成签到并解析奖励
-//（已签到等业务错误不阻塞余额刷新），成功且本轮有到账则入账——与 scheduler /
-// login 的签到记账同口径。此前只调 DailyCheckin、不入账，面板手动签到的积分会丢。
+// accountCheckin 单号签到：DailyCheckin + 余额查询解冻（已签到等业务错误不阻塞余额刷新），
+// 与 scheduler.RunCheckinNow 的单号语义一致。
 func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
 	a := p.cfg.Pool.AuthByUID(uid)
@@ -462,21 +385,14 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	checkinMsg := ""
-	credit, _, cerr := p.cfg.Upstream.DailyCheckinCredit(a)
-	if cerr != nil {
-		checkinMsg = cerr.Error() // "今天已签到"等业务错误照常查余额
-	} else if p.cfg.Ledger != nil && credit > 0 {
-		p.cfg.Ledger.Append(ledger.Entry{At: time.Now(), UID: a.UID, Nick: a.Nickname,
-			Kind: ledger.KindCheckin, Delta: credit, Note: "每日签到（面板）"})
+	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
 	}
 	resp := map[string]any{"ok": true}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	if credit > 0 {
-		resp["credit"] = credit
-	}
-	remain, total, err := p.cfg.Upstream.UserResourceRT(a)
+	remain, total, err := p.cfg.Upstream.UserResource(a)
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
@@ -485,7 +401,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	p.cfg.Pool.ReenableIfCredits(uid, remain, total)
 	resp["credits"] = remain
 	resp["credits_total"] = total
-	log.Printf("panel: checkin uid=%s msg=%q credit=%.0f credits=%d/%d", uid, checkinMsg, credit, remain, total)
+	log.Printf("panel: checkin uid=%s msg=%q credits=%d/%d", uid, checkinMsg, remain, total)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -497,7 +413,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, err := p.cfg.Upstream.UserResourceRT(a)
+	remain, total, err := p.cfg.Upstream.UserResource(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
@@ -594,6 +510,94 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 // helpers
 // ---------------------------------------------------------------------------
 
+// usage 返回逐请求用量聚合。hours 查询参数控制小时粒度时序窗口（默认 72，
+// 上限 1440=60 天）；更早的数据自动折叠为日点，因此长期趋势不会丢。
+func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Usage == nil {
+		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
+		return
+	}
+	hours := 72
+	if v := r.URL.Query().Get("hours"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			hours = n
+		}
+	}
+	if hours > 1440 {
+		hours = 1440
+	}
+	// 昵称仅用于展示，取自池快照（不含任何凭证）。
+	nicks := map[string]string{}
+	for _, s := range p.cfg.Pool.List() {
+		if s.Nickname != "" {
+			nicks[s.UID] = s.Nickname
+		}
+	}
+	writeJSON(w, http.StatusOK, p.cfg.Usage.Snapshot(hours, nicks))
+}
+
+// usageSave 立即把内存中的用量桶落盘（正常由后台 30s 防抖刷新负责）。
+func (p *Panel) usageSave(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Usage == nil {
+		writeErr(w, http.StatusNotImplemented, "usage recorder not available")
+		return
+	}
+	p.cfg.Usage.Save()
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// packages 返回全部账号的积分包构成，供「积分构成」视图对比。
+//
+// 逐个账号向上游查（并发有上限，避免瞬时打满上游限流），失败只在对应账号上
+// 标 error，不影响其它账号——一个号 token 失效不该让整页空白。
+func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
+	accts := p.cfg.Pool.List()
+	type row struct {
+		UID      string                   `json:"uid"`
+		Nickname string                   `json:"nickname"`
+		Realm    string                   `json:"realm"`
+		Remain   int64                    `json:"remain"`
+		Size     int64                    `json:"size"`
+		Packages []upstream.CreditPackage `json:"packages"`
+		Error    string                   `json:"error,omitempty"`
+	}
+	out := make([]row, len(accts))
+
+	sem := make(chan struct{}, 3)
+	var wg sync.WaitGroup
+	for i, s := range accts {
+		wg.Add(1)
+		go func(i int, s pool.Status) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			it := row{UID: s.UID, Nickname: s.Nickname, Realm: s.Realm}
+			a := p.cfg.Pool.AuthByUID(s.UID)
+			if a == nil {
+				it.Error = "account not loaded"
+				out[i] = it
+				return
+			}
+			packs, remain, size, err := p.cfg.Upstream.CreditPackages(a)
+			if err != nil {
+				it.Error = err.Error()
+				out[i] = it
+				return
+			}
+			it.Packages = packs
+			it.Remain = remain
+			it.Size = size
+			out[i] = it
+		}(i, s)
+	}
+	wg.Wait()
+
+	// 余额降序：多的在前，便于和少的对比。
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
+	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	raw, _ := json.Marshal(v)
 	w.Header().Set("Content-Type", "application/json")
@@ -603,4 +607,133 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]any{"ok": false, "error": msg})
+}
+
+// ─── fork 特性：积分账本 + 成员管理 handler ───
+
+// ledgerHandler 积分明细流水：?uid=&kind=&member=&hours=&limit=
+func (p *Panel) ledgerHandler(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Ledger == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"entries": []any{}})
+		return
+	}
+	q := r.URL.Query()
+	qry := ledger.Query{
+		UID:    q.Get("uid"),
+		Kind:   ledger.Kind(q.Get("kind")),
+		Member: q.Get("member"),
+		Limit:  500,
+	}
+	if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 && n <= 20000 {
+		qry.Limit = n
+	}
+	if h, err := strconv.ParseFloat(q.Get("hours"), 64); err == nil && h > 0 {
+		qry.Since = time.Now().Add(-time.Duration(h * float64(time.Hour)))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": p.cfg.Ledger.List(qry)})
+}
+
+// ledgerSummary 分账号汇总：?hours=（默认 24h；0=全部）
+func (p *Panel) ledgerSummary(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Ledger == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"accounts": []any{}, "inflow": 0, "outflow": 0})
+		return
+	}
+	q := r.URL.Query()
+	qry := ledger.Query{}
+	if h, err := strconv.ParseFloat(q.Get("hours"), 64); err == nil && h > 0 {
+		qry.Since = time.Now().Add(-time.Duration(h * float64(time.Hour)))
+	}
+	in, out := p.cfg.Ledger.Totals(qry)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"accounts": p.cfg.Ledger.Summarize(qry),
+		"inflow":   in,
+		"outflow":  out,
+	})
+}
+
+// membersList 成员列表 + 汇总。
+func (p *Panel) membersList(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Members == nil {
+		writeErr(w, http.StatusNotImplemented, "member store not available")
+		return
+	}
+	sum, list := p.cfg.Members.Stats()
+	writeJSON(w, http.StatusOK, map[string]any{"summary": sum, "members": list})
+}
+
+// memberAdd 新建成员，返回新签发的密钥（仅此一次明文回显，之后列表脱敏）。
+func (p *Panel) memberAdd(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Members == nil {
+		writeErr(w, http.StatusNotImplemented, "member store not available")
+		return
+	}
+	var body struct{ Name, Note string }
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	m := p.cfg.Members.Add(body.Name, body.Note)
+	log.Printf("panel: member added id=%s name=%q", m.ID, m.Name)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": m.ID, "key": m.Key})
+}
+
+// memberUpdate 改成员名称/备注。
+func (p *Panel) memberUpdate(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Members == nil {
+		writeErr(w, http.StatusNotImplemented, "member store not available")
+		return
+	}
+	var body struct{ Name, Note string }
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid body")
+		return
+	}
+	if !p.cfg.Members.Update(r.PathValue("id"), body.Name, body.Note) {
+		writeErr(w, http.StatusNotFound, "member not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// memberRotate 重新签发密钥（旧密钥立即失效）。
+func (p *Panel) memberRotate(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Members == nil {
+		writeErr(w, http.StatusNotImplemented, "member store not available")
+		return
+	}
+	key, ok := p.cfg.Members.Rotate(r.PathValue("id"))
+	if !ok {
+		writeErr(w, http.StatusNotFound, "member not found")
+		return
+	}
+	log.Printf("panel: member key rotated id=%s", r.PathValue("id"))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "key": key})
+}
+
+// memberReset 清零用量计数（保留成员与密钥）。
+func (p *Panel) memberReset(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Members == nil {
+		writeErr(w, http.StatusNotImplemented, "member store not available")
+		return
+	}
+	if !p.cfg.Members.ResetUsage(r.PathValue("id")) {
+		writeErr(w, http.StatusNotFound, "member not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// memberRemove 删除成员（密钥立即失效，已记账数据一并消失）。
+func (p *Panel) memberRemove(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Members == nil {
+		writeErr(w, http.StatusNotImplemented, "member store not available")
+		return
+	}
+	if !p.cfg.Members.Remove(r.PathValue("id")) {
+		writeErr(w, http.StatusNotFound, "member not found")
+		return
+	}
+	log.Printf("panel: member removed id=%s", r.PathValue("id"))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

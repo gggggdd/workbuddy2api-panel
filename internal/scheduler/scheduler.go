@@ -23,8 +23,8 @@ import (
 // 与引入开关前的行为逐字一致（老调用方/老测试无需改动）。
 type Config struct {
 	Pool           *pool.Pool
-	Upstream       *upstream.Client
 	Ledger         ledger.LedgerStore // 积分账本（可选；nil = 不记账）
+	Upstream       *upstream.Client
 	CheckinHours   []int // 默认 [9, 21]
 	TravelHours    []int // 默认 [9,21]：一趟派出 + 一趟领奖闭环
 	ActivityHours  []int // 默认 [10]
@@ -37,7 +37,7 @@ type Config struct {
 	// 默认建议 7*24h。
 	ExpiringSoonWindow time.Duration
 
-	// ActivityReportCount fork 特性：每次活跃上报条数（cmd/activity 传入；0/缺省=1）。
+	// ActivityReportCount fork 特性：活跃上报条数。
 	ActivityReportCount int
 
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
@@ -239,21 +239,53 @@ func (s *Scheduler) Run(ctx context.Context) {
 			timer.Stop() // 排程已变：重算下一次唤醒
 		case <-timer.C:
 			// 到点任务在排程时确定（不依赖唤醒时刻的小时数），迟到唤醒也不会漏跑。
-			for _, k := range kinds {
-				switch k {
-				case taskCheckin:
-					s.RunCheckinNow()
-				case taskTravel:
-					s.RunTravelNow()
-				case taskActivity:
-					s.RunActivityNow()
-				case taskKeepalive:
-					s.RunKeepaliveNow()
-				case taskBlackcat:
-					s.RunBlackcatNow()
-				}
-			}
+			// 唤醒时全部并行派发：每类一个 goroutine，慢任务族（如活跃上报
+			// 多号 × 间隔 ≈ 数分钟睡眠）不再阻塞同槽其他任务族；返回前等全部
+			// 任务收尾（下一轮 nextWake 照旧从"现在"起算，多轮重叠的风险与
+			// 串行版相同——nextWake 只挑现在之后的时点）。
+			s.runBatch(ctx, kinds)
 		}
+	}
+}
+
+// runBatch 并行派发一批任务（同一唤醒时刻的多类任务），等全部完成返回。
+// ctx 取消时由各任务内部的可取消等待快速收尾。
+func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
+	var wg sync.WaitGroup
+	for _, k := range kinds {
+		wg.Add(1)
+		go func(k taskKind) {
+			defer wg.Done()
+			switch k {
+			case taskCheckin:
+				s.RunCheckinNow()
+			case taskTravel:
+				s.RunTravelNow()
+			case taskActivity:
+				s.runActivity(ctx)
+			case taskKeepalive:
+				s.RunKeepaliveNow()
+			case taskBlackcat:
+				s.RunBlackcatNow()
+			}
+		}(k)
+	}
+	wg.Wait()
+}
+
+// sleepCtx 可取消的等待：ctx 取消立即返回 false（优雅停机不必等限速睡醒），
+// 等满返回 true。d<=0 立即放行。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }
 
@@ -282,13 +314,13 @@ func (s *Scheduler) RunCheckinNow() {
 		}
 		credit, _, cerr := s.cfg.Upstream.DailyCheckinCredit(a)
 		if cerr != nil {
-			// "今天已签到"是幂等成功；其余业务错误也继续走余额查询，奖励记 0
+			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 			if upstream.IsAlreadyCheckin(cerr) {
 				log.Printf("checkin %s: 今天已签到（幂等）", st.UID)
 			} else {
 				log.Printf("checkin %s: %v", st.UID, cerr)
 			}
-			credit = 0
+			credit = 0 // 业务错误（含已签到）奖励记 0
 		}
 		if lg := s.lg(); lg != nil {
 			lg.Append(ledger.Entry{
@@ -317,7 +349,14 @@ func (s *Scheduler) RunCheckinNow() {
 // 一条上报同时点亮 growth 连登 + 解锁 first_buddy 任务。
 // 上报成功后续跑 streak 自检（checkActivityStreak）：回读连登天数，发现
 // 「上报 200 但 streak 没涨」的静默丢弃（只读 oracle，不做重试）。
+// RunActivityNow 是无 ctx 的外部入口（面板/测试一次性触发）；排程主循环走
+// runActivity（ctx 取消时立即放弃剩余账号，不等限速睡满）。
 func (s *Scheduler) RunActivityNow() {
+	s.runActivity(context.Background())
+}
+
+// runActivity 活跃上报遍历，随 ctx 取消立即退出。
+func (s *Scheduler) runActivity(ctx context.Context) {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
@@ -331,7 +370,9 @@ func (s *Scheduler) RunActivityNow() {
 			continue // D4 门控：global 无任务中心/活跃体系，不发起任何上游调用
 		}
 		if !first {
-			time.Sleep(activityAccountDelay)
+			if !sleepCtx(ctx, activityAccountDelay) {
+				return // 优雅停机：不等限速睡满，剩余账号下轮再报
+			}
 		}
 		first = false
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())

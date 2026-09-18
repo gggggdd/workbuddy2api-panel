@@ -24,7 +24,7 @@ var chatLogEnabled = true
 // chatLogOut 聊天表格日志的输出目标。生产默认 os.Stdout；main 在启用管理面板时
 // 经 SetChatLogOutput 注入 MultiWriter，把每行镜像进 /panel/api/logs 的环形缓冲，
 // stdout 行为不变。需在开始服务前调用一次（无并发竞争窗口）。
-var chatLogOut io.Writer // nil = 跟随当前 os.Stdout（测试可在运行期替换 os.Stdout 捕获）
+var chatLogOut io.Writer = os.Stdout
 
 // SetChatLogOutput 替换聊天表格日志输出目标（仅 main 启动期调用一次）。
 func SetChatLogOutput(w io.Writer) { chatLogOut = w }
@@ -68,16 +68,16 @@ type chatStatsReader struct {
 	start               time.Time
 	ttfb                time.Duration
 	seen                bool // 已见过首个 data 帧（TTFB 只记一次）
-	hasUsage            bool // 末帧是否带 usage（兼容旧判断）
 	promptTokens        int
 	completionTokens    int
 	totalTokens         int
 	hasPromptTokens     bool
 	hasCompletionTokens bool
 	hasTotalTokens      bool
-	credit              float64 // usage.credit（成员记账用；无 usage 时为 0）
-	hasCredit           bool    // usage 里真的出现了 credit 字段（显式 0 也是合法观测）
-	pend                []byte  // 已读未返回的行缓存
+	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
+	hasCredit bool
+	credit    float64
+	pend      []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -91,6 +91,12 @@ func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.completionTokens, s.hasCompletionTokens }
 
+// Credit 返回末帧 usage.credit（本次真实扣费积分）与是否缺失。
+func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
+
+// TotalTokens 返回末帧 usage.total_tokens 与是否缺失。
+func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.hasTotalTokens }
+
 // Usage 返回流式响应中已收到的 token usage 字段。
 func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 	return pool.TokenUsageDelta{
@@ -102,9 +108,6 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 		TotalTokens:         int64(s.totalTokens),
 	}
 }
-
-// Credit 返回末帧 usage.credit 与是否存在（缺失≠免费：ok=false 不能当 0 记账）。
-func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
@@ -122,16 +125,15 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	var chunk struct {
 		Usage *struct {
-			PromptTokens     *int    `json:"prompt_tokens"`
-			CompletionTokens *int    `json:"completion_tokens"`
-			TotalTokens      *int    `json:"total_tokens"`
+			PromptTokens     *int     `json:"prompt_tokens"`
+			CompletionTokens *int     `json:"completion_tokens"`
+			TotalTokens      *int     `json:"total_tokens"`
 			Credit           *float64 `json:"credit"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
 		return
 	}
-	s.hasUsage = true
 	if chunk.Usage.PromptTokens != nil {
 		s.hasPromptTokens = true
 		s.promptTokens = *chunk.Usage.PromptTokens
@@ -166,6 +168,27 @@ func (s *chatStatsReader) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	return 0, err
+}
+
+// rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
+// 仅当 bare != 原 model 时由 chatCompletions 调用；body 不可解析时原样返回（不二次错误化）。
+func rewriteModel(body []byte, bare string) []byte {
+	if len(body) == 0 || bare == "" {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	if cur, ok := obj["model"].(string); !ok || cur == bare {
+		return body
+	}
+	obj["model"] = bare
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // parseModelFromBody 从请求 JSON 取 model 字段，缺省标 "-"。
@@ -232,19 +255,6 @@ func completionTokens(resp map[string]any) int {
 	return int(v)
 }
 
-// completionCredit 从 Aggregate 返回的响应中提取 usage.credit（成员记账用）；缺失返回 0。
-func completionCredit(resp map[string]any) float64 {
-	u, ok := resp["usage"].(map[string]any)
-	if !ok {
-		return 0
-	}
-	v, ok := u["credit"].(float64)
-	if !ok || v < 0 {
-		return 0
-	}
-	return v
-}
-
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
 func uidPrefix(uid string) string {
 	if uid == "" {
@@ -280,11 +290,7 @@ func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, 
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	w := chatLogOut
-	if w == nil {
-		w = os.Stdout
-	}
-	fmt.Fprintf(w, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,

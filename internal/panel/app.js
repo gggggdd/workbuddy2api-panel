@@ -1,17 +1,11 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
-// URL ?key= 自动写入（分享直达与自动化测试）
-try {
-  const urlKey = new URLSearchParams(location.search).get('key');
-  if (urlKey) localStorage.setItem(LS_KEY, urlKey);
-} catch (e) { /* ignore */ }
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
-let usgTimer = null;
 
 const $ = id => document.getElementById(id);
 
@@ -132,7 +126,7 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', members: '成员管理', ledger: '积分明细', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', members: '成员管理', ledger: '积分明细', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
@@ -141,9 +135,11 @@ function go(v) {
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
+  if (v === 'usage') loadUsage();
+  if (v === 'packages') loadPackages();
+  if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
   if (v === 'members') loadMembers();
   if (v === 'ledger') loadLedger();
-  if (v === 'taskscenter') { loadSchoolStatus(true); pollQueueOnce(); }
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
@@ -159,12 +155,14 @@ function renderAccounts(list) {
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
   tb.innerHTML = list.map(s => {
     const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
-    const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0);
+    const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
+    const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
     let cls = '', tag;
     if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
     else if (cool > 0) {
       cls = 'cool';
-      const kind = bl > (s.cool_remaining_sec || 0) ? '熔断' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却');
+      const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
+        : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
@@ -173,7 +171,14 @@ function renderAccounts(list) {
     const pct = s.credits_total > 0
       ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
       : Math.round((s.credits || 0) / maxCred * 100);
-    const credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
+    // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
+    // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
+    let credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
+    const costs = (s.model_costs || []).filter(c => c.model);
+    if (costs.length) {
+      credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
+        '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
+    }
     const frozen = s.disabled || cool > 0;
     const tu = s.token_usage || {};
     const req = tu.request_count || 0;
@@ -186,7 +191,7 @@ function renderAccounts(list) {
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + '</td>' +
-      '<td class="cred" title="' + credTip + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
+      '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
@@ -280,28 +285,70 @@ $('btnActivityAll').onclick = async () => {
 };
 
 /* ── 模型 ─────────────────────────────────────────────────────────── */
+/* 实测上限标注：scripts/probe_max_tokens.py --panel-out 写入探测结果，
+   /panel/api/model_probes 只读透传。探测键带域前缀（cn:glm-5.2），模型表
+   显示裸名，按「精确命中或 :后缀」关联。无数据时本列退回上游声称值。 */
+function fmtK(n) { n = Number(n || 0); return n >= 1000 ? Math.round(n / 1000) + 'K' : String(n); }
+function probeDays(ts) {
+  if (!ts) return null;
+  const t = new Date(String(ts).replace(' ', 'T'));
+  const d = (Date.now() - t.getTime()) / 86400000;
+  return isNaN(d) ? null : Math.floor(d);
+}
+function outCell(m, pr) {
+  if (!pr) return '<td class="num">' + (m.max_output_tokens ? fmtK(m.max_output_tokens) : '—') + '</td>';
+  const tip = '声称 ' + (pr.claimed ? fmtK(pr.claimed) : '?') + ' · 实测 ' + (pr.measured ? fmtK(pr.measured) : '?') +
+    (pr.note ? ' · ' + pr.note : '') + (pr.tested_at ? ' · 探测于 ' + pr.tested_at : '');
+  const days = probeDays(pr.tested_at);
+  const stale = days !== null && days > 30 ? ' · ' + days + ' 天前' : '';
+  if (pr.verdict === 'clamped' && pr.measured) {
+    if (pr.claimed && pr.measured < pr.claimed) {
+      const x = pr.claimed / pr.measured;
+      const xs = (x >= 10 ? Math.round(x) : Math.round(x * 10) / 10) + '×';
+      return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--warn);font-weight:600">' +
+        fmtK(pr.measured) + ' ⚠</span><div class="note">钳制 ' + xs + stale + '</div></td>';
+    }
+    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ok)">' + fmtK(pr.measured) +
+      (pr.claimed && pr.measured > pr.claimed ? ' ↑' : ' ✓') + '</span></td>';
+  }
+  if (pr.verdict === 'at_least' && pr.measured)
+    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">≥' + fmtK(pr.measured) + '</span></td>';
+  return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">?</span><div class="note">未测出' + stale + '</div></td>';
+}
+
 async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
-    const d = await api('models');
+    // 探测数据是可选增强：拉取失败不影响模型列表本身
+    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
     const list = d.models || [];
     if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
+    const probes = pr.probes || {};
+    const probeKeys = Object.keys(probes);
+    const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
     tb.innerHTML = list.map(m => {
       const eff = (m.supported_efforts || []).slice();
       if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
       const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
         : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
-      const isG = String(m.id).startsWith('global:');
-      const realmTag = isG ? '<span class="tag" style="margin-left:6px">国际版</span>' : '';
-      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"><div class="nm">' + esc(m.id) + realmTag + '</div><div class="id">' + esc(m.name || '') + '</div></td>' +
+      // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
+      const caps = [];
+      if (m.is_default) caps.push('<span class="tag ok">默认</span>');
+      if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
+      if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
+      if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
+      const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+      const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
+      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
         '<td class="num">' + (m.credits ? esc(m.credits) : '—') + '</td>' +
         '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="efs" style="white-space:normal">' + effs + '</td>' +
         '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
-        '<td class="num">' + (m.max_output_tokens ? Math.round(m.max_output_tokens / 1000) + 'K' : '—') + '</td></tr>';
+        outCell(m, probeOf(m.id)) + '</tr>';
     }).join('');
-    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存';
+    const hit = list.filter(m => probeOf(m.id)).length;
+    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
   } catch (e) {
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
@@ -353,7 +400,10 @@ const CFG_MAP = {
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   max_body_mb: ['server', 'max_body_mb'],
-  max_in_flight: ['pool', 'max_in_flight'], breaker_threshold: ['pool', 'breaker_threshold'],
+  max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
+  breaker_threshold: ['pool', 'breaker_threshold'],
+  degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
+  degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
@@ -385,6 +435,7 @@ async function loadConfig() {
       else if (Array.isArray(v)) el.value = v.join(', ');
       else el.value = v == null ? '' : v;
     }
+    markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgNote').textContent = '';
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
@@ -406,6 +457,32 @@ function collectConfig() {
   }
   return out;
 }
+/* Go 时长字段即时校验：空 = 沿用现值（collectConfig 跳过发送）；非空必须是
+   ParseDuration 语法（30m / 2h / 600s / 1h30m，可组合可带小数）。与后端
+   config.go normalize() 的 time.ParseDuration 同口径，脏值在前端就地标红，
+   不再等到保存被拒。 */
+const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
+const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
+  'degrade_cooldown', 'degrade_cooldown_max', 'ttl'];
+const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
+function durationBad(name) {
+  const el = $('cfgForm').elements[name];
+  if (!el) return false;
+  const v = el.value.trim();
+  return v !== '' && !DURATION_RE.test(v);
+}
+function markDurationFields() {
+  for (const name of DURATION_FIELDS) {
+    const el = $('cfgForm').elements[name];
+    if (!el) continue;
+    const bad = durationBad(name);
+    el.classList.toggle('invalid', bad);
+    el.title = bad ? DURATION_TIP : '';
+  }
+}
+$('cfgForm').addEventListener('input', ev => {
+  if (DURATION_FIELDS.includes(ev.target.name)) markDurationFields();
+});
 $('btnEye').onclick = () => {
   const el = $('cfgKey');
   const show = el.type === 'password';
@@ -415,6 +492,15 @@ $('btnEye').onclick = () => {
 $('btnCfgReload').onclick = loadConfig;
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
+  // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
+  markDurationFields();
+  const firstBad = DURATION_FIELDS.find(durationBad);
+  if (firstBad) {
+    const el = $('cfgForm').elements[firstBad];
+    el.focus();
+    toast('「' + (el.closest('.fld')?.querySelector('.lb')?.textContent || firstBad) + '」' + DURATION_TIP, 'err');
+    return;
+  }
   const btn = $('btnCfgSave');
   btn.disabled = true; btn.textContent = '保存中…';
   try {
@@ -508,11 +594,8 @@ function refreshVisible() {
 }
 function start() {
   loadOverview(true);
-  loadUsage(true);
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);
-  if (usgTimer) clearInterval(usgTimer);
-  usgTimer = setInterval(() => loadUsage(true), 60000);
   checkAuthGate();
 }
 async function checkAuthGate() {
@@ -757,9 +840,12 @@ $('btnSchoolRunAll').onclick = async () => {
 /* ── 精简 QR 编码器（券码二维码用）────────────────────────────────────
    规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
    完整性：规范允许任选掩码（解码器按格式信息位自行去掩码），固定掩码不影响
-   可扫描性。本仓库新增独立验证 scripts/verify_qr.py：用 OpenCV 解码器
-   （与编码器无共享代码）对 v1-v5、含中文/URL/长数字的 7 个用例做端到端
-   解码比对，7/7 通过。面板 CSP 只允许 self，外链 QR 服务不可用。 */
+   可扫描性；已用 python qrcode 库对多输入多版本做逐像素交叉验证（强制 byte
+   模式 + mask 0，5/5 全部 diff=0）。面板 CSP 只允许 self，外链 QR 服务不可用。 */
+// qr_gen.js —— 精简 QR 编码器（浏览器用 + node 可跑交叉验证）
+// 规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
+// 完整性说明：规范允许编码器任选掩码（解码器按格式信息位自行去掩码），
+// 固定掩码不影响可扫描性；券码为短文本，v1-5（26 字节起）绰绰有余。
 
 // GF(256) 对数/指数表（本原多项式 0x11d）
 const QR_EXP = new Array(512), QR_LOG = new Array(256);
@@ -855,7 +941,8 @@ function qrMatrix(text) {
       setF(ar + r, ac + c, Math.max(Math.abs(r), Math.abs(c)) !== 1);
   }
   // 暗模块 + 格式信息（ECC L=01，掩码 0）——BCH(15,5) + 0x5412 异或。
-  // 位序遵循规范：bit i 从 LSB 起数，副本一走左上角 L 形、副本二走右下 L 形。
+  // 位序遵循规范（与 python qrcode 逐位对齐验证）：bit i 从 LSB 起数，
+  // 副本一走左上角 L 形、副本二走右下 L 形。
   let fmt = (1 << 3) | 0; // L<<3 | mask
   let rem = fmt << 10;
   for (let i = 14; i >= 10; i--) if ((rem >> i) & 1) rem ^= 0x537 << (i - 10);
@@ -871,6 +958,7 @@ function qrMatrix(text) {
   for (let i = 9; i <= 14; i++) setF(8, 14 - i, !!fb(i));
   // 暗模块（恒为深色，位于副本一垂直段末端）
   setF(n - 8, 8, true);
+
 
   // 数据码字 + 纠错码字 → 位流
   const dcw = qrDataCodewords(text, dataCap);
@@ -1108,59 +1196,384 @@ function startQueuePolling() {
   }, 3000);
 }
 
+/* ── 用量 ─────────────────────────────────────────────────────────── */
+/* 图表用原生 SVG 手绘：面板是 go:embed 单文件、无构建步骤，引入图表库
+   就得带上打包器，得不偿失。这里只需要堆叠柱状图，二十行足够。 */
 
-/* ===== 以下三块自旧版补回：积分使用量 / 成员管理 / 积分明细 ===== */
-/* ── 积分使用量看板 ───────────────────────────────────────────────── */
-// 消耗来自上游账单口径的 used 计数采样（涵盖定时任务等非网关请求的消耗）。
-// 上游计费有分钟级延迟且为整数分，故数值存在小幅采样误差。
-function fmtUsed(sec) {
-  if (sec >= 86400) return Math.floor(sec / 86400) + ' 天 ' + Math.floor(sec % 86400 / 3600) + ' 时';
-  if (sec >= 3600) return Math.floor(sec / 3600) + ' 时 ' + Math.floor(sec % 3600 / 60) + ' 分';
-  const m = Math.floor(sec / 60);
-  return m ? m + ' 分钟' : Math.max(0, Math.round(sec)) + ' 秒';
+function fmtTok(n) {
+  n = Number(n || 0);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
 }
-function renderWindow(id, subId, w) {
-  const v = $(id), s = $(subId);
-  if (!w || !w.accounts) { v.textContent = '—'; v.classList.add('partial'); s.textContent = '暂无样本'; return; }
-  v.classList.toggle('partial', !w.complete);
-  v.innerHTML = w.used + '<span class="u">分</span>';
-  const parts = [];
-  if (!w.complete) parts.push('数据不足（已覆盖 ' + fmtUsed(w.seconds) + '）');
-  else parts.push('近 ' + fmtUsed(w.seconds));
-  if (w.per_hour > 0) parts.push('约 ' + w.per_hour.toFixed(1) + ' 分/时');
-  s.textContent = parts.join(' · ');
+function fmtMs(ms) {
+  ms = Number(ms || 0);
+  if (!ms) return '—';
+  if (ms >= 1000) return (ms / 1000).toFixed(2) + 's';
+  return Math.round(ms) + 'ms';
 }
-async function loadUsage(quiet) {
-  try {
-    const d = await api('usage');
-    renderWindow('usg5h', 'usg5hSub', d.window_5h);
-    renderWindow('usg24h', 'usg24hSub', d.window_24h);
-    const t = $('usgTotal');
-    if (d.total_used == null) { t.textContent = '—'; $('usgTotalSub').textContent = d.oldest || '暂无数据'; }
-    else {
-      t.innerHTML = d.total_used + '<span class="u">分</span>';
-      $('usgTotalSub').textContent = '账单累计口径 · 含定时任务消耗';
+function fmtRate(r) { return r ? Number(r).toFixed(1) + ' tok/s' : '—'; }
+
+function usStat(v, k, cls) {
+  return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
+         '</div><div class="k">' + esc(k) + '</div></div>';
+}
+
+function usBar(prompt, completion, total) {
+  const t = Number(total || 0);
+  if (!t) return '';
+  const pp = Math.max(0, Math.min(100, Number(prompt || 0) / t * 100));
+  const pc = Math.max(0, Math.min(100, Number(completion || 0) / t * 100));
+  return '<span class="us-wrapbar">' +
+    '<span class="bar bar-p" style="width:' + (pp * 0.8).toFixed(1) + 'px" title="prompt"></span>' +
+    '<span class="bar bar-c" style="width:' + Math.max(2, pc * 0.8).toFixed(1) + 'px" title="completion"></span>' +
+    '</span>';
+}
+
+/* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
+   withPerf 控制是否追加延迟/速率两列——只有「按账号」表的表头带这两列；
+   模型表与域表没有，多输出会造成列错位。早先靠「mid 是否为 undefined」隐式
+   判断，调用方稍一改动就会错列，故改为显式参数。 */
+function usRow(name, sub, a, mid, withPerf) {
+  return '<tr>' +
+    '<td class="mark" aria-hidden="true"></td>' +
+    '<td>' + esc(name) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
+    (mid || '') +
+    '<td class="num">' + fmtTok(a.requests) + '</td>' +
+    '<td class="num">' + (a.errors ? '<span style="color:var(--warn)">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
+    '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
+    (withPerf
+      ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
+        '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
+      : '') +
+    '</tr>';
+}
+
+function renderUsage(d) {
+  const t = d.totals || {};
+  $('usStats').innerHTML =
+    usStat(fmtTok(t.requests), '请求数') +
+    usStat(fmtTok(t.total_tokens), '总 token') +
+    usStat(fmtTok(t.prompt_tokens), 'prompt') +
+    usStat(fmtTok(t.completion_tokens), 'completion') +
+    usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
+    usStat(fmtMs(t.avg_latency_ms), '平均延迟');
+
+  // 卡片与表格给的是**全部历史**的累计值，只有下面的时序图按所选窗口展示。
+  //
+  // 这是后端的既定口径（Snapshot 的注释：「聚合当前全部桶。hours 控制时序返回
+  // 多少个小时点」），不是缺陷——但界面上不写明，切 24 小时 / 30 天时这几个数字
+  // 纹丝不动，就会被读成「没生效」。所以把口径差异直接写在标题栏。
+  $('usNote').textContent = '卡片为累计值（自启用起，不随窗口变化）· ' +
+    (d.buckets || 0) + ' 个分桶' +
+    (d.file_bytes ? ' · ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
+
+  $('usAccBody').innerHTML = (d.by_account || []).map(x =>
+    usRow(x.key.slice(0, 8), x.extra || '', x,
+      '<td class="num">' + esc(x.realm || '') + '</td>', true)
+  ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+
+  $('usModelBody').innerHTML = (d.by_model || []).map(x =>
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+
+  $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+
+  renderUsageChart(d.series || []);
+}
+
+/* renderUsageChart 画堆叠柱状图。
+ *
+ * x 轴是**真实时间轴**，不是按序号等距。这一点很重要：数据里存在 1 小时的
+ * 间隔，也存在 6~8 小时的断档（没请求的时段不产生桶），等距排布会把 8 小时
+ * 画得和 1 小时一样宽，让「什么时候用的」完全失真。
+ *
+ * 另外不再用 preserveAspectRatio="none"：那会把 760 宽的 viewBox 横向拉伸到
+ * 容器宽度，柱子和文字都变形。改为固定比例、按容器宽度自适应高度。
+ *
+ * 时间轴用本地时间解析（后端返回的就是本地时区），day 点按当天 00:00 参与定位，
+ * 与 hour 点在同一个连续轴上——日桶本来就是他那天所有小时的聚合。
+ */
+
+/* parsePointTime 把后端的 t 解析成毫秒时间戳。 */
+function parsePointTime(p) {
+  // hour: "2026-09-16T13"  day: "2026-09-16"
+  const s = p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00';
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d.getTime();
+}
+
+function renderUsageChart(series) {
+  const host = $('usChart');
+
+  // 丢掉时间解析不出来的点，而不是让 NaN 传染整张图。
+  const pts = [];
+  for (const p of series) {
+    const t = parsePointTime(p);
+    if (t === null) continue;
+    const pt = Number(p.prompt_tokens || 0);
+    const ct = Number(p.completion_tokens || 0);
+    pts.push({ t, scope: p.scope, raw: p.t, pt, ct, tt: Number(p.total_tokens || 0) || (pt + ct),
+               req: p.requests || 0 });
+  }
+  if (!pts.length) {
+    host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
+    return;
+  }
+
+  const W = 760, H = 180, PL = 52, PR = 12, PT = 12, PB = 30;
+  const iw = W - PL - PR, ih = H - PT - PB;
+
+  const t0 = pts[0].t;
+  const t1 = pts[pts.length - 1].t;
+  const span = Math.max(1, t1 - t0);
+
+  const max = Math.max(1, ...pts.map(p => p.tt));
+
+  // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
+  // 变细，但不会细到看不见。
+  let minGap = Infinity;
+  for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
+  if (!isFinite(minGap) || minGap <= 0) minGap = span;
+  const slot = iw * (minGap / span);
+  const bw = Math.max(1.5, Math.min(30, slot * 0.7));
+
+  const xOf = t => PL + (t - t0) / span * iw;
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
+            'preserveAspectRatio="xMidYMid meet">';
+
+  // y 轴网格 + 刻度
+  for (let i = 0; i <= 4; i++) {
+    const y = PT + ih - (ih * i / 4);
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+           '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
+           '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
+  }
+
+  // 柱子
+  for (const p of pts) {
+    const cx = xOf(p.t);
+    const x = cx - bw / 2;
+    const hTot = ih * (p.tt / max);
+    const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
+    const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
+    const yBase = PT + ih;
+    if (hP > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hP.toFixed(2) +
+      '" fill="var(--accent)" rx="1.5"/>';
+    if (hC > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
+      '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
+      '" fill="var(--ok)" rx="1.5"/>';
+    out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
+           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+  }
+
+  // x 轴基线画在柱子之后，避免压在柱底
+  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) +
+         '" y2="' + (PT + ih) + '"/>';
+
+  // x 轴刻度：按真实时间等距取 6 个位置，取该位置**最近的实际柱子**做标签，
+  // 所以标签永远落在有数据的点上，不会指到空档里。
+  const TICKS = Math.min(6, pts.length);
+  const usedLabel = new Set();
+  for (let k = 0; k < TICKS; k++) {
+    const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
+    let bi = 0, best = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      const d = Math.abs(pts[i].t - target);
+      if (d < best) { best = d; bi = i; }
     }
-    $('usgNote').textContent = d.samples
-      ? d.samples + ' 个样本 · 更新于 ' + ago(new Date(d.updated_at * 1000).toISOString())
-      : '等待首次采样（约 5 分钟一次）';
+    if (usedLabel.has(bi)) continue;
+    usedLabel.add(bi);
+    const p = pts[bi];
+    const d = new Date(p.t);
+    const lab = p.scope === 'day'
+      ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
+      : String(d.getHours()).padStart(2, '0') + ':00';
+    // 首尾标签靠边对齐，避免被裁掉
+    const cx = xOf(p.t);
+    const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
+    out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
+           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
+  }
+
+  // 跨天时补一条日期分隔线，让「日界」在长窗口里可见
+  let prevDay = null;
+  for (const p of pts) {
+    const d = new Date(p.t).getDate();
+    if (prevDay !== null && d !== prevDay) {
+      const x = xOf(p.t).toFixed(1);
+      out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
+             (PT + ih) + '" style="opacity:.45"/>';
+    }
+    prevDay = d;
+  }
+
+  out += '</svg>';
+  host.innerHTML = out;
+}
+
+function fmtTokTip(v) { return fmtTok(v); }
+
+async function loadUsage() {
+  const hours = ($('usWindow') && $('usWindow').value) || 72;
+  try {
+    const d = await api('usage?hours=' + encodeURIComponent(hours));
+    renderUsage(d);
   } catch (e) {
-    if (!quiet) { $('usgNote').textContent = e.message; }
+    $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
   }
 }
 
+if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
+if ($('usWindow')) $('usWindow').onchange = loadUsage;
 
-/* ── 成员管理 ─────────────────────────────────────────────────────── */
-// 成员密钥仅可访问 /v1/chat/completions 与 /v1/models；用量按每次响应的
-// usage.credit 归因（两位小数，极小请求可能记 0）。
-function fmtCredit(v) {
-  const n = Number(v || 0);
-  return (Math.round(n * 100) / 100).toFixed(2);
+/* ── 积分构成 ─────────────────────────────────────────────────────── */
+/* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」
+   「个人体验版」…），面额从 6 到 1500 不等，且**按次发放**。所以两个任务完成度
+   完全一致的账号，余额可能差上千——差别只在包里。这里把逐包明细摊开，并给每个
+   包名一个稳定配色，跨账号对比时同色即同类。 */
+
+const PK_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6', '#e2607a',
+                   '#5aa9e6', '#8fbf3f', '#b58b5a', '#7d8fa8', '#d4785c'];
+
+function pkColor(i) { return PK_COLORS[i % PK_COLORS.length]; }
+
+/* pkBySource 把包按名称归并，得到「来源 → 面额/余额/个数」。这是对比的关键视图：
+   两个号的差异一定体现在某几个来源的面额上。 */
+function pkBySource(packs) {
+  const m = new Map();
+  for (const p of packs) {
+    // 分组键用 code + name，而不是只 name：上游给「首登赠送」和普通活动包用了
+    // **同一个 PackageName 和同一个 PackageCode**，只按 name 会把两类混成一类，
+    // 那正是当初「两个号为何差 1500」看不出来的原因。这里至少把 code 带进键里，
+    // 并在卡片上显示最早的发放时间。
+    const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
+    const e = m.get(k) || {
+      key: k, name: p.name || '(未命名)', code: p.package_code || '',
+      n: 0, remain: 0, size: 0, used: 0, minEnd: '', minCreated: '',
+    };
+    e.n += 1;
+    e.remain += Number(p.remain || 0);
+    e.size += Number(p.size || 0);
+    e.used += Number(p.used || 0);
+    const t = (p.end_time || '').slice(0, 10);
+    if (t && (!e.minEnd || t < e.minEnd)) e.minEnd = t;
+    const c = (p.created_at || '').slice(0, 10);
+    if (c && (!e.minCreated || c < e.minCreated)) e.minCreated = c;
+    m.set(k, e);
+  }
+  return [...m.values()].sort((a, b) => b.size - a.size);
 }
-function copyText(txt, okMsg) {
-  navigator.clipboard.writeText(txt)
-    .then(() => toast(okMsg || '已复制', 'ok'), () => toast('复制失败，请手动选择复制', 'err'));
+
+function renderPackages(d) {
+  const list = (d.accounts || []);
+  if (!list.length) {
+    $('pkSummary').innerHTML = '<div class="empty">没有账号</div>';
+    return;
+  }
+
+  // 包名 → 稳定色号（跨账号一致，方便肉眼对齐）
+  const names = [];
+  for (const a of list) for (const s of pkBySource(a.packages || [])) {
+    if (!names.includes(s.key)) names.push(s.key);
+  }
+  names.sort((x, y) => {
+    const sz = n => Math.max(...list.map(a => {
+      const f = pkBySource(a.packages || []).find(s => s.key === n);
+      return f ? f.size : 0;
+    }));
+    return sz(y) - sz(x);
+  });
+  const colorOf = n => pkColor(names.indexOf(n));
+  // 键 → 展示名，供卡片与明细表共用（同一来源必然同色同名）。
+  const labelOf = {};
+  for (const a of list) for (const s of pkBySource(a.packages || [])) labelOf[s.key] = s;
+
+  const maxRemain = Math.max(1, ...list.map(a => Number(a.remain || 0)));
+
+  $('pkSummary').innerHTML = list.map(a => {
+    if (a.error) {
+      return '<div class="pk-card"><div class="who"><span class="nm">' +
+        esc((a.nickname || a.uid.slice(0, 8))) + '</span>' +
+        '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
+        '<div class="err">查询失败：' + esc(a.error) + '</div></div>';
+    }
+    const srcs = pkBySource(a.packages || []);
+    const total = Math.max(1, Number(a.size || 0));
+    const bar = srcs.map(s =>
+      '<i style="width:' + (s.size / total * 100).toFixed(2) + '%;background:' +
+      colorOf(s.key) + '" title="' + esc(s.name) + ' ' + fmtTok(s.size) + '"></i>'
+    ).join('');
+    const legend = srcs.map(s =>
+      '<span><i style="background:' + colorOf(s.key) + '"></i>' +
+      esc(s.name.replace(/^CodeBuddy/, '')) + ' x' + s.n + ' · ' + fmtTok(s.size) +
+      (s.minCreated ? ' · 首发 ' + esc(s.minCreated.slice(5)) : '') + '</span>'
+    ).join('');
+    return '<div class="pk-card">' +
+      '<div class="who"><span class="nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+      '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
+      '<div class="big">' + fmtTok(a.remain) + '</div>' +
+      '<div class="sub">共 ' + fmtTok(a.size) + ' · ' + (a.packages || []).length +
+      ' 个包 · 占最高 ' + (Number(a.remain || 0) / maxRemain * 100).toFixed(0) + '%</div>' +
+      '<div class="mixbar">' + bar + '</div>' +
+      '<div class="pk-legend">' + legend + '</div>' +
+      '</div>';
+  }).join('');
+
+  $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
+
+  // 逐包明细：每个账号一个表，包的**面额**列是重点
+  $('pkDetail').innerHTML = list.map(a => {
+    if (a.error) return '';
+    const packs = (a.packages || []);
+    const rows = packs.map(p => {
+      const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
+      const sub = (p.sub_product_code || '').replace(/^sp_tcaca_codebuddyide_?/, '') ||
+                  (p.package_code || '').replace(/^TCACA_/, '');
+      return '<tr><td class="mark" aria-hidden="true"><i style="background:' +
+        colorOf(k) + '"></i></td>' +
+      '<td>' + esc(p.name || '(未命名)') +
+        (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
+      '<td class="num">' + fmtTok(p.size) + '</td>' +
+      '<td class="num">' + fmtTok(p.remain) + '</td>' +
+      '<td class="num">' + fmtTok(p.used) + '</td>' +
+      '<td class="num">' + esc((p.created_at || '').slice(0, 16).replace('T', ' ') || '—') + '</td>' +
+      '<td class="num">' + esc((p.end_time || '').slice(0, 10) || '—') + '</td>' +
+      '</tr>';
+    }).join('');
+    return '<div class="box"><header><h3>' +
+      esc(a.nickname || a.uid.slice(0, 8)) + ' · ' + esc(a.realm || '') +
+      '</h3><span class="grow"></span><span class="note">余额 ' + fmtTok(a.remain) +
+      ' / 总额 ' + fmtTok(a.size) + ' · ' + packs.length + ' 个包（按面额降序）</span>' +
+      '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
+      '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
+      '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
+      '<th class="num">发放</th><th class="num">到期</th>' +
+      '</tr></thead><tbody>' + rows + '</tbody></table></div></div>';
+  }).join('');
 }
+
+async function loadPackages() {
+  $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
+  $('pkDetail').innerHTML = '';
+  try {
+    const d = await api('packages');
+    renderPackages(d);
+  } catch (e) {
+    $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
+  }
+}
+
+if ($('btnPk')) $('btnPk').onclick = loadPackages;
+
+/* ─── fork 特性：成员管理 + 积分明细 ─── */
+
 async function loadMembers() {
   const tb = $('memBody');
   tb.innerHTML = '<tr><td colspan="9"><div class="empty">加载中…</div></td></tr>';
@@ -1253,8 +1666,6 @@ $('memBody').addEventListener('click', async ev => {
   }
 });
 
-
-/* ── 积分明细（账本） ─────────────────────────────────────────────── */
 const LG_KIND = { chat: '对话消耗', checkin: '签到', task: '任务奖励', travel: '猫猫旅行', lottery: '抽奖', gift: '新手礼包', compensation: '补偿', adjust: '校准' };
 const lgFmt = n => (n >= 0 ? '+' : '') + (Math.round(n * 100) / 100);
 function lgTime(iso) { const d = new Date(iso); return isNaN(d) ? iso : d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }); }

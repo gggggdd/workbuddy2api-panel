@@ -51,13 +51,11 @@ func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]a
 // SchoolTask 开学季任务条目。
 type SchoolTask struct {
 	TaskCode    string `json:"task_code"`
+	// RewardCredit 任务奖励积分（账本入账依据，上游 /tasks 直接给出）。
+	RewardCredit int `json:"reward_credit"`
 	Status      string `json:"status"` // pending | completed | claimed
 	Progress    int    `json:"progress"`
 	TargetCount int    `json:"target_count"`
-	// RewardCredit 任务奖励积分。由 /tasks 直接给出（实测 share_invite=100、
-	// chat_3_times=50、expert_use=50、desktop_chat_1_time=100），领奖响应不返回
-	// 积分金额，故入账取值一律以本字段为准。
-	RewardCredit int `json:"reward_credit"`
 }
 
 // SchoolTasks 任务列表 + 活动是否在期。
@@ -119,88 +117,6 @@ func (c *Client) SchoolDraw(a *auth.Auth) (prizeCode string, credit int, err err
 		return "", 0, err
 	}
 	return out.PrizeCode, out.CreditAmount, nil
-}
-
-// SchoolReward 开学季「我的奖励」条目（上游服务端权威积分记录）。
-type SchoolReward struct {
-	Type      string `json:"type"`       // credit | voucher
-	GrantedAt string `json:"granted_at"` // "2006-01-02 15:04:05"（本地时区，无 TZ 后缀）
-	Amount    int    `json:"amount"`     // 积分增量（type=credit 时有效）
-}
-
-// SchoolRewards 拉取账号的开学季奖励记录（GET /rewards，只读，按时间倒序）。
-//
-// 这是上游服务端自己记的账，比客户端埋点可靠：任务领奖与转盘积分都落在这里，
-// 且可回补网关停机期间漏记的部分。实测 data = {items[],has_more,page,page_size,total}，
-// 单账户记录量小（活动期每日数条），一页 page_size 足够，按 has_more 兜底翻页。
-func (c *Client) SchoolRewards(a *auth.Auth) ([]SchoolReward, error) {
-	var all []SchoolReward
-	for page := 1; page <= 10; page++ {
-		var out struct {
-			Items   []SchoolReward `json:"items"`
-			HasMore bool           `json:"has_more"`
-		}
-		path := fmt.Sprintf("/rewards?page=%d&page_size=100", page)
-		if err := c.schoolJSON(a, http.MethodGet, path, nil, &out); err != nil {
-			return nil, err
-		}
-		all = append(all, out.Items...)
-		if !out.HasMore || len(out.Items) == 0 {
-			break
-		}
-	}
-	return all, nil
-}
-
-// SchoolPrizeCredits 返回转盘奖品里「发积分」的面额集合（GET /config 的 prizes[]）。
-//
-// 用途：/rewards 只给 (type=credit, amount)，不区分来自任务还是转盘。转盘面额
-// （实测 6/66）与任务面额（实测 50/100）不重叠，故可按金额判定来源。拉取失败
-// 返回空集合——调用方退化为全部按任务归类，不阻断入账。
-func (c *Client) SchoolPrizeCredits(a *auth.Auth) map[int]bool {
-	var out struct {
-		Prizes []struct {
-			Type         string `json:"type"`
-			CreditAmount int    `json:"credit_amount"`
-		} `json:"prizes"`
-	}
-	if err := c.schoolJSON(a, http.MethodGet, "/config", nil, &out); err != nil {
-		return nil
-	}
-	amt := map[int]bool{}
-	for _, p := range out.Prizes {
-		if p.Type == "credit" && p.CreditAmount > 0 {
-			amt[p.CreditAmount] = true
-		}
-	}
-	return amt
-}
-
-// ---- 我的券码（#/prizes?tab=vouchers，2026-09-16 接入）----
-
-// SchoolVoucher 开学季抽奖抽中的第三方券（KFC/瑞幸/酷狗等）。
-// 字段结构按真实响应样本：GET /vouchers 单次拉全（无分页），data.items[]。
-type SchoolVoucher struct {
-	GrantID   int64  `json:"grant_id"`
-	DrawUUID  string `json:"draw_uuid,omitempty"`
-	SKUCode   string `json:"sku_code,omitempty"`   // kfc_ice_cream / voucher_luckin / voucher_kugou …
-	PrizeName string `json:"prize_name,omitempty"` // 肯德基冰淇淋
-	Code      string `json:"code"`                 // 券码本体（复制给店员核销）
-	ValidFrom string `json:"valid_from,omitempty"` // 上游常为空
-	ValidTo   string `json:"valid_to,omitempty"`   // "2026-10-24"
-	GrantedAt string `json:"granted_at,omitempty"` // RFC3339
-}
-
-// SchoolVouchers 查询账号的开学季券码列表（只读）。
-// 抽到积分的记录不在此端点（那是 /rewards 的 type=credit 条目）。
-func (c *Client) SchoolVouchers(a *auth.Auth) ([]SchoolVoucher, error) {
-	var out struct {
-		Items []SchoolVoucher `json:"items"`
-	}
-	if err := c.schoolJSON(a, http.MethodGet, "/vouchers", nil, &out); err != nil {
-		return nil, err
-	}
-	return out.Items, nil
 }
 
 // ---- 开学季 chat_3_times / expert_use（2026-09-14 判据破解）----
@@ -327,4 +243,38 @@ func SchoolExpertUseEvents(expertID, expertName, conversationID string) []map[st
 			"codebuddy.conversation_request_id": rid,
 		},
 	}
+}
+
+// ---- 我的券码（#/prizes?tab=vouchers，2026-09-16 接入）----
+
+// SchoolVoucher 开学季抽奖抽中的第三方券（KFC/瑞幸/酷狗等）。
+// 字段结构按真实响应样本：GET /vouchers 单次拉全（无分页），data.items[]。
+type SchoolVoucher struct {
+	GrantID   int64  `json:"grant_id"`
+	DrawUUID  string `json:"draw_uuid,omitempty"`
+	SKUCode   string `json:"sku_code,omitempty"`   // kfc_ice_cream / voucher_luckin / voucher_kugou …
+	PrizeName string `json:"prize_name,omitempty"` // 肯德基冰淇淋
+	Code      string `json:"code"`                 // 券码本体（复制给店员核销）
+	ValidFrom string `json:"valid_from,omitempty"` // 上游常为空
+	ValidTo   string `json:"valid_to,omitempty"`   // "2026-10-24"
+	GrantedAt string `json:"granted_at,omitempty"` // RFC3339
+}
+
+// SchoolVouchers 查询账号的开学季券码列表（只读）。
+// 抽到积分的记录不在此端点（那是 /rewards 的 type=credit 条目）。
+func (c *Client) SchoolVouchers(a *auth.Auth) ([]SchoolVoucher, error) {
+	var out struct {
+		Items []SchoolVoucher `json:"items"`
+	}
+	if err := c.schoolJSON(a, http.MethodGet, "/vouchers", nil, &out); err != nil {
+		return nil, err
+	}
+	return out.Items, nil
+}
+
+// SchoolReward 开学季「我的奖励」条目（上游服务端权威积分记录）。
+type SchoolReward struct {
+	Type      string `json:"type"`       // credit | voucher
+	GrantedAt string `json:"granted_at"` // "2006-01-02 15:04:05"（本地时区，无 TZ 后缀）
+	Amount    int    `json:"amount"`     // 积分增量（type=credit 时有效）
 }

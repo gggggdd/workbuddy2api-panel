@@ -231,10 +231,8 @@ func TestGlobalChatServerFallbackErrorCode(t *testing.T) {
 	defer billSrv.Close()
 
 	c := globalTestClient(t, chatSrv, billSrv)
-	_, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
-	if err != nil {
-		t.Fatalf("chat 500: %v", err)
-	}
+	// 新版 ChatStream 对 ≥400 返回已分类的 *Error（错误分类内聚），故 err 非 nil 属预期。
+	_, status, _, _ := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
 	if status != 500 {
 		t.Errorf("status=%d want 500", status)
 	}

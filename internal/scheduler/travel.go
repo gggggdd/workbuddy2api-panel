@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"workbuddy2api/internal/auth"
-	"workbuddy2api/internal/ledger"
 	"workbuddy2api/internal/upstream"
 )
 
@@ -118,12 +117,6 @@ func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
 		return
 	}
 	log.Printf("travel %s: claim ok record=%d reward=%d", a.UID, ts.RecordID, reward)
-	if s.lg() != nil && reward > 0 {
-		s.lg().Append(ledger.Entry{
-			At: time.Now(), UID: a.UID, Nick: a.Nickname,
-			Kind: ledger.KindTravel, Delta: float64(reward), Note: "猫猫旅行到站",
-		})
-	}
 }
 
 // travelAdopt 无猫时领养，链路：report → agreement → buddy/first。
