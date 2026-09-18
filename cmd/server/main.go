@@ -366,17 +366,13 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		return nil, err
 	}
 
-	// 3) 落盘（原子替换）。
+	// 3) 落盘（原子替换；bind mount 挂载点自动回退原地写入，见 writeConfigFile）。
 	out, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal config: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o600); err != nil {
-		return nil, fmt.Errorf("write config: %w", err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return nil, fmt.Errorf("replace config: %w", err)
+	if err := writeConfigFile(path, out); err != nil {
+		return nil, err
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
@@ -452,4 +448,41 @@ func mergedJSON(m map[string]any) []byte {
 		return []byte("{}")
 	}
 	return b
+}
+
+// writeConfigFile 把配置写入 path。
+//
+// 优先「先写 tmp 再 rename」原子替换（避免写一半崩溃留下残缺配置）。但
+// Docker 部署常把 config.json 作为单文件 bind mount 挂进容器
+// （docker-compose.yml: ./config.json:/app/config.json），而 Linux 不允许
+// rename 覆盖挂载点——会返回 EBUSY（"device or resource busy"），导致面板
+// 「保存配置」永远失败。此时回退为原地写入：挂载点是文件，open+truncate
+// 是允许的（只有换 inode 的 rename 被禁）。
+//
+// 回退的代价：原地写入不是原子的（写到一半崩溃会留下残缺文件）。但配置文件
+// 很小（数 KB，单次 write 基本不会被拆开），且这比"完全存不上"强得多；
+// 非挂载点路径仍走原子替换，不受影响。
+func writeConfigFile(path string, out []byte) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	if err := os.Rename(tmp, path); err == nil {
+		return nil
+	} else if !isCrossDeviceOrBusy(err) {
+		return fmt.Errorf("replace config: %w", err)
+	}
+	// 挂载点：rename 不可用，原地覆盖（清掉刚写的 tmp）。
+	if err := os.WriteFile(path, out, 0o600); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("write config in place (bind mount): %w", err)
+	}
+	os.Remove(tmp)
+	return nil
+}
+
+// isCrossDeviceOrBusy rename 失败的「换个写法还能救」判定：挂载点返回 EBUSY
+// （Linux），跨设备返回 EXDEV（不同文件系统）。
+func isCrossDeviceOrBusy(err error) bool {
+	return errors.Is(err, syscall.EBUSY) || errors.Is(err, syscall.EXDEV)
 }
