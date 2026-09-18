@@ -54,6 +54,11 @@ type Config struct {
 	// ApplyConfig 闭包完成热生效（池参数/排程/密钥/脱敏）。error 时配置不写盘。
 	SaveConfig func(raw []byte) (restartRequired []string, err error)
 
+	// Restart 触发进程重启（nil = 重启接口 501）。main 注入：先应答再优雅
+	// 退出，容器 restart 策略（unless-stopped）负责拉起——等效重启，且不
+	// 需要挂载 docker.sock（无容器逃逸面）。
+	Restart func()
+
 	// StickyCount 返回粘性会话绑定数；nil 时报告 0。
 	StickyCount func() int
 
@@ -178,6 +183,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
 	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
+	p.mux.HandleFunc("POST /panel/api/restart", p.withAuth(p.restart))
 	p.mux.HandleFunc("GET /panel/api/ledger", p.withAuth(p.ledgerHandler))
 	p.mux.HandleFunc("GET /panel/api/ledger/summary", p.withAuth(p.ledgerSummary))
 	p.mux.HandleFunc("GET /panel/api/members", p.withAuth(p.membersList))
@@ -736,4 +742,19 @@ func (p *Panel) memberRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("panel: member removed id=%s", r.PathValue("id"))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// restart 一键重启：先应答客户端，再触发进程优雅退出（容器 restart 策略拉起）。
+// 延迟 800ms 触发是为了让 HTTP 响应先写完——客户端据此显示"重启中"并轮询恢复。
+func (p *Panel) restart(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Restart == nil {
+		writeErr(w, http.StatusNotImplemented, "restart not available")
+		return
+	}
+	log.Printf("panel: 收到一键重启请求，进程将在 0.8s 后优雅退出（由容器策略拉起）")
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "重启已触发，约 5-15 秒后自动恢复"})
+	go func() {
+		time.Sleep(800 * time.Millisecond)
+		p.cfg.Restart()
+	}()
 }

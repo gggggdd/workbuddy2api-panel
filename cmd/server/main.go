@@ -235,6 +235,10 @@ func main() {
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
 
+	// stop 前置声明：panel 的 Restart 闭包需要引用（实际赋值在下文
+	// signal.NotifyContext 处）。nil 保护：极端时序下未赋值时直接退出进程。
+	var stop func()
+
 	// chatHandler 前置声明：panel 的 SaveConfig 闭包要拿到 handler 以热应用
 	// server.max_body_mb，而 handler 的 Config.Panel 又依赖 pn——装配循环用
 	// 变量前置 + saveConfig 内 nil 保护解开（SaveConfig 只在请求期被调，彼时
@@ -263,6 +267,16 @@ func main() {
 		SaveConfig: func(raw []byte) ([]string, error) {
 			return saveConfig(raw, *cfgPath, live, p, up, sch, chatHandler)
 		},
+		// 一键重启：触发优雅停机（下方 ctx 的 stop），进程退出后由容器
+		// restart 策略（unless-stopped）拉起。stop 在 ctx 定义后才有值，
+		// 用闭包变量延迟捕获。
+		Restart: func() {
+			if stop != nil {
+				stop()
+				return
+			}
+			os.Exit(0) // 兜底：信号未就绪时直接退出（容器策略同样拉起）
+		},
 	})
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
@@ -288,7 +302,8 @@ func main() {
 	})
 	chatHandler = h
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	stop = stopSig
 	defer stop()
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)

@@ -1716,3 +1716,36 @@ function fmtCredit(v) {
   const n = Number(v || 0);
   return (Math.round(n * 100) / 100).toFixed(2);
 }
+
+/* ── 一键重启（fork 特性）──────────────────────────────────────────── */
+async function doRestart() {
+  if (!confirm('确认重启网关进程？\n\n将优雅退出后由容器策略自动拉起，期间服务中断约 5-15 秒。\n正在进行的流式对话会被中断。')) return;
+  const b = $('btnRestart');
+  b.disabled = true; b.textContent = '重启中…';
+  try {
+    await api('restart', { method: 'POST' });
+    toast('重启已触发，等待恢复…', 'ok');
+    // 轮询健康：容器重启期间请求会失败，恢复后自动刷新状态
+    let tries = 0;
+    const timer = setInterval(async () => {
+      tries++;
+      try {
+        await api('overview');
+        clearInterval(timer);
+        b.disabled = false; b.textContent = '重启';
+        toast('网关已恢复', 'ok');
+        loadOverview(true); loadUsage(true);
+      } catch (e) {
+        if (tries > 60) { // 最长等 90s（1.5s 间隔）
+          clearInterval(timer);
+          b.disabled = false; b.textContent = '重启';
+          toast('等待超时，请检查容器状态', 'err');
+        }
+      }
+    }, 1500);
+  } catch (e) {
+    b.disabled = false; b.textContent = '重启';
+    toast('重启失败：' + e.message, 'err');
+  }
+}
+$('btnRestart').onclick = doRestart;
