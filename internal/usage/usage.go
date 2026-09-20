@@ -1,295 +1,541 @@
-// Package usage 定期采样各账号的上游计费用量（used 计数），提供固定时间窗口内
-// 的「积分总使用量」观测，供面板看板展示。
+// Package usage 记录并聚合逐请求 token 用量，供面板「用量」视图展示。
 //
-// 为什么用上游 used 而不是累加每次请求的 usage.credit：
-//   - used 是账单口径（used + remain = size），涵盖全部消耗来源——包括网关
-//     定时任务（夜猫子等）与任何非 /v1/chat/completions 路径的花费；
-//   - 逐请求累加只能覆盖经过网关的请求，且进程重启即丢失；
-//   - used 单调递增，因此跨重启仍然有效（历史样本不因重启失效）。
+// 与 internal/pool 的 TokenUsage 的区别：
+//   - pool 的 TokenUsage 是**每账号一个累计计数器**，只保留总量与「最近一次」，
+//     没有时间维度，也无法按模型/时间下钻；
+//   - 本包按 (时间片, realm, uid, model) 分桶累计，因此可以出「今天各模型各用了多少」
+//     「这一小时 prompt 涨得多快」这类问题，且能长期保留。
 //
-// 已知粒度限制：上游计费有分钟级延迟，used 为整数分，故窗口值存在 ±数分的
-// 采样误差；不适用于逐请求的精确计费。
+// 保留策略（分片粒度自动降级，总量因此有界）：
+//   - 近 hourlyKeep 小时内：小时桶（细粒度，看尖峰）
+//   - 更早：折叠为日桶，**永久保留**（看长期趋势）
+//
+// 落盘：data/usage.json，原子替换 + 防抖刷新（默认 30s），重启不丢。
+// 桶数上界 ≈ 账号数 × 模型数 × (hourlyKeep + 已过天数)，实测单桶约 90 字节。
 package usage
 
 import (
-	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
-
-	"workbuddy2api/internal/pool"
-	"workbuddy2api/internal/upstream"
 )
 
+// hourlyKeep 小时桶的保留时长；超出后折叠为日桶。
+const hourlyKeep = 90 * 24 * time.Hour
+
+// flushInterval 防抖落盘间隔。
+const flushInterval = 30 * time.Second
+
+// maxBuckets 桶数硬上限。超过时立即触发一次折叠，避免异常流量把内存/文件撑爆。
+const maxBuckets = 400_000
+
+// hourLayout / dayLayout 分片键的时间格式（本地时区，与用户直觉一致）。
 const (
-	// SampleInterval 采样周期。上游计费计数分钟级延迟，5 分钟足够，
-	// 且请求量可忽略（每账号每 5 分钟一次余额查询）。
-	SampleInterval = 5 * time.Minute
-	// retain 样本保留时长：覆盖 24h 窗口并留冗余。
-	retain = 48 * time.Hour
-	// maxSamples 硬上限，防止异常配置下无限增长。
-	maxSamples = 2000
+	hourLayout = "2006-01-02T15"
+	dayLayout  = "2006-01-02"
 )
 
-// sample 单次采样：uid → 该账号的 used 累计值。
-type sample struct {
-	T        int64            `json:"t"`        // Unix 秒
-	Accounts map[string]int64 `json:"accounts"` // uid → used
+// bucket 一个 (时间片, realm, uid, model) 的累计量。
+// JSON 字段名刻意取短，因为桶数量会随时间增长。
+type bucket struct {
+	Scope string  `json:"s"` // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm string  `json:"r"`
+	UID   string  `json:"u"`
+	Model string  `json:"m"`
+	Req   int64   `json:"q"`  // 请求数（含失败）
+	Err   int64   `json:"e"`  // 失败数
+	PT    int64   `json:"p"`  // prompt tokens
+	CT    int64   `json:"c"`  // completion tokens
+	TT    int64   `json:"t"`  // total tokens（上游给什么用什么的合计）
+	LatMs int64   `json:"l"`  // 延迟累计（ms）
+	LatN  int64   `json:"ln"` // 延迟样本数
+	TPS   float64 `json:"v"`  // 吐字速率累计
+	TPSN  int64   `json:"vn"` // 速率样本数
 }
 
-// Window 一个时间窗口内的使用量统计。
-type Window struct {
-	Used     int64   `json:"used"`      // 窗口内消耗合计
-	Seconds  int64   `json:"seconds"`   // 实际覆盖时长
-	Complete bool    `json:"complete"`  // true = 有覆盖整个窗口的样本；false = 历史不足
-	PerHour  float64 `json:"per_hour"`  // 平均每小时消耗
-	Since    string  `json:"since"`     // 基准样本时刻（RFC3339）
-	Accounts int     `json:"accounts"`  // 参与统计的账号数
+// file 落盘结构。
+type file struct {
+	Version int      `json:"version"`
+	Saved   string   `json:"saved"`
+	Buckets []bucket `json:"buckets"`
 }
 
-// Stats 看板数据。
-type Stats struct {
-	UpdatedAt time.Time `json:"updated_at"` // 最近一次采样时刻
-	Samples   int       `json:"samples"`    // 当前保留的样本数
-	Oldest    string    `json:"oldest"`     // 最老样本时刻（RFC3339）
-	TotalUsed int64     `json:"total_used"` // 各账号 used 合计（账单累计值）
-	Window5h  *Window   `json:"window_5h"`
-	Window24h *Window   `json:"window_24h"`
-}
-
-// Tracker 采样器：周期查询各账号 used 并留存样本序列。
-type Tracker struct {
-	pool     *pool.Pool
-	upstream *upstream.Client
-	path     string
-
+// Recorder 并发安全的用量记录器。
+type Recorder struct {
 	mu      sync.Mutex
-	samples []sample
-	lastErr string
+	path    string
+	buckets map[string]*bucket // key: scope|realm|uid|model
+	dirty   bool
+	started time.Time
+
+	stopOnce sync.Once
+	stop     chan struct{}
+	done     chan struct{}
 }
 
-// New 构建采样器。path 为空表示不持久化（仅内存）。
-func New(p *pool.Pool, up *upstream.Client, path string) *Tracker {
-	t := &Tracker{pool: p, upstream: up, path: path}
-	t.load()
-	return t
+// New 创建记录器。path 为空时禁用落盘（纯内存，测试用）。
+func New(path string) *Recorder {
+	r := &Recorder{
+		path:    path,
+		buckets: make(map[string]*bucket),
+		started: time.Now(),
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	if path != "" {
+		if err := r.load(); err != nil {
+			log.Printf("[usage] 读取 %s 失败（从零开始）: %v", path, err)
+		}
+	}
+	return r
 }
 
-// load 从磁盘恢复样本（损坏或不存在时静默从头开始）。
-func (t *Tracker) load() {
-	if t.path == "" {
+// Start 启动后台防抖落盘与折叠。Stop 前一直运行。
+func (r *Recorder) Start() {
+	go func() {
+		defer close(r.done)
+		t := time.NewTicker(flushInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-r.stop:
+				r.flush(true)
+				return
+			case <-t.C:
+				r.mu.Lock()
+				n := len(r.buckets)
+				r.mu.Unlock()
+				if n > maxBuckets {
+					r.Rollup(time.Now())
+				}
+				r.flush(false)
+			}
+		}
+	}()
+}
+
+// Stop 停止后台循环并做最后一次落盘。
+func (r *Recorder) Stop() {
+	r.stopOnce.Do(func() { close(r.stop) })
+	<-r.done
+}
+
+// Delta 一次请求尝试的用量增量（与 pool.TokenUsageDelta 同形，避免包间依赖）。
+type Delta struct {
+	PromptTokens     int64
+	HasPromptTokens  bool
+	CompletionTokens int64
+	HasCompletion    bool
+	TotalTokens      int64
+	HasTotal         bool
+	LatencyMs        int64
+	HasLatency       bool
+	TokensPerSecond  float64
+	HasTPS           bool
+}
+
+// Add 记录一次请求尝试。
+//
+// ok=false 表示该次尝试失败（传输错误 / 上游 >=400 / 解析失败）。失败尝试通常
+// 没有 usage，但**仍要计入请求数与失败数**——重试放大正是靠这一列才看得出来。
+func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool) {
+	if r == nil {
 		return
 	}
-	raw, err := os.ReadFile(t.path)
+	if realm == "" {
+		realm = "cn"
+	}
+	if model == "" {
+		model = "(unknown)"
+	}
+	scope := "h:" + now.Format(hourLayout)
+	key := scope + "|" + realm + "|" + uid + "|" + model
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	b := r.buckets[key]
+	if b == nil {
+		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model}
+		r.buckets[key] = b
+	}
+	b.Req++
+	if !ok {
+		b.Err++
+	}
+	if d.HasPromptTokens {
+		b.PT += d.PromptTokens
+	}
+	if d.HasCompletion {
+		b.CT += d.CompletionTokens
+	}
+	if d.HasTotal {
+		b.TT += d.TotalTokens
+	} else if d.HasPromptTokens || d.HasCompletion {
+		// 上游没给 total：用 pt+ct 兜底，保证总量口径连续。
+		b.TT += d.PromptTokens + d.CompletionTokens
+	}
+	if d.HasLatency {
+		b.LatMs += d.LatencyMs
+		b.LatN++
+	}
+	if d.HasTPS {
+		b.TPS += d.TokensPerSecond
+		b.TPSN++
+	}
+	r.dirty = true
+}
+
+// Rollup 把超出 hourlyKeep 的小时桶折叠为日桶（按本地日历日）。
+// 幂等：同一小时反复折叠不会重复计数（先累加再删源桶）。
+func (r *Recorder) Rollup(now time.Time) {
+	if r == nil {
+		return
+	}
+	cutoff := now.Add(-hourlyKeep)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	type move struct{ from, to string }
+	var moves []move
+	for k, b := range r.buckets {
+		if !strings.HasPrefix(b.Scope, "h:") {
+			continue
+		}
+		ts, err := time.ParseInLocation(hourLayout, strings.TrimPrefix(b.Scope, "h:"), time.Local)
+		if err != nil || !ts.Before(cutoff) {
+			continue
+		}
+		day := "d:" + ts.Format(dayLayout)
+		moves = append(moves, move{from: k, to: day + "|" + b.Realm + "|" + b.UID + "|" + b.Model})
+	}
+	for _, m := range moves {
+		src := r.buckets[m.from]
+		if src == nil {
+			continue
+		}
+		dst := r.buckets[m.to]
+		if dst == nil {
+			cp := *src
+			cp.Scope = strings.SplitN(m.to, "|", 2)[0]
+			dst = &cp
+			r.buckets[m.to] = dst
+		} else {
+			dst.Req += src.Req
+			dst.Err += src.Err
+			dst.PT += src.PT
+			dst.CT += src.CT
+			dst.TT += src.TT
+			dst.LatMs += src.LatMs
+			dst.LatN += src.LatN
+			dst.TPS += src.TPS
+			dst.TPSN += src.TPSN
+		}
+		delete(r.buckets, m.from)
+	}
+	if len(moves) > 0 {
+		r.dirty = true
+		log.Printf("[usage] 折叠 %d 个小时桶为日桶（保留 %v 细粒度）", len(moves), hourlyKeep)
+	}
+}
+
+// ---------------------------------------------------------------- 持久化 ----
+
+func (r *Recorder) load() error {
+	raw, err := os.ReadFile(r.path)
 	if err != nil {
-		return
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
-	var samples []sample
-	if json.Unmarshal(raw, &samples) != nil {
-		return
+	var f file
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return err
 	}
-	t.samples = trim(samples, time.Now())
+	for i := range f.Buckets {
+		b := f.Buckets[i]
+		r.buckets[b.Scope+"|"+b.Realm+"|"+b.UID+"|"+b.Model] = &b
+	}
+	log.Printf("[usage] 已恢复 %d 个用量桶（%s）", len(r.buckets), r.path)
+	return nil
 }
 
-// save 原子落盘（tmp + rename）；失败只记日志，不影响采样主流程。
-func (t *Tracker) save() {
-	if t.path == "" {
+func (r *Recorder) flush(force bool) {
+	if r == nil || r.path == "" {
 		return
 	}
-	raw, err := json.Marshal(t.samples)
+	r.mu.Lock()
+	if !r.dirty && !force {
+		r.mu.Unlock()
+		return
+	}
+	snap := file{Version: 1, Saved: time.Now().Format(time.RFC3339), Buckets: make([]bucket, 0, len(r.buckets))}
+	for _, b := range r.buckets {
+		snap.Buckets = append(snap.Buckets, *b)
+	}
+	r.dirty = false
+	r.mu.Unlock()
+
+	raw, err := json.Marshal(snap)
 	if err != nil {
+		log.Printf("[usage] 序列化失败: %v", err)
 		return
 	}
-	tmp := t.path + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(r.path), 0o755); err != nil {
+		log.Printf("[usage] 建目录失败: %v", err)
+		return
+	}
+	tmp := r.path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		log.Printf("usage: 落盘失败 %v", err)
+		log.Printf("[usage] 写临时文件失败: %v", err)
 		return
 	}
-	if err := os.Rename(tmp, t.path); err != nil {
-		log.Printf("usage: 替换失败 %v", err)
+	if err := os.Rename(tmp, r.path); err != nil {
+		log.Printf("[usage] 原子替换失败: %v", err)
 	}
 }
 
-// trim 丢弃超出保留期的样本与超出硬上限的最老样本。
-func trim(samples []sample, now time.Time) []sample {
-	cut := now.Add(-retain).Unix()
-	out := samples[:0]
-	for _, s := range samples {
-		if s.T >= cut {
-			out = append(out, s)
-		}
-	}
-	if len(out) > maxSamples {
-		out = out[len(out)-maxSamples:]
-	}
-	return out
+// Save 立即落盘（面板「刷新」或关闭前调用）。
+func (r *Recorder) Save() { r.flush(true) }
+
+// ---------------------------------------------------------------- 聚合 ----
+
+// Agg 一组累计量。
+type Agg struct {
+	Requests      int64   `json:"requests"`
+	Errors        int64   `json:"errors"`
+	PromptTokens  int64   `json:"prompt_tokens"`
+	CompletionTok int64   `json:"completion_tokens"`
+	TotalTokens   int64   `json:"total_tokens"`
+	AvgLatencyMs  float64 `json:"avg_latency_ms"`
+	AvgTPS        float64 `json:"avg_tokens_per_second"`
 }
 
-// Start 启动周期采样循环（阻塞直到 ctx 取消）。启动时立即采一次，
-// 让看板在进程起来后很快就有基线。
-func (t *Tracker) Start(ctx context.Context) {
-	t.SampleNow()
-	ticker := time.NewTicker(SampleInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			t.SampleNow()
-		}
-	}
+// aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
+// 正确加权（不能对每桶的均值再取平均），所以样本数留在这里。
+type aggAcc struct {
+	Agg
+	latSum     int64
+	latSamples int64
+	tpsSum     float64
+	tpsSamples int64
 }
 
-// SampleNow 执行一轮采样：查询所有非禁用账号的 used，合并进样本序列。
-//
-// 查询失败的账号沿用上一次的已知值（而不是从样本中缺失）——缺失会让窗口内的
-// 消耗被静默漏算；沿用则把误差限制在「该账号这段时间的增量」上。
-// 全部账号都失败时不追加样本（避免写出一条全零的假样本）。
-func (t *Tracker) SampleNow() {
-	t.mu.Lock()
-	prev := map[string]int64{}
-	if n := len(t.samples); n > 0 {
-		for k, v := range t.samples[n-1].Accounts {
-			prev[k] = v
-		}
-	}
-	t.mu.Unlock()
-
-	cur := map[string]int64{}
-	fresh := 0
-	var firstErr error
-	for _, st := range t.pool.List() {
-		if st.Disabled {
-			continue
-		}
-		a := t.pool.AuthByUID(st.UID)
-		if a == nil {
-			continue
-		}
-		u, err := t.upstream.UserResourceDetail(a)
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			if v, ok := prev[st.UID]; ok {
-				cur[st.UID] = v // 沿用上次已知值
-			}
-			continue
-		}
-		cur[st.UID] = u.Used
-		fresh++
-	}
-
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if fresh == 0 {
-		if firstErr != nil {
-			t.lastErr = firstErr.Error()
-		}
-		return // 无任何成功查询：不追加样本
-	}
-	t.lastErr = ""
-	t.samples = append(t.samples, sample{T: time.Now().Unix(), Accounts: cur})
-	t.samples = trim(t.samples, time.Now())
-	t.save()
+func (g *aggAcc) add(b *bucket) {
+	g.Requests += b.Req
+	g.Errors += b.Err
+	g.PromptTokens += b.PT
+	g.CompletionTok += b.CT
+	g.TotalTokens += b.TT
+	g.latSum += b.LatMs
+	g.latSamples += b.LatN
+	g.tpsSum += b.TPS
+	g.tpsSamples += b.TPSN
 }
 
-// Stats 返回当前看板数据（基于已保留的样本，不触发上游查询）。
-func (t *Tracker) Stats() Stats {
-	t.mu.Lock()
-	samples := make([]sample, len(t.samples))
-	copy(samples, t.samples)
-	errMsg := t.lastErr
-	t.mu.Unlock()
-
-	out := Stats{Samples: len(samples)}
-	if len(samples) == 0 {
-		if errMsg != "" {
-			out.Oldest = "采样失败：" + errMsg
-		}
-		return out
+func (g *aggAcc) finish() Agg {
+	a := g.Agg
+	if g.latSamples > 0 {
+		a.AvgLatencyMs = float64(g.latSum) / float64(g.latSamples)
 	}
-	latest := samples[len(samples)-1]
-	out.UpdatedAt = time.Unix(latest.T, 0)
-	out.Oldest = time.Unix(samples[0].T, 0).Format(time.RFC3339)
-	for _, v := range latest.Accounts {
-		out.TotalUsed += v
+	if g.tpsSamples > 0 {
+		a.AvgTPS = g.tpsSum / float64(g.tpsSamples)
 	}
-	out.Window5h = window(samples, 5*time.Hour)
-	out.Window24h = window(samples, 24*time.Hour)
-	return out
+	return a
 }
 
-// window 计算最近 d 时长内的消耗：对每个账号，用「当前值 − 该账号在窗口起点的值」，
-// 逐账号求和。逐账号比对而非直接比总量，是为了让窗口内新增/移除账号不会
-// 制造虚假消耗（新账号没有基线 → 跳过；移除的账号不再出现在当前样本 → 计 0）。
-//
-// 负数增量（套餐周期重置导致 used 归零）钳为 0：宁可少算，不虚报。
-func window(samples []sample, d time.Duration) *Window {
-	latest := samples[len(samples)-1]
-	cutoff := latest.T - int64(d.Seconds())
+// KeyedAgg 按某个维度聚合的一行。
+type KeyedAgg struct {
+	Key   string `json:"key"`
+	Realm string `json:"realm,omitempty"`
+	Extra string `json:"extra,omitempty"` // 账号行放昵称
+	Agg
+}
 
-	w := &Window{}
-	var used int64
-	accounts := 0
-	for uid, cur := range latest.Accounts {
-		// 找该账号在 cutoff 之前最近的一个样本作基线；没有则用它最早出现的样本。
-		var base int64
-		var found bool
-		for _, s := range samples {
-			v, ok := s.Accounts[uid]
-			if !ok {
+// Point 时序上的一个点。
+type Point struct {
+	T     string `json:"t"`
+	Scope string `json:"scope"` // "hour" | "day"
+	Agg
+}
+
+// Snapshot 面板一次拉取的全部用量视图数据。
+type Snapshot struct {
+	Totals    Agg        `json:"totals"`
+	ByRealm   []KeyedAgg `json:"by_realm"`
+	ByAccount []KeyedAgg `json:"by_account"`
+	ByModel   []KeyedAgg `json:"by_model"`
+	Series    []Point    `json:"series"`
+	Buckets   int        `json:"buckets"`
+	FileBytes int64      `json:"file_bytes"`
+	Since     string     `json:"since,omitempty"`
+	Generated string     `json:"generated"`
+}
+
+// Snapshot 聚合当前全部桶。hours 控制时序返回多少个小时点（其余按日折叠）。
+// nicks 是 uid→昵称映射，仅用于展示。
+func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
+	if r == nil {
+		return Snapshot{Generated: time.Now().Format(time.RFC3339)}
+	}
+	if hours <= 0 || hours > 24*60 {
+		hours = 72
+	}
+
+	r.mu.Lock()
+	bs := make([]bucket, 0, len(r.buckets))
+	for _, b := range r.buckets {
+		bs = append(bs, *b)
+	}
+	r.mu.Unlock()
+
+	var total aggAcc
+	realmAgg := map[string]*aggAcc{}
+	acctAgg := map[string]*aggAcc{}
+	acctRealm := map[string]string{}
+	modelAgg := map[string]*aggAcc{}
+	hourSeries := map[string]*aggAcc{}
+	daySeries := map[string]*aggAcc{}
+
+	nowHour := time.Now().Truncate(time.Hour)
+	hourFrom := nowHour.Add(-time.Duration(hours-1) * time.Hour)
+
+	for i := range bs {
+		b := &bs[i]
+		total.add(b)
+
+		if realmAgg[b.Realm] == nil {
+			realmAgg[b.Realm] = &aggAcc{}
+		}
+		realmAgg[b.Realm].add(b)
+
+		if acctAgg[b.UID] == nil {
+			acctAgg[b.UID] = &aggAcc{}
+		}
+		acctAgg[b.UID].add(b)
+		// 一个账号只属于一个 realm，这里记下来供前端展示「域」列；
+		// keyed() 的 Realm 字段默认是空的（它按 key 分组，不知道 realm）。
+		if acctRealm[b.UID] == "" {
+			acctRealm[b.UID] = b.Realm
+		}
+
+		if modelAgg[b.Model] == nil {
+			modelAgg[b.Model] = &aggAcc{}
+		}
+		modelAgg[b.Model].add(b)
+
+		scope := strings.TrimPrefix(b.Scope, "h:")
+		isHour := strings.HasPrefix(b.Scope, "h:")
+		if isHour {
+			ts, err := time.ParseInLocation(hourLayout, scope, time.Local)
+			if err != nil {
 				continue
 			}
-			if !found {
-				base, found = v, true // 兜底：该账号最早可见值
+			if !ts.Before(hourFrom) {
+				if hourSeries[scope] == nil {
+					hourSeries[scope] = &aggAcc{}
+				}
+				hourSeries[scope].add(b)
+			} else {
+				// 超出小时窗口的细粒度数据并入其所在日，避免时序出现空洞。
+				d := ts.Format(dayLayout)
+				if daySeries[d] == nil {
+					daySeries[d] = &aggAcc{}
+				}
+				daySeries[d].add(b)
 			}
-			if s.T <= cutoff {
-				base = v // 覆盖为窗口起点之前的最新值
+		} else {
+			if daySeries[scope] == nil {
+				daySeries[scope] = &aggAcc{}
 			}
+			daySeries[scope].add(b)
 		}
-		if !found {
-			continue
-		}
-		if delta := cur - base; delta > 0 {
-			used += delta
-		}
-		accounts++
 	}
 
-	w.Used = used
-	w.Accounts = accounts
+	snap := Snapshot{
+		Totals:  total.finish(),
+		ByRealm: keyed(realmAgg, func(k string) (string, string) { return k, "" }),
+		ByAccount: keyed(acctAgg, func(k string) (string, string) {
+			return k, nicks[k]
+		}),
+		ByModel:   keyed(modelAgg, func(k string) (string, string) { return k, "" }),
+		Buckets:   len(bs),
+		Generated: time.Now().Format(time.RFC3339),
+	}
+	for i := range snap.ByAccount {
+		snap.ByAccount[i].Realm = acctRealm[snap.ByAccount[i].Key]
+	}
 
-	// 覆盖时长与完整性：以最老样本为界。
-	span := latest.T - samples[0].T
-	if span > int64(d.Seconds()) {
-		span = int64(d.Seconds())
+	// 日点（升序）+ 小时点（升序）拼成一条连续时序。
+	dayKeys := make([]string, 0, len(daySeries))
+	for k := range daySeries {
+		dayKeys = append(dayKeys, k)
 	}
-	if span < 0 {
-		span = 0
+	sort.Strings(dayKeys)
+	for _, k := range dayKeys {
+		snap.Series = append(snap.Series, Point{T: k, Scope: "day", Agg: daySeries[k].finish()})
 	}
-	w.Seconds = span
-	w.Complete = samples[0].T <= cutoff
-	if !w.Complete {
-		w.Since = time.Unix(samples[0].T, 0).Format(time.RFC3339)
-	} else {
-		w.Since = time.Unix(cutoff, 0).Format(time.RFC3339)
+	hourKeys := make([]string, 0, len(hourSeries))
+	for k := range hourSeries {
+		hourKeys = append(hourKeys, k)
 	}
-	if w.Seconds > 0 {
-		w.PerHour = float64(used) / (float64(w.Seconds) / 3600)
+	sort.Strings(hourKeys)
+	for _, k := range hourKeys {
+		snap.Series = append(snap.Series, Point{T: k, Scope: "hour", Agg: hourSeries[k].finish()})
 	}
-	return w
+
+	if r.path != "" {
+		if fi, err := os.Stat(r.path); err == nil {
+			snap.FileBytes = fi.Size()
+		}
+	}
+	// 最早的分片即数据起点。
+	if len(snap.Series) > 0 {
+		snap.Since = snap.Series[0].T
+	}
+	return snap
 }
 
-// DefaultPath 由状态文件路径推导采样文件路径（同目录 usage.json）。
-// state_file 为空时回落 ./data/usage.json。
-func DefaultPath(stateFile string) string {
-	if stateFile == "" {
-		return filepath.Join("data", "usage.json")
+func keyed(m map[string]*aggAcc, label func(string) (string, string)) []KeyedAgg {
+	out := make([]KeyedAgg, 0, len(m))
+	for k, v := range m {
+		key, extra := label(k)
+		out = append(out, KeyedAgg{Key: key, Extra: extra, Agg: v.finish()})
 	}
-	return filepath.Join(filepath.Dir(stateFile), "usage.json")
+	// 按总量降序；同量按 key 升序，保证输出稳定（前端 diff 不抖）。
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TotalTokens != out[j].TotalTokens {
+			return out[i].TotalTokens > out[j].TotalTokens
+		}
+		if out[i].Requests != out[j].Requests {
+			return out[i].Requests > out[j].Requests
+		}
+		return out[i].Key < out[j].Key
+	})
+	return out
+}
+
+// Describe 返回一行人类可读的占用摘要（启动日志用）。
+func (r *Recorder) Describe() string {
+	if r == nil {
+		return "disabled"
+	}
+	r.mu.Lock()
+	n := len(r.buckets)
+	r.mu.Unlock()
+	var sz int64
+	if r.path != "" {
+		if fi, err := os.Stat(r.path); err == nil {
+			sz = fi.Size()
+		}
+	}
+	return fmt.Sprintf("%d buckets, file %d bytes", n, sz)
 }

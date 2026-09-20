@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -78,21 +79,17 @@ func main() {
 		}
 
 		err = up.DailyCheckin(a)
-		switch {
-		case err == nil:
-			r.status = "OK"
+		// DailyCheckin 重复调用返回 code!=0（已签到）——归 ALREADY 而非 FAIL。
+		r.status = checkinStatusOf(err)
+		switch r.status {
+		case "OK":
 			okN++
+		case "ALREADY":
+			r.detail = short(err.Error())
+			alreadyN++
 		default:
-			// DailyCheckin 已签到返回 code!=0 错误
-			if isAlready(err.Error()) {
-				r.status = "ALREADY"
-				r.detail = short(err.Error())
-				alreadyN++
-			} else {
-				r.status = "FAIL"
-				r.detail = short(err.Error())
-				failN++
-			}
+			r.detail = short(err.Error())
+			failN++
 		}
 		// 顺手查余额
 		if remain, _, qerr := up.UserResource(a); qerr == nil {
@@ -115,13 +112,50 @@ func main() {
 	fmt.Printf("\ntotal=%d ok=%d already=%d fail=%d\n", len(rows), okN, alreadyN, failN)
 }
 
-// 已签判定：code 非 0 且含 "已签到"/"already"/"checkin" 等字样
-func isAlready(msg string) bool {
-	s := strings.ToLower(msg)
-	return strings.Contains(s, "已签到") ||
-		strings.Contains(s, "already") ||
-		strings.Contains(s, "checkin") ||
-		strings.Contains(s, "code=400")
+// checkinStatusOf 把签到结果 error 映射为状态字：OK / ALREADY / FAIL。
+//
+// 抽成纯函数便于单测（不依赖网络与账号），调用点只负责计数与详情。
+func checkinStatusOf(err error) string {
+	switch {
+	case err == nil:
+		return "OK"
+	case isAlready(err):
+		return "ALREADY"
+	default:
+		return "FAIL"
+	}
+}
+
+// 已签判定：把「今天已签到 / 活动未开启 / 已过期 / session inactive」这类
+// 幂等或不适用情形与真实失败区分开——global 账号多数没有签到体系，混判 FAIL
+// 会让手跑 signin 时成片标红，掩盖真实故障。
+//
+// 分两层，因为英文短词区分度低：
+//   - 业务 *upstream.Error（Msg 来自上游 JSON）：「已签到/已过期/功能未开启」
+//     中文关键词 + 「already/inactive/checkin」英文短词全参与匹配。
+//   - 裸 error（网络/代理/TLS 文本）：只认「已签到」这类中文关键词，不认英文
+//     短词——"bind: address already in use" 是 TCP 绑定失败的常见文本，若判成
+//     已签到会在停机补签时把真实故障咽掉。
+func isAlready(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "已签到") || strings.Contains(s, "已过期") ||
+		strings.Contains(s, "功能未开启") || strings.Contains(s, "未开启") {
+		return true
+	}
+	var ue *upstream.Error
+	if errors.As(err, &ue) {
+		// 业务错误：英文短词才是有效信号。
+		return strings.Contains(s, "already") ||
+			strings.Contains(s, "inactive") ||
+			strings.Contains(s, "checkin") ||
+			strings.Contains(s, "code=10001") ||
+			strings.Contains(s, "code=14001") ||
+			strings.Contains(s, "code=20003")
+	}
+	return false
 }
 
 func trunc(s string, n int) string {

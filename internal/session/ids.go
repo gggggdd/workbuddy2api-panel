@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
-	"sync"
 )
 
 // ResolveConversationID 从请求体提取会话头族的 conversationId（snake/camel 双形态，
@@ -57,13 +56,15 @@ func NewMessageID() string {
 	return fmt.Sprintf("%016x%016x", uint64(rand.Uint64())|1, rand.Uint64())
 }
 
-// requestIDs 会话键（sticky key）→ conversationRequestID 的进程内惰性缓存。
-// sync.Map：并发无锁读/写，Entry 不删除（会话 key 恒定，值只增不减，不泄漏——
-// key 与粘性会话键同源，进程生命周期内数量有限）。
-var requestIDs sync.Map
+// deriveSalt 进程启动随机盐：对所有稳定聚合 ID 的纯派生统一加盐，使派生值无法
+// 按外部可控的键内容（会话键/轮级键）被预计算；重启换新（重启时旧对话轮/会话已
+// 结束，不构成断档）。会话级（RequestIDForKey）与轮级（TurnRequestID）共用同一盐。
+var deriveSalt = NewMessageID()
 
-// RequestIDForKey 返回会话键的稳定 conversationRequestID：
-//   - 同 key：首次调用生成并缓存，此后恒返回同值（一次 user send/同会话多轮聚合）；
+// RequestIDForKey 返回会话键的稳定 conversationRequestID：sha256(盐|键) 前 16 字节
+// 的 hex，纯派生（无缓存、无 TTL、内存不随键数增长——此前 sync.Map 惰性缓存随
+// 会话键数量无上限增长，纯派生天然有界）。
+//   - 同 key：进程内恒派生同值（一次 user send/同会话多轮聚合）；
 //   - 异 key：各自独立，互不相同；
 //   - 空 key：每次生成新值（无会话则无"会话内稳定"语义——调用方应在请求级
 //     捕获复用，handler 在轮转循环外取一次即天然共享）。
@@ -73,17 +74,9 @@ func RequestIDForKey(key string) string {
 	if key == "" {
 		return NewMessageID()
 	}
-	if v, ok := requestIDs.Load(key); ok {
-		return v.(string)
-	}
-	id := NewMessageID()
-	actual, _ := requestIDs.LoadOrStore(key, id)
-	return actual.(string)
+	sum := sha256.Sum256([]byte(deriveSalt + "|" + key))
+	return hex.EncodeToString(sum[:16])
 }
-
-// turnSalt 轮级聚合键的派生盐：进程启动时随机生成，让派生 ID 无法按消息内容
-// 被外部预计算；重启换新（重启时旧对话轮已结束，不构成断档）。
-var turnSalt = NewMessageID()
 
 // TurnKey 派生「对话轮级」聚合键：body 里**最后一条** role=="user" 消息的
 // 「序号 + 文本」。
@@ -119,13 +112,13 @@ func TurnKey(body []byte) string {
 		if obj.Messages[i].Role != "user" {
 			continue
 		}
-		text := contentText(obj.Messages[i].Content)
-		if text == "" {
-			// 最后一条 user 消息没有文本（纯图片等）→ 本轮不建立聚合键。
+		sig := contentSignature(obj.Messages[i].Content)
+		if sig == "" {
+			// 最后一条 user 消息没有可签名内容（空/null/空 parts）→ 本轮不建立聚合键。
 			// 不继续往前找：整轮内该消息位置恒定，往前找反而会让键随 step 漂移。
 			return ""
 		}
-		return fmt.Sprintf("u%d:%s", i, text)
+		return fmt.Sprintf("u%d:%s", i, sig)
 	}
 	return ""
 }
@@ -160,6 +153,66 @@ func contentText(raw json.RawMessage) string {
 	return ""
 }
 
+// contentSignature 取消息 content 的确定性签名（G1 修复——纯图片轮不再碎片化）：
+//   - string 形态：返回文本，与 contentText 结果**完全一致**——纯文本路径键值
+//     不变，存量会话的轮键/粘性键零漂移（向后兼容契约）；
+//   - 数组形态（多模态 parts）：文本 part（type 为 "" 或 "text"，与 contentText
+//     的拼接口径一致）按原文无缝拼接；非文本 part 追加 "[type:摘要]"——摘要取该
+//     part 原始字节的 sha256 前 8 hex。data: base64 内联图可能超长，原文入键会
+//     放大派生哈希压力（见 TurnKey 头注），只入短摘要；type + 原文摘要天然区分
+//     不同内容/数量的非文本 part 集合，无需额外计数占位。
+//
+// 无可签名内容（空 / null / 空数组 / 纯文本 part 全为空串）返回 ""（不伪造——
+// 调用方回落原有的空键语义）。TurnKey 与 firstUserText（粘性兜底）共用本函数，
+// 两条链路的图片盲区一并修复。
+func contentSignature(raw json.RawMessage) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return ""
+	}
+	// 字符串形态：纯文本路径签名 == contentText 结果（键值零漂移）。
+	if s[0] == '"' {
+		var str string
+		if err := json.Unmarshal(raw, &str); err != nil {
+			return ""
+		}
+		return str
+	}
+	if s[0] != '[' {
+		return ""
+	}
+	var parts []json.RawMessage
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	hasNonText := false
+	for _, pr := range parts {
+		var p struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(pr, &p); err != nil {
+			return ""
+		}
+		if p.Type == "" || p.Type == "text" {
+			// 文本 part：无缝拼接（与 contentText 完全同口径——全文本 part 的数组
+			// 签名 == contentText 结果，存量键零漂移）。
+			b.WriteString(p.Text)
+			continue
+		}
+		// 非文本 part：type + 原文 sha256 前 8 hex（超长 data: URL 只入短摘要）。
+		hasNonText = true
+		sum := sha256.Sum256(pr)
+		fmt.Fprintf(&b, "\n[%s:%s]\n", p.Type, hex.EncodeToString(sum[:4]))
+	}
+	out := b.String()
+	if !hasNonText {
+		return out
+	}
+	return strings.TrimSpace(out)
+}
+
 // TurnRequestID 返回轮级键对应的聚合 ID：sha256(盐|键) 前 16 字节的 hex（32 位，
 // 与 NewMessageID 同形态，可直接作 B3 TraceId）。
 //
@@ -171,6 +224,6 @@ func TurnRequestID(turnKey string) string {
 	if turnKey == "" {
 		return NewMessageID()
 	}
-	sum := sha256.Sum256([]byte(turnSalt + "|" + turnKey))
+	sum := sha256.Sum256([]byte(deriveSalt + "|" + turnKey))
 	return hex.EncodeToString(sum[:16])
 }

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"workbuddy2api/internal/logfmt"
 	"workbuddy2api/internal/pool"
 )
 
@@ -24,7 +25,7 @@ var chatLogEnabled = true
 // chatLogOut 聊天表格日志的输出目标。生产默认 os.Stdout；main 在启用管理面板时
 // 经 SetChatLogOutput 注入 MultiWriter，把每行镜像进 /panel/api/logs 的环形缓冲，
 // stdout 行为不变。需在开始服务前调用一次（无并发竞争窗口）。
-var chatLogOut io.Writer // nil = 跟随当前 os.Stdout（测试可在运行期替换 os.Stdout 捕获）
+var chatLogOut io.Writer = os.Stdout
 
 // SetChatLogOutput 替换聊天表格日志输出目标（仅 main 启动期调用一次）。
 func SetChatLogOutput(w io.Writer) { chatLogOut = w }
@@ -35,6 +36,7 @@ type chatStat struct {
 	model  string
 	mode   string // "stream" | "sync"
 	uid    string // 完整 uid，展示时只取前 8 位
+	nick   string // 账号昵称（随选号同步），流水行经 logfmt.Label 拼成 "昵称(uid8)"
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
@@ -57,7 +59,7 @@ func (s *chatStat) done() {
 		return
 	}
 	s.logged = true
-	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks)
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
@@ -68,16 +70,16 @@ type chatStatsReader struct {
 	start               time.Time
 	ttfb                time.Duration
 	seen                bool // 已见过首个 data 帧（TTFB 只记一次）
-	hasUsage            bool // 末帧是否带 usage（兼容旧判断）
 	promptTokens        int
 	completionTokens    int
 	totalTokens         int
 	hasPromptTokens     bool
 	hasCompletionTokens bool
 	hasTotalTokens      bool
-	credit              float64 // usage.credit（成员记账用；无 usage 时为 0）
-	hasCredit           bool    // usage 里真的出现了 credit 字段（显式 0 也是合法观测）
-	pend                []byte  // 已读未返回的行缓存
+	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
+	hasCredit bool
+	credit    float64
+	pend      []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -91,6 +93,12 @@ func (s *chatStatsReader) TTFB() time.Duration { return s.ttfb }
 // Tokens 返回末帧 usage.completion_tokens 与是否缺失；无 usage 时 ok=false。
 func (s *chatStatsReader) Tokens() (int, bool) { return s.completionTokens, s.hasCompletionTokens }
 
+// Credit 返回末帧 usage.credit（本次真实扣费积分）与是否缺失。
+func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
+
+// TotalTokens 返回末帧 usage.total_tokens 与是否缺失。
+func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.hasTotalTokens }
+
 // Usage 返回流式响应中已收到的 token usage 字段。
 func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 	return pool.TokenUsageDelta{
@@ -102,9 +110,6 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 		TotalTokens:         int64(s.totalTokens),
 	}
 }
-
-// Credit 返回末帧 usage.credit 与是否存在（缺失≠免费：ok=false 不能当 0 记账）。
-func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredit }
 
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
 func (s *chatStatsReader) parseSSELine(line string) {
@@ -122,16 +127,15 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 	var chunk struct {
 		Usage *struct {
-			PromptTokens     *int    `json:"prompt_tokens"`
-			CompletionTokens *int    `json:"completion_tokens"`
-			TotalTokens      *int    `json:"total_tokens"`
+			PromptTokens     *int     `json:"prompt_tokens"`
+			CompletionTokens *int     `json:"completion_tokens"`
+			TotalTokens      *int     `json:"total_tokens"`
 			Credit           *float64 `json:"credit"`
 		} `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
 		return
 	}
-	s.hasUsage = true
 	if chunk.Usage.PromptTokens != nil {
 		s.hasPromptTokens = true
 		s.promptTokens = *chunk.Usage.PromptTokens
@@ -166,6 +170,27 @@ func (s *chatStatsReader) Read(p []byte) (int, error) {
 		return n, nil
 	}
 	return 0, err
+}
+
+// rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。
+// 仅当 bare != 原 model 时由 chatCompletions 调用；body 不可解析时原样返回（不二次错误化）。
+func rewriteModel(body []byte, bare string) []byte {
+	if len(body) == 0 || bare == "" {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	if cur, ok := obj["model"].(string); !ok || cur == bare {
+		return body
+	}
+	obj["model"] = bare
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 // parseModelFromBody 从请求 JSON 取 model 字段，缺省标 "-"。
@@ -232,68 +257,66 @@ func completionTokens(resp map[string]any) int {
 	return int(v)
 }
 
-// completionCredit 从 Aggregate 返回的响应中提取 usage.credit（成员记账用）；缺失返回 0。
-func completionCredit(resp map[string]any) float64 {
-	u, ok := resp["usage"].(map[string]any)
-	if !ok {
-		return 0
-	}
-	v, ok := u["credit"].(float64)
-	if !ok || v < 0 {
-		return 0
-	}
-	return v
-}
-
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。
+//
+// 实现委托 logfmt.UID8，避免 "截 8 位" 的规则在 server 与 logfmt 两处各写一份而走样。
 func uidPrefix(uid string) string {
-	if uid == "" {
-		return "-"
-	}
-	if len(uid) > 8 {
-		return uid[:8]
-	}
-	return uid
+	return logfmt.UID8(uid)
 }
 
-// logChatRow 打印一行请求级表格日志（直接输出 stdout，无 log 时间戳前缀）。
-// toks<0 表示 usage 缺失，显示 "-"。
-func logChatRow(ttfb, total time.Duration, model, mode, uid string, status int, toks int) {
+// 请求流水行的固定列宽（显示列宽，非字节）。取固定宽度而不是让内容自然长度撑开，
+// 是为了让 stdout 里成百上千行能竖着扫——否则模型名长短不一、中文昵称按字节补空格
+// 错位，根本没法用肉眼对齐着一列列看（这正是上一版 11 字节硬截断要解决的问题）。
+const (
+	// chatModelWidth 覆盖 realm 前缀 + 最长模型名："global:" (7) + "deepseek-v4.1-flash" (19) = 26。
+	// 旧的 11 字节截断会把 "cn:deepseek-v4-flash" 切成 "cn:deepseek"，让人误以为是另一个模型。
+	chatModelWidth = 26
+	// chatAcctWidth 容纳 "昵称(uid8)"：中文昵称按 2 列/字算，5 字中文 + "(xxxxxxxx)" = 20 列。
+	chatAcctWidth = 22
+	chatTTFBWidth = 8
+	chatTokWidth  = 6
+	chatRateWidth = 11 // 形如 "183.6tok/s"
+)
+
+// logChatRow 打印一行请求级表格日志（输出 chatLogOut，无 log 时间戳前缀）。
+//
+// 参数：
+//   - model：模型名（含 realm 前缀），超 chatModelWidth 截断（模型名是 ASCII，字节截即列宽）；
+//   - uid/nick：完整 uid 与账号昵称，经 logfmt.Label 拼成 "昵称(uid8)" 展示——只有
+//     uid8 时人眼无法判断是哪个号，要辨认必须再查 auths/，排障多一跳；
+//   - toks<0 表示 usage 缺失，显示 "-"。
+func logChatRow(ttfb, total time.Duration, model, mode, uid, nick string, status int, toks int) {
 	if !chatLogEnabled {
 		return
 	}
 	seq := chatSeq.Add(1)
-	if len(model) > 11 {
-		model = model[:11]
-	}
+	model = logfmt.Pad(logfmt.Truncate(model, chatModelWidth), chatModelWidth)
+	// 账号标签只补不截：超宽时宁可让该行变宽，也不丢昵称信息（昵称是排查的主线索）。
+	acct := logfmt.Pad(logfmt.Label(uid, nick), chatAcctWidth)
 	tokField := "-"
 	tokpsField := "-"
 	if toks >= 0 {
 		tokField = fmt.Sprintf("%d", toks)
 		if total > 0 {
-			tokpsField = fmt.Sprintf("%.1f", float64(toks)/total.Seconds())
+			tokpsField = fmt.Sprintf("%.1ftok/s", float64(toks)/total.Seconds())
 		} else {
-			tokpsField = "0.0"
+			tokpsField = "0.0tok/s"
 		}
 	}
 	ttfbMS := "-"
 	if ttfb > 0 {
 		ttfbMS = fmt.Sprintf("%dms", ttfb.Milliseconds())
 	}
-	w := chatLogOut
-	if w == nil {
-		w = os.Stdout
-	}
-	fmt.Fprintf(w, "| #%03d | %s | %s | %s | %d | uid=%s | TTFB=%s | tok=%s | %stok/s | total=%.1fs |\n",
+	fmt.Fprintf(chatLogOut, "| #%03d | %s | %s | %s | %d | %s | TTFB=%s | tok=%s | %s | total=%.1fs |\n",
 		seq,
 		time.Now().Format("15:04:05"),
 		model,
 		mode,
 		status,
-		uidPrefix(uid),
-		ttfbMS,
-		tokField,
-		tokpsField,
+		acct,
+		logfmt.Pad(ttfbMS, chatTTFBWidth),
+		logfmt.Pad(tokField, chatTokWidth),
+		logfmt.Pad(tokpsField, chatRateWidth),
 		total.Seconds(),
 	)
 }

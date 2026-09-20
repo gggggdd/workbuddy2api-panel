@@ -98,13 +98,13 @@ func TestParseSoftRateReset(t *testing.T) {
 		{"6004 带时间+UTC+8 后缀", `{"code":6004,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"6004 带时间无后缀", `{"code":6004,"msg":"将在 ` + ts + ` 重置"}`, true},
 		{"6004 无时间文案", `{"code":6004,"msg":"model usage limit exceeded"}`, false},
-		{"非 6004 但带时间（不是模型级）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, false},
+		{"非 6004 但带时间（ParseRateReset 统一解析；模型级豁免由调用侧按 6004 判定）", `{"code":11140,"msg":"将在 ` + ts + ` UTC+8 重置"}`, true},
 		{"非法时间格式", `{"code":6004,"msg":"将在 明天 重置"}`, false},
 		{"空 body", ``, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, ok := ParseSoftRateReset(c.body)
+			got, ok := ParseRateReset(c.body)
 			if ok != c.ok {
 				t.Fatalf("ok=%v want %v (body=%s)", ok, c.ok, c.body)
 			}
@@ -243,6 +243,8 @@ func TestFetchModelsEffortsDriveBodyDowngrade(t *testing.T) {
 			return jsonResp(200, `{"code":0,"data":{"models":[
 				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"high","supportedEfforts":["low","high"]}}
 			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			return jsonResp(200, `{"code":0,"data":{"models":[]}}`), nil
 		default:
 			outbound, _ = io.ReadAll(r.Body)
 			return &http.Response{
@@ -291,12 +293,13 @@ func TestChatStreamHardCreditError(t *testing.T) {
 	if status != 402 {
 		t.Errorf("status=%d", status)
 	}
-	if err != nil {
-		t.Fatalf("hard credit should return body via status, not err: %v", err)
+	// 错误信封一次成型：≥400 返回已分类的 *Error（Kind + body 全量仍经 respBody 透出）
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Kind != ErrHardCredit {
+		t.Fatalf("hard credit should return classified *Error envelope, got %v", err)
 	}
-	// caller classifies via returned body
-	if Classify(status, string(respBody)) != ErrHardCredit {
-		t.Errorf("body=%q not classified hard credit", respBody)
+	if len(respBody) == 0 {
+		t.Errorf("body should still be returned for passthrough")
 	}
 }
 
@@ -432,8 +435,8 @@ func TestNewChatClientNoTotalTimeoutAndSharedTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("Transport type=%T", c.ChatHTTP.Transport)
 	}
-	if htr.ResponseHeaderTimeout != 120*time.Second {
-		t.Errorf("ResponseHeaderTimeout=%v want 120s", htr.ResponseHeaderTimeout)
+	if htr.ResponseHeaderTimeout != 60*time.Second { // 连接层加固：响应头上限从 120s 收到 60s（慢冷启动留 3.75× 余量）
+		t.Errorf("ResponseHeaderTimeout=%v want 60s", htr.ResponseHeaderTimeout)
 	}
 }
 
@@ -509,5 +512,62 @@ func TestFetchModelsDefaultEffortDualKeyAndSizes(t *testing.T) {
 	}
 	if au := byID["auto"]; au.DefaultEffort != "high" {
 		t.Errorf("auto DefaultEffort=%q want high (from legacy effort key)", au.DefaultEffort)
+	}
+}
+
+func TestFetchModelsOverlaysV3ConfigCapabilities(t *testing.T) {
+	// CLI 目录给 flash 精简字段（128K / 固定 high）；IDE /v3/config 给完整能力。
+	var sawIDE bool
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/console/enterprises/personal/models"):
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":128000,"credits":"x0.03 credits","supportsReasoning":true,"onlyReasoning":true,"reasoning":{"effort":"high","summary":"auto"}}
+			],"agents":[{"name":"cli","models":["deepseek-v4.1-flash"]}]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/v3/config"):
+			sawIDE = true
+			if r.Header.Get("User-Agent") != codeBuddyIDEUA {
+				t.Errorf("v3/config UA=%q want %s", r.Header.Get("User-Agent"), codeBuddyIDEUA)
+			}
+			if r.Header.Get("X-Product") != "SaaS" {
+				t.Errorf("X-Product=%q want SaaS", r.Header.Get("X-Product"))
+			}
+			if r.Header.Get("X-User-Id") != "u1" {
+				t.Errorf("X-User-Id=%q want u1", r.Header.Get("X-User-Id"))
+			}
+			return jsonResp(200, `{"code":0,"data":{"models":[
+				{"id":"deepseek-v4.1-flash","name":"Deepseek-V4.1-Flash","maxInputTokens":1000000,"maxOutputTokens":393216,"credits":"x0.03","supportsReasoning":true,"onlyReasoning":true,"reasoning":{"canDisableThinking":true,"defaultEffort":"high","summary":"auto","supportedEfforts":["low","high","max"]}}
+			]}}`), nil
+		default:
+			t.Errorf("unexpected path %s", r.URL.Path)
+			return jsonResp(404, `{}`), nil
+		}
+	})
+	a := &auth.Auth{AccessToken: "at", UID: "u1", Domain: "copilot.tencent.com"}
+	infos, err := c.FetchModels(a)
+	if err != nil {
+		t.Fatalf("fetch models: %v", err)
+	}
+	if !sawIDE {
+		t.Fatal("expected /v3/config request")
+	}
+	if len(infos) != 1 {
+		t.Fatalf("infos=%+v", infos)
+	}
+	mi := infos[0]
+	if mi.MaxTokens != 393216 {
+		t.Errorf("MaxTokens=%d want 393216", mi.MaxTokens)
+	}
+	if mi.ContextWindow != 1000000 {
+		t.Errorf("ContextWindow=%d want 1000000", mi.ContextWindow)
+	}
+	if !mi.CanDisableThinking || !mi.SupportsReasoning {
+		t.Errorf("flags canDisable=%v supportsReasoning=%v", mi.CanDisableThinking, mi.SupportsReasoning)
+	}
+	if mi.DefaultEffort != "high" {
+		t.Errorf("DefaultEffort=%q want high", mi.DefaultEffort)
+	}
+	if got := strings.Join(mi.Efforts, ","); got != "low,high,max" {
+		t.Errorf("Efforts=%v want low,high,max", mi.Efforts)
 	}
 }

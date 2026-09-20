@@ -116,7 +116,7 @@ func TestExtractKeyPriority(t *testing.T) {
 	}{
 		{`{"metadata":{"conversation_id":"mc","user_id":"mu"},"conversation_id":"top"}`, "mc"}, // metadata.conversation_id 优先
 		{`{"conversation_id":"top"}`, "top"},                                                   // 顶层 conversation_id
-		{`{"metadata":{"user_id":"mu"}}`, "mu"},                                                // metadata.user_id 兜底
+		{`{"metadata":{"user_id":"mu"}}`, ""},                                                  // user_id 已剔除粘性键（粒度过粗），回落轮换
 		{`{"metadata":{"conversation_id":123}}`, ""},                                           // 非字符串 → 空
 		{`not-json`, ""}, // 非法 JSON → 空
 		// issue #35：客户端实际发 camelCase conversationId，ExtractKey 必须识别。
@@ -336,5 +336,16 @@ func TestExtractKeyMultimodalContent(t *testing.T) {
 	body2 := `{"messages":[{"role":"user","content":[{"type":"text","text":"看图说话"},{"type":"image_url","image_url":{"url":"http://x/z.png"}}]}]}`
 	if ExtractKey([]byte(body2)) != k {
 		t.Error("image url changes must not break derived key stability")
+	}
+	// 纯图片首条 user（无 text part）也应派生非空键（首图会话粘性盲区修复；
+	// 图片只入类型占位，同图重发/换 URL 均同键）。
+	imgOnly := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x/y.png"}}]}]}`
+	k2 := ExtractKey([]byte(imgOnly))
+	if k2 == "" || !strings.HasPrefix(k2, "d-") {
+		t.Fatalf("pure-image first user should derive a key, got %q", k2)
+	}
+	imgOnly2 := `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://x/z.png"}}]}]}`
+	if ExtractKey([]byte(imgOnly2)) != k2 {
+		t.Error("pure-image url changes must keep same derived key")
 	}
 }

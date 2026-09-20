@@ -19,10 +19,10 @@ func globalTestClient(t *testing.T, chatSrv, billingSrv *httptest.Server) *Clien
 	auth.SetGlobalEnabled(true)
 	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	return &Client{
-		HTTP:             &http.Client{}, // DefaultTransport → 走 httptest 服务器真实地址
-		ChatBaseCN:       "https://chat.example",
-		BillingBaseCN:    "https://billing.example",
-		ChatBaseGlobal:   strings.TrimSuffix(chatSrv.URL, "/"),
+		HTTP:              &http.Client{}, // DefaultTransport → 走 httptest 服务器真实地址
+		ChatBaseCN:        "https://chat.example",
+		BillingBaseCN:     "https://billing.example",
+		ChatBaseGlobal:    strings.TrimSuffix(chatSrv.URL, "/"),
 		BillingBaseGlobal: strings.TrimSuffix(billingSrv.URL, "/"),
 		GlobalEnabled:     true,
 	}
@@ -72,8 +72,11 @@ func TestGlobalChatUsesConsolePathAndBase(t *testing.T) {
 	}
 	rc.Close()
 
-	if gotPath != "/console/chat/completions" {
-		t.Errorf("global chat path=%q want /console/chat/completions", gotPath)
+	// global chat 固定单路径 /v2/chat/completions（#119）：/console 同 base 但挂
+	// 腾讯云 WAF body 内容规则（反引号/printf/whoami 等命令执行特征确定性 403），
+	// /v2 为实测等价端点且不挂该规则。
+	if gotPath != "/v2/chat/completions" {
+		t.Errorf("global chat path=%q want /v2/chat/completions", gotPath)
 	}
 	if gotOrigin != "https://www.workbuddy.ai" {
 		t.Errorf("global chat Origin=%q want https://www.workbuddy.ai", gotOrigin)
@@ -87,17 +90,13 @@ func TestGlobalChatUsesConsolePathAndBase(t *testing.T) {
 	}
 }
 
-// TestGlobalChatFallsBackToV2Path 断言 /console 404 时 fallback /v2/chat/completions（同一 base 二次请求）。
-func TestGlobalChatFallsBackToV2Path(t *testing.T) {
+// TestGlobalChatSinglePathNoConsoleProbe 断言 global chat 只打一次 /v2，
+// 不再先探 /console（#119 固定单路径：/console 挂 WAF body 规则确定性 403，
+// 先探一次纯属浪费往返且会把 WAF 特征写进日志）。
+func TestGlobalChatSinglePathNoConsoleProbe(t *testing.T) {
 	var calls []string
 	chatSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls = append(calls, r.URL.Path)
-		if r.URL.Path == "/console/chat/completions" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(404)
-			_, _ = w.Write([]byte(`{"code":404,"msg":"nope"}`))
-			return
-		}
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte("data: [DONE]\n\n"))
@@ -112,11 +111,11 @@ func TestGlobalChatFallsBackToV2Path(t *testing.T) {
 	c := globalTestClient(t, chatSrv, billSrv)
 	rc, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
 	if err != nil || status != 200 {
-		t.Fatalf("chat fallback: status=%d err=%v", status, err)
+		t.Fatalf("chat: status=%d err=%v", status, err)
 	}
 	rc.Close()
-	if len(calls) != 2 || calls[0] != "/console/chat/completions" || calls[1] != "/v2/chat/completions" {
-		t.Errorf("chat fallback calls=%v want [console, v2]", calls)
+	if len(calls) != 1 || calls[0] != "/v2/chat/completions" {
+		t.Errorf("chat calls=%v want single [v2]", calls)
 	}
 }
 
@@ -231,10 +230,8 @@ func TestGlobalChatServerFallbackErrorCode(t *testing.T) {
 	defer billSrv.Close()
 
 	c := globalTestClient(t, chatSrv, billSrv)
-	_, status, _, err := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
-	if err != nil {
-		t.Fatalf("chat 500: %v", err)
-	}
+	// 新版 ChatStream 对 ≥400 返回已分类的 *Error（错误分类内聚），故 err 非 nil 属预期。
+	_, status, _, _ := c.ChatStream(globalAcct(), []byte(`{"model":"gpt-5.4","messages":[{"role":"system","content":"s"},{"role":"user","content":"hi"}]}`), "", ChatMeta{})
 	if status != 500 {
 		t.Errorf("status=%d want 500", status)
 	}
@@ -242,6 +239,7 @@ func TestGlobalChatServerFallbackErrorCode(t *testing.T) {
 		t.Errorf("500 should NOT retry /v2, calls=%v", calls)
 	}
 }
+
 // TestEffortsKeyedByRealm efforts 缓存按 realm 隔离：CN 探测写入的 supportedEfforts
 // 不得被 global 同模型名请求复用（C-2）。global 侧无 efforts 探测 → 原样透传不降级；
 // 同 Client 上 CN 请求仍按 CN 探测结果降级。
@@ -259,13 +257,16 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[
 				{"id":"glm-5.2","name":"GLM-5.2","maxInputTokens":131072,"maxOutputTokens":8192,"reasoning":{"effort":"medium","supportedEfforts":["low","medium"]}}
 			],"agents":[{"name":"cli","models":["glm-5.2"]}]}}`))
-		case strings.HasSuffix(r.URL.Path, "/console/chat/completions"):
-			globalBody, _ = io.ReadAll(r.Body)
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.WriteHeader(200)
-			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		// global 与 CN chat 现已同路径 /v2/chat/completions（#119 单路径），
+		// 按账号 token 区分是哪个 realm 的请求。
 		case strings.HasSuffix(r.URL.Path, "/v2/chat/completions"):
-			cnBody, _ = io.ReadAll(r.Body)
+			body, _ := io.ReadAll(r.Body)
+			// globalAcct() 的 UID 是 g1；CN 账号 UID 是 cn1。
+			if r.Header.Get("X-User-Id") == "g1" {
+				globalBody = body
+			} else {
+				cnBody = body
+			}
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(200)
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
@@ -278,11 +279,11 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 
 	base := strings.TrimSuffix(srv.URL, "/")
 	c := &Client{
-		HTTP:               http.DefaultClient,
-		ChatBaseCN:         base,
-		BillingBaseCN:      "https://billing.example",
-		ChatBaseGlobal:     base,
-		GlobalEnabled:      true,
+		HTTP:                 http.DefaultClient,
+		ChatBaseCN:           base,
+		BillingBaseCN:        "https://billing.example",
+		ChatBaseGlobal:       base,
+		GlobalEnabled:        true,
 		SanitizeFingerprints: true,
 	}
 	cn := &auth.Auth{AccessToken: "at", UID: "cn1", Domain: "www.codebuddy.cn"}

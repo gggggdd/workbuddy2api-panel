@@ -15,22 +15,45 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
+
+	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/upstream"
 )
 
 const billingBaseCN = "https://www.codebuddy.cn"
+
+// billingBaseGlobal 国际版计费域。global 账号打 CN 域会得到 401：
+// www.codebuddy.cn 不认 workbuddy.ai 的 token（实测 401，workbuddy.ai 同 token 为 code=0）。
+const billingBaseGlobal = "https://www.workbuddy.ai"
+
+// billingBaseFor 按账号 realm 选择计费域。
+//
+// 判定口径与 internal/auth.Realm() 一致：显式 realm=global 或 domain 落在
+// workbuddy.ai 家族，都按国际版处理。cmd/credit 早先对所有账号硬编码 CN 域，
+// 导致 global 账号余额查询恒返回 401（面板显示的是池内缓存值，不是实时的）。
+func billingBaseFor(af *authFile) string {
+	if strings.EqualFold(strings.TrimSpace(af.Auth.Realm), "global") {
+		return billingBaseGlobal
+	}
+	d := strings.ToLower(strings.TrimSpace(af.Auth.Domain))
+	if d == "workbuddy.ai" || strings.HasSuffix(d, ".workbuddy.ai") {
+		return billingBaseGlobal
+	}
+	return billingBaseCN
+}
 
 type authFile struct {
 	Auth struct {
 		AccessToken string `json:"accessToken"`
 		Domain      string `json:"domain"`
+		Realm       string `json:"realm"`
 	} `json:"auth"`
 	Account struct {
 		UID          string `json:"uid"`
@@ -88,79 +111,44 @@ func packageRemainUsed(a resourcePackage) (remain, used, size int64) {
 	return remain, used, size
 }
 
-func fetchUserResource(af *authFile) (remain, used, size int64, packs int, err error) {
-	now := time.Now()
-	body, _ := json.Marshal(map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
-		"ProductCode":              "p_tcaca",
-		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format("2006-01-02 15:04:05"),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format("2006-01-02 15:04:05"),
-	})
-	req, err := http.NewRequest(http.MethodPost, billingBaseCN+"/v2/billing/meter/get-user-resource", bytes.NewReader(body))
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-	req.Header.Set("Authorization", "Bearer "+af.Auth.AccessToken)
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	if af.Account.UID != "" {
-		req.Header.Set("X-User-Id", af.Account.UID)
-	}
-	if af.Account.EnterpriseID != "" {
-		req.Header.Set("X-Enterprise-Id", af.Account.EnterpriseID)
-		req.Header.Set("X-Tenant-Id", af.Account.EnterpriseID)
-	}
-	if af.Auth.Domain != "" {
-		req.Header.Set("X-Domain", af.Auth.Domain)
-	}
-	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return 0, 0, 0, 0, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	var env struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-		Data struct {
-			Response struct {
-				Data struct {
-					TotalDosage int64             `json:"TotalDosage"`
-					Accounts    []resourcePackage `json:"Accounts"`
-				} `json:"Data"`
-			} `json:"Response"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&env); err != nil {
-		return 0, 0, 0, 0, err
-	}
-	if env.Code != 0 {
-		return 0, 0, 0, 0, fmt.Errorf("code=%d %s", env.Code, env.Msg)
-	}
-	for _, a := range env.Data.Response.Data.Accounts {
-		r, u, s := packageRemainUsed(a)
-		remain += r
-		used += u
-		size += s
-	}
-	packs = len(env.Data.Response.Data.Accounts)
-	if size > 0 {
-		if derived := size - remain; derived > used {
-			used = derived
+// collect 遍历 dir 下的 workbuddy-*.json，逐账号查积分构成。
+//
+// 接受 *upstream.Client 而非自建 http.Client：realm 路由（global 优先无 /v2 的
+// billing 域、404 回落 /v2；CN 单走 /v2）由 internal/upstream.billingMeterPaths
+// 统一决定，工具侧不再重复实现一套，避免两处口径漂移。
+//
+// 无 token / 损坏文件由 auth.Parse 拒收 → 静默跳过、不发请求（与 signin/trial
+// 对损坏文件的处理一致）。
+func collect(dir string, up *upstream.Client) []accountResult {
+	files, _ := filepath.Glob(filepath.Join(dir, "workbuddy-*.json"))
+	sort.Strings(files)
+
+	accounts := make([]accountResult, 0, len(files))
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			continue
 		}
-	}
-	if dosage := env.Data.Response.Data.TotalDosage; dosage > size {
-		size = dosage
-		if derived := size - remain; derived > used {
-			used = derived
+		a, err := auth.Parse(raw)
+		if err != nil {
+			continue // 无 accessToken / 解析失败：跳过
 		}
+		res := accountResult{UID: a.UID, Nickname: a.Nickname}
+		packs, remain, size, err := up.CreditPackages(a)
+		if err != nil {
+			res.Error = err.Error()
+		} else {
+			used := size - remain
+			if used < 0 {
+				used = 0
+			}
+			res.Remain, res.Used, res.Size = &remain, &used, &size
+			res.Packages, res.OK = len(packs), true
+		}
+		accounts = append(accounts, res)
+		time.Sleep(200 * time.Millisecond)
 	}
-	return remain, used, size, packs, nil
+	return accounts
 }
 
 func main() {
@@ -169,35 +157,14 @@ func main() {
 	if v := os.Getenv("WB2A_AUTH_DIR"); v != "" {
 		authDir = v
 	}
-	files, _ := filepath.Glob(filepath.Join(authDir, "workbuddy-*.json"))
-	sort.Strings(files)
-
-	accounts := make([]accountResult, 0, len(files))
-	for _, f := range files {
-		var af authFile
-		raw, err := os.ReadFile(f)
-		if err != nil || json.Unmarshal(raw, &af) != nil {
-			continue
-		}
-		res := accountResult{UID: af.Account.UID, Nickname: af.Account.Nickname}
-		if af.Auth.AccessToken == "" {
-			res.Error = "no accessToken"
-			accounts = append(accounts, res)
-			continue
-		}
-		remain, used, size, packs, err := fetchUserResource(&af)
-		if err != nil {
-			res.Error = err.Error()
-		} else {
-			res.Remain = &remain
-			res.Used = &used
-			res.Size = &size
-			res.Packages = packs
-			res.OK = true
-		}
-		accounts = append(accounts, res)
-		time.Sleep(200 * time.Millisecond)
+	// realm 路由交给 upstream.Client（billingMeterPaths 统一决定双路径/单路径）。
+	up := &upstream.Client{
+		ChatBaseCN:        billingBaseCN,
+		BillingBaseCN:     billingBaseCN,
+		BillingBaseGlobal: billingBaseGlobal,
+		GlobalEnabled:     true,
 	}
+	accounts := collect(authDir, up)
 
 	var totalRemain, totalUsed, totalSize int64
 	okCount := 0

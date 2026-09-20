@@ -20,15 +20,15 @@ func checkinWithCreditServer(t *testing.T) (*httptest.Server, *upstream.Client) 
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case strings.HasSuffix(r.URL.Path, "/daily-checkin"):
+		case strings.HasSuffix(r.URL.Path, "/v2/billing/meter/daily-checkin"):
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"code": 0, "msg": "ok",
 				"data": map[string]any{"Response": map[string]any{"Data": map[string]any{
 					"credit": 9, "total_credit": 500,
 				}}},
 			})
-		case strings.HasSuffix(r.URL.Path, "/get-user-resource"):
-			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":100,"CycleCapacityRemain":500,"CycleCapacityUsed":0}]}}}}`))
+		case strings.HasSuffix(r.URL.Path, "/v2/billing/meter/get-user-resource"):
+			w.Write([]byte(`{"code":0,"data":{"Response":{"Data":{"Accounts":[{"CycleCapacitySize":500,"CycleCapacityRemain":500,"CycleCapacityUsed":0}]}}}}`))
 		default:
 			http.Error(w, "not found", 404)
 		}
