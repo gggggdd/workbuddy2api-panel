@@ -530,6 +530,7 @@ function openAdd() {
   $('addLoad').hidden = true; $('addReady').hidden = true;
   $('addDone').hidden = true; $('addErr').hidden = true;
   $('importDone').hidden = true; $('importErr').hidden = true;
+  $('addQR').innerHTML = ''; // 清掉上一轮的二维码（避免旧码残留误导）
   $('btnCopyUrl').hidden = true; $('btnOpenUrl').hidden = true;
   $('btnStartLogin').hidden = false; $('btnStartLogin').disabled = false;
   stopPoll();
@@ -549,6 +550,12 @@ function startAddLogin() {
   api('login/start', { method: 'POST', body: JSON.stringify({ realm }) }).then(r => {
     loginState = r.state;
     $('addUrl').textContent = r.url;
+    // 二维码直接渲染授权 URL（手机扫码即可），不必先复制再粘到手机。
+    // 生成失败（如 URL 超长超出编码器容量）只是少一条路：文本链接照常可复制/打开。
+    const qbox = $('addQR');
+    qbox.innerHTML = '';
+    try { qbox.innerHTML = qrSVG(qrMatrix(r.url), 168); }
+    catch (e) { console.warn('login QR render failed:', e.message); }
     $('addPick').hidden = true; // 选域锁定（会话已按该域发起）
     $('addLoad').hidden = true; $('addReady').hidden = false;
     $('btnStartLogin').hidden = true;
