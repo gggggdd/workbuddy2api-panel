@@ -175,3 +175,110 @@ func TestTrimmedRefKeptInMemory(t *testing.T) {
 		t.Fatal("同进程内重放被裁掉的记录又被入账了")
 	}
 }
+
+// TestTotalsAcrossTrim 裁剪后历史入账必须仍计入汇总。
+//
+// 回归护栏：Summarize/Totals 若只遍历 s.entries（而不是连同 archive），
+// 汇总会随裁剪「倒扣」——线上实测 23752 积分入账在裁剪后从汇总消失。
+func TestTotalsAcrossTrim(t *testing.T) {
+	s := New("", 4)
+	s.Append(Entry{UID: "a", Kind: KindCheckin, Delta: 100})
+	s.Append(Entry{UID: "a", Kind: KindTask, Delta: 50})
+	s.Append(Entry{UID: "a", Kind: KindChat, Delta: -10})
+	s.Append(Entry{UID: "a", Kind: KindChat, Delta: -10})
+	// 裁剪前基线：此时归档还是空的。
+	if before, _ := s.Totals(Query{}); before != 150 {
+		t.Fatalf("裁剪前入账=%.0f，期望 150", before)
+	}
+	s.Append(Entry{UID: "a", Kind: KindChat, Delta: -5}) // 触发裁剪
+	in2, out2 := s.Totals(Query{})
+	if in2 != 150 || out2 != 25 {
+		t.Errorf("  ❌ 仍丢失历史：入账=%.0f 消耗=%.0f", in2, out2)
+	} else {
+		t.Logf("  ✅ 汇总跨裁剪累计正确")
+	}
+}
+
+// TestArchiveWindowFilter 归档分片也要按时间范围过滤（近 24h 不该含 72h 前的）。
+func TestArchiveWindowFilter(t *testing.T) {
+	s := New("", 2)
+	old := time.Now().Add(-72 * time.Hour)
+	s.Append(Entry{At: old, UID: "a", Kind: KindCheckin, Delta: 1000})
+	s.Append(Entry{At: time.Now().Add(-1 * time.Hour), UID: "a", Kind: KindCheckin, Delta: 7})
+	s.Append(Entry{At: time.Now(), UID: "a", Kind: KindCheckin, Delta: 3}) // 触发裁剪，1000 进归档
+	s.Append(Entry{At: time.Now(), UID: "a", Kind: KindCheckin, Delta: 1}) // 再裁一条
+
+	all, _ := s.Totals(Query{})
+	since24 := Query{Since: time.Now().Add(-24 * time.Hour)}
+	in24, _ := s.Totals(since24)
+	if all != 1011 {
+		t.Errorf("  ❌ 全部口径错误: %.0f", all)
+	}
+	if in24 != 11 {
+		t.Errorf("  ❌ 24h 窗口未过滤归档: %.0f", in24)
+	}
+}
+
+// TestArchivePersistsAcrossRestart 归档随盘持久化：重启后汇总不该退回「只有窗口内」。
+func TestArchivePersistsAcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "l.json")
+	s := New(p, 2)
+	s.Append(Entry{UID: "a", Kind: KindCheckin, Delta: 500})
+	s.Append(Entry{UID: "a", Kind: KindCheckin, Delta: 50})
+	s.Append(Entry{UID: "a", Kind: KindTask, Delta: 30}) // 触发裁剪 → 500 进归档
+	s.Append(Entry{UID: "a", Kind: KindTask, Delta: 20}) // 再裁 → 50 也进归档
+	s.saveSoon()
+
+	raw, _ := os.ReadFile(p)
+	var st snapshot
+	_ = json.Unmarshal(raw, &st)
+
+	s2 := New(p, 2)
+	in, out := s2.Totals(Query{})
+	if in != 600 || out != 0 {
+		t.Errorf("重启后汇总丢失归档: 入账=%.0f 消耗=%.0f，期望 600/0", in, out)
+	}
+}
+
+// TestArchiveRollupIdempotent 反复折叠不产生重复日片。
+//
+// 回归护栏：折叠若只跟踪「本次新建的日片」而不预置归档里已有的日片，
+// 上一轮的 d:X 与本次折出的 d:X 会并存——同一 (日,账号) 两条分片，
+// 汇总重复计数。折叠在落盘路径上反复执行，故这里连续折三次断言不变。
+func TestArchiveRollupIdempotent(t *testing.T) {
+	s := New("", 2)
+	old := time.Now().Add(-40 * 24 * time.Hour) // 40 天前，超出 30 天小时保留
+	s.Append(Entry{At: old, UID: "a", Kind: KindCheckin, Delta: 300})
+	s.Append(Entry{At: old.Add(time.Hour), UID: "a", Kind: KindCheckin, Delta: 200})
+	s.Append(Entry{At: time.Now(), UID: "a", Kind: KindCheckin, Delta: 1}) // 触发裁剪
+	s.Append(Entry{At: time.Now(), UID: "a", Kind: KindCheckin, Delta: 1}) // 再裁一条
+
+	now := time.Now()
+	s.mu.Lock()
+	s.rollupArchiveLocked(now)
+	n1, in1 := len(s.archive), archiveInflow(s.archive)
+	s.rollupArchiveLocked(now)
+	n2, in2 := len(s.archive), archiveInflow(s.archive)
+	s.rollupArchiveLocked(now)
+	n3, in3 := len(s.archive), archiveInflow(s.archive)
+	s.mu.Unlock()
+
+	if n1 != n2 || n2 != n3 {
+		t.Errorf("折叠不幂等：分片数 %d → %d → %d", n1, n2, n3)
+	}
+	if in1 != in2 || in2 != in3 {
+		t.Errorf("折叠不幂等：入账 %.0f → %.0f → %.0f", in1, in2, in3)
+	}
+	if in3 != 500 {
+		t.Errorf("归档入账=%.0f，期望 500（两次折叠都不得重复计数）", in3)
+	}
+}
+
+func archiveInflow(a []archiveShard) float64 {
+	var sum float64
+	for _, s := range a {
+		sum += s.Inflow
+	}
+	return sum
+}
