@@ -476,10 +476,13 @@ func writeConfigFile(path string, out []byte) error {
 	} else if !isCrossDeviceOrBusy(err) {
 		return fmt.Errorf("replace config: %w", err)
 	}
-	// 挂载点：rename 不可用，原地覆盖（清掉刚写的 tmp）。
+	// 挂载点：rename 不可用，原地覆盖。
+	//
+	// 写失败时**保留 tmp**：O_TRUNC 已经把挂载文件破坏成空/半截，此刻若把 tmp
+	// 也删掉，新旧内容就都不剩了（配置彻底丢失，只能从备份恢复）。tmp 里是刚
+	// 写好的完整新内容，留着还能手工 cp 回去。写成功才清理。
 	if err := os.WriteFile(path, out, 0o600); err != nil {
-		os.Remove(tmp)
-		return fmt.Errorf("write config in place (bind mount): %w", err)
+		return fmt.Errorf("write config in place (bind mount, 完整新内容保留在 %s): %w", tmp, err)
 	}
 	os.Remove(tmp)
 	return nil
