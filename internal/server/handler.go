@@ -283,7 +283,12 @@ var dynamicModelsCache struct {
 }
 
 const (
-	dynamicModelsTTL        = time.Hour
+	// dynamicModelsTTL 动态模型目录缓存时长。取 5 分钟而非 1 小时：面板端点每次
+	// 实时拉上游，公开 /v1/models 若缓存过久会出现「面板已见新模型、客户端看不到」
+	// 的口径分歧（实测曾差一个 hy4-preview-f）；但也不能完全不缓存——/v1/models
+	// 是公开端点，FetchModels 是 v3/config + 企业端点两路并发真实请求，每次打上游
+	// 会给刚加过 WAF 402/403 防护的域增加无谓负载。
+	dynamicModelsTTL        = 5 * time.Minute
 	modelsFetchFailCooldown = 5 * time.Minute
 )
 
@@ -475,7 +480,15 @@ func (h *Handler) fetchDynamicModels() []upstream.ModelInfo {
 	}
 	dynamicModelsCache.RUnlock()
 
-	acct := h.cfg.Pool.Pick()
+	// 账号选择与 /panel/api/models 同口径：取当前第一个可用 CN 账号，而不是
+	// Pool.Pick()。Pick() 是对话通道的加权/粘性选号，混合池里会选中 global 账号
+	// ——拿 global token 打 CN 目录端点必然失败，表现为 /v1/models 偶发空列表，
+	// 且与面板（固定取首个 CN 号）返回两套目录。
+	uids := h.cfg.Pool.AvailableUIDsForRealm("cn")
+	if len(uids) == 0 {
+		return nil
+	}
+	acct := h.cfg.Pool.AuthByUID(uids[0])
 	if acct == nil {
 		return nil
 	}
