@@ -38,6 +38,7 @@ const (
 	ErrModelBlocked                  // 11102「该后端无此模型」→ (账号,模型) 负缓存避让，切模型/切账号
 	ErrWafBlock                      // 403 + 非业务信封体（APISIX WAF 拦截页/空体）→ 账号软冷却 + 抖动退避
 	ErrPromptTooLong                 // 11115「prompt is too long」→ 请求级错误（上下文超限是请求的问题非账号的问题）：不罚号、不轮转，末端透传原文
+	ErrImageInvalid                  // 图片请求格式/数据无效 → 请求级错误：不罚号、不轮转，末端透传原文
 	ErrClient                        // 其他 4xx / 业务错误
 )
 
@@ -63,6 +64,8 @@ func (k ErrKind) String() string {
 		return "waf_block"
 	case ErrPromptTooLong:
 		return "prompt_too_long"
+	case ErrImageInvalid:
+		return "image_invalid"
 	case ErrAccountFault:
 		return "account_fault"
 	case ErrClient:
@@ -183,6 +186,17 @@ func isPromptTooLongStatus(status int) bool {
 var alreadyCheckinMarkers = []string{"已签到", "already"}
 var badParamsMarkerCode = `"code":11101`
 
+// invalidImageMarkers 图片请求格式/数据无效（HTTP 400）的**文案**形态。这类错误由
+// 请求内容决定，不是账号问题：换账号不会改变同一 body 的解析结果。
+//
+// 业务码 11135 不放在这里：code 判定必须容忍 JSON 空白（`"code": 11135`），
+// 字面量 marker 只能覆盖紧凑形态，故统一走 codeMarker（见 Classify）。
+var invalidImageMarkers = []string{
+	"invalid image_url content",
+	"invalid_image_data",
+	"replace the image",
+}
+
 // softRateResetLoc 上游 429 6004 文案中的重置时间固定按 UTC+8 解释（上游文案如此，
 // 与容器时区无关）。
 var softRateResetLoc = time.FixedZone("UTC+8", 8*60*60)
@@ -280,6 +294,40 @@ func IsModelBlocked(status int, body string) bool {
 // 信封，正常走既有分类）。JSON 解析不做：信封存在性只需字段名命中——
 // 畸形 JSON 但含 `"msg":` 字样仍按业务响应保守处理（宁漏判 WAF 也不误罚
 // 业务 403，后者有各自的权威分类）。
+// hasBusinessCode 报告 JSON 错误信封里是否含**精确**的业务码（字段名 "code"）。
+// 上游信封在顶层与嵌套 error/data 间不一致，故遍历解码后的结构。
+//
+// 为何要精确匹配而非子串：14018 若用 strings.Contains 判定，会误命中 140180 这类
+// 更长数字，也可能被响应里的无关字段（如 requestId 含该串）带跑。
+func hasBusinessCode(body, want string) bool {
+	var root any
+	if err := json.Unmarshal([]byte(body), &root); err != nil {
+		return false
+	}
+	var walk func(any) bool
+	walk = func(value any) bool {
+		switch node := value.(type) {
+		case map[string]any:
+			if code, ok := node["code"]; ok && strings.TrimSpace(fmt.Sprint(code)) == want {
+				return true
+			}
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		case []any:
+			for _, child := range node {
+				if walk(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return walk(root)
+}
+
 func hasBusinessEnvelope(body string) bool {
 	return strings.Contains(body, `"code":`) || strings.Contains(body, `"msg":`)
 }
@@ -458,6 +506,14 @@ func Classify(status int, body string) ErrKind {
 	// 信号：上游既然给了 429，就按限流语义处理（宁可短冷却自愈，不可长冷却弃号）；
 	// 真正的余额耗尽由 402（上层）捕获，非 429 状态码的 quota 措辞仍走下方
 	// hardMarkers（历史语义不变）。
+	// 14018 是明确的账号积分耗尽业务码，必须先于通用 429 兜底：否则会被误判为
+	// 可自愈的软限流，在全池冷却时被反复兜底选中（issue #175）——软限流预期过一会
+	// 就好，积分耗尽等到次日 04:00 也不会恢复，账号被空转消耗。仅按结构化 code
+	// 判定；无该 code 的 "credits exhausted" 文案仍保持普通 429 的软限流语义，
+	// 避免把跨计费/限流两界的措辞猜错。
+	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
+		return ErrHardCredit
+	}
 	if status == http.StatusTooManyRequests {
 		return ErrSoftRate
 	}
@@ -496,6 +552,21 @@ func Classify(status int, body string) ErrKind {
 	}
 	// 内容策略拦截（HTTP 400 + 审核文案）：判在通用 ErrClient 之前。
 	// 这是误报信号，不罚账号，由网关降级重试处理（见 handler.applyErrorPolicy）。
+	// 图片格式/数据错误是确定性的请求级错误：同 body 换账号结果不变，直接 fail-fast，
+	// 避免把健康账号轮转一遍后仍把最终 503 返回给客户端。
+	if status == http.StatusBadRequest {
+		for _, m := range invalidImageMarkers {
+			if strings.Contains(lower, m) || strings.Contains(body, m) {
+				return ErrImageInvalid
+			}
+		}
+		// 业务码 11135 经 codeMarker 而非字面量 marker：上游 JSON 含空白
+		// （`"code": 11135`）时字面量会漏判，退化成 ErrClient 并继续轮转健康号。
+		// 口径与 hint.go 的 isInvalidImageData 一致（同一 codeMarker）。
+		if codeMarker(lower, "11135") {
+			return ErrImageInvalid
+		}
+	}
 	if status >= 400 {
 		for _, m := range contentBlockedMarkers {
 			if strings.Contains(lower, m) {
