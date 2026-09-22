@@ -1521,6 +1521,34 @@ function pkBySource(packs) {
   return [...m.values()].sort((a, b) => b.size - a.size);
 }
 
+// expiryLabel 把到期日渲染为「还剩 N 天」并按紧迫度着色。
+//
+// 积分按套餐分批过期、过期即作废，所以「还有多少分快没了」比「总额多少」
+// 更需要一眼可见。分档：≤3 天 warn（红），≤7 天 caution（黄），其余中性。
+// 已过期（<0 天）标 bad——理论上后端只返回 Status 0/3（未过期/冻结），
+// 出现负值是上游时钟或字段异常，如实标出不隐藏。
+function expiryLabel(minEnd) {
+  if (!minEnd) return '';
+  const end = new Date(minEnd + 'T23:59:59');
+  if (isNaN(end)) return '';
+  const days = Math.floor((end - Date.now()) / 86400000);
+  if (days < 0)  return { text: '已过期', cls: 'bad' };
+  if (days <= 3) return { text: '剩 ' + days + ' 天', cls: 'bad' };
+  if (days <= 7) return { text: '剩 ' + days + ' 天', cls: 'warn' };
+  return { text: minEnd.slice(5) + ' 到期', cls: '' };
+}
+
+// nearestExpiry 全部包里最近的一个未到期时刻（只看仍有余额的包）。
+// 余额为 0 的包到期无所谓，不该成为卡片上的「最近到期」。
+function nearestExpiry(packs) {
+  let best = '';
+  for (const p of packs) {
+    if (!p.end_time || Number(p.remain || 0) <= 0) continue;
+    if (!best || p.end_time < best) best = p.end_time;
+  }
+  return best ? expiryLabel(best.slice(0, 10)) : null;
+}
+
 function renderPackages(d) {
   const list = (d.accounts || []);
   if (!list.length) {
@@ -1560,17 +1588,23 @@ function renderPackages(d) {
       '<i style="width:' + (s.size / total * 100).toFixed(2) + '%;background:' +
       colorOf(s.key) + '" title="' + esc(s.name) + ' ' + fmtTok(s.size) + '"></i>'
     ).join('');
-    const legend = srcs.map(s =>
-      '<span><i style="background:' + colorOf(s.key) + '"></i>' +
+    // legend 每个来源补「最早到期」——minEnd 此前只算不显，积分何时作废无从得知。
+    // 该来源已用尽的（remain 0）不标到期，避免满屏「剩 N 天」干扰。
+    const legend = srcs.map(s => {
+      const ex = s.remain > 0 ? expiryLabel(s.minEnd) : '';
+      return '<span><i style="background:' + colorOf(s.key) + '"></i>' +
       esc(s.name.replace(/^CodeBuddy/, '')) + ' x' + s.n + ' · ' + fmtTok(s.size) +
-      (s.minCreated ? ' · 首发 ' + esc(s.minCreated.slice(5)) : '') + '</span>'
-    ).join('');
+      (ex ? ' · <b class="' + ex.cls + '">' + esc(ex.text) + '</b>' : '') +
+      (s.minCreated ? ' · 首发 ' + esc(s.minCreated.slice(5)) : '') + '</span>';
+    }).join('');
     return '<div class="pk-card">' +
       '<div class="who"><span class="nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
       '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
       '<div class="big">' + fmtTok(a.remain) + '</div>' +
       '<div class="sub">共 ' + fmtTok(a.size) + ' · ' + (a.packages || []).length +
-      ' 个包 · 占最高 ' + (Number(a.remain || 0) / maxRemain * 100).toFixed(0) + '%</div>' +
+      ' 个包 · 占最高 ' + (Number(a.remain || 0) / maxRemain * 100).toFixed(0) + '%' +
+      (() => { const e = nearestExpiry((a.packages || [])); if (!e) return '';
+        return ' · <b class="' + e.cls + '">最近 ' + esc(e.text) + '</b>'; })() + '</div>' +
       '<div class="mixbar">' + bar + '</div>' +
       '<div class="pk-legend">' + legend + '</div>' +
       '</div>';

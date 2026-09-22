@@ -1529,7 +1529,11 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 					CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
 					CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
 					CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-					// 到期时间字段名在上游同时存在两种口径，都读，谁有值用谁。
+					// 到期时间字段：上游**实测**下发的只有 CycleEndTime（周期结束时刻），
+					// ExpiredTime / PackageEndTime 在 CN/global 两域字段全集里都存在但恒为空。
+					// 三者都读、按序取第一个非空值——新增口径时不必改代码，缺 CLI 侧
+					// 实测的租户形态也能兜住。
+					CycleEndTime   string `json:"CycleEndTime"`
 					ExpiredTime    string `json:"ExpiredTime"`
 					PackageEndTime string `json:"PackageEndTime"`
 					// 发放时刻（epoch 毫秒）。
@@ -1554,10 +1558,15 @@ func (c *Client) CreditPackages(a *auth.Auth) ([]CreditPackage, int64, int64, er
 			SubProductCode: p.SubProductCode,
 			SubProductName: p.SubProductName,
 		}
-		if p.ExpiredTime != "" {
-			cp.EndTime = p.ExpiredTime
-		} else {
-			cp.EndTime = p.PackageEndTime
+		// 按可用性取第一个非空到期时间。CycleEndTime 排最前是因为它是实测唯一
+		// 有值的字段——此前只读 ExpiredTime/PackageEndTime（两者恒空），
+		// 导致 1314 个包里 1279 个到期时间为空，面板「积分构成」的到期列
+		// 恒显示「—」，积分何时作废完全不可见。
+		for _, cand := range []string{p.CycleEndTime, p.ExpiredTime, p.PackageEndTime} {
+			if cand != "" {
+				cp.EndTime = cand
+				break
+			}
 		}
 		// CreateTime 是 epoch 毫秒；0 表示上游没给，留空而不是伪造 1970。
 		if p.CreateTime > 0 {
