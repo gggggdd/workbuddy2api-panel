@@ -14,7 +14,7 @@ data/
 /signin_bin
 
 # Config with secrets (use config.example.json)
-config.json
+/config.json
 
 # Build artifacts
 *.tmp
@@ -37,6 +37,7 @@ docs/
 
 # 设计/计划文档（但 README.md 必须进版本库）
 *.md
+!internal/prompt/defaultprompt.md
 !README.md
 
 # Windows binaries
