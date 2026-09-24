@@ -1,6 +1,6 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
-const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
+const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme', LS_MASK = 'wb2api.accmask';
 // URL ?key= 自动写入（分享直达与自动化测试）
 try {
   const urlKey = new URLSearchParams(location.search).get('key');
@@ -150,10 +150,18 @@ document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDef
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+// 账号信息脱敏：截图 / 分享面板时隐藏昵称与 uid。纯前端显示层开关——不改变任何
+// 数据、不影响按钮功能（操作按钮走 data-u 上的真实 uid，与显示无关）。
+// 存 localStorage，刷新与重开浏览器后保持。
+let accMask = localStorage.getItem(LS_MASK) === '1';
+const MASK_TEXT = '••••••';
+function syncMaskBtn() {
+  const b = $('btnAccMask');
+  if (b) b.textContent = accMask ? '显示账号信息' : '隐藏账号信息';
+}
 function renderAccounts(list) {
   const tb = $('accBody');
-  if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+  if (!list.length) {    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -192,9 +200,16 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
-    return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
+    // 脱敏时替换昵称与 uid 文本，并摘掉行上的 uid tooltip（悬停不再泄漏）。
+    // 域徽标（国际版）保留：它不是敏感信息，且有助于辨认行。
+    const nmHtml = accMask
+      ? '<span class="acc-mask">' + MASK_TEXT + '</span>'
+      : (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>');
+    const idHtml = accMask ? MASK_TEXT : esc(short);
+    const rowTitle = accMask ? '' : ' title="uid: ' + esc(s.uid) + '"';
+    return '<tr class="' + cls + '"' + rowTitle + '>' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + nmHtml + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + idHtml + '</div></td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -241,6 +256,16 @@ async function loadOverview(quiet) {
     renderAccounts(d.accounts || []);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
+
+// 账号信息显示/隐藏：切换后用已缓存的 overviewData 就地重绘，不额外打一次接口。
+$('btnAccMask').onclick = () => {
+  accMask = !accMask;
+  localStorage.setItem(LS_MASK, accMask ? '1' : '0');
+  syncMaskBtn();
+  if (overviewData) renderAccounts(overviewData.accounts || []);
+  toast(accMask ? '已隐藏账号信息（截图分享用）' : '已显示账号信息', 'ok');
+};
+syncMaskBtn();
 
 $('accBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-a]');

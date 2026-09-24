@@ -95,6 +95,11 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// 慢接口结果缓存（swr.go / swr_wiring.go）：packages 与 models 的耗时来自
+	// 打上游而非本机计算，SWR 语义——热数据立即回、过期后台刷、?force=1 强制同步。
+	pkgCache    *swrCache
+	modelsCache *swrCache
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -144,6 +149,7 @@ func New(cfg Config) *Panel {
 		logs:    NewRing(500),
 		logins:  map[string]loginSession{},
 	}
+	p.initSlowCaches()
 	p.routes()
 	return p
 }
@@ -156,7 +162,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
-	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.modelsCached))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -183,7 +189,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/activity_all", p.withAuth(p.activityAll))
 	p.mux.HandleFunc("POST /panel/api/keepalive_all", p.withAuth(p.keepaliveAll))
 	p.mux.HandleFunc("POST /panel/api/balance_all", p.withAuth(p.balanceAll))
-	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packages))
+	p.mux.HandleFunc("GET /panel/api/packages", p.withAuth(p.packagesCached))
 	p.mux.HandleFunc("GET /panel/api/usage", p.withAuth(p.usage))
 	p.mux.HandleFunc("POST /panel/api/restart", p.withAuth(p.restart))
 	p.mux.HandleFunc("GET /panel/api/ledger", p.withAuth(p.ledgerHandler))
