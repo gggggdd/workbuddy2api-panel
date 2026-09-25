@@ -232,6 +232,27 @@ function renderAccounts(list) {
   }).join('');
 }
 
+// tokensEquiv 估算当前剩余积分等价于多少 tokens：以各账号 model_costs 的实测
+// 单价（cost_per_1k，EMA 平滑，单位=积分/1K tokens）按观测样本数加权平均，得到
+// 池级平均单价，再折算 remSum 积分可服务的 token 量。无任何有效观测 → '—'。
+// 纯估算：不同模型单价差异大（免费/收费混跑时尤其），数值随近期流量结构漂移。
+function tokensEquiv(accounts, remSum) {
+  if (!remSum || remSum <= 0) return '—';
+  let weighted = 0, samples = 0;
+  for (const s of accounts) {
+    for (const c of (s.model_costs || [])) {
+      if (c.cost_per_1k > 0 && c.samples > 0) {
+        weighted += c.cost_per_1k * c.samples;
+        samples += c.samples;
+      }
+    }
+  }
+  if (samples === 0) return '—';
+  const per1k = weighted / samples;   // 积分 / 1K tokens
+  if (!Number.isFinite(per1k) || per1k <= 0) return '—';
+  return '≈ ' + formatTokenCount(Math.round(remSum / per1k * 1000)) + ' tokens';
+}
+
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
@@ -243,6 +264,7 @@ async function loadOverview(quiet) {
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
+    $('sTokensEquiv').textContent = tokensEquiv(d.accounts || [], remSum);
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
