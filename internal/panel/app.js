@@ -261,12 +261,15 @@ async function hubApi(path, opts) {
   return d;
 }
 
+let hubCheckin = {}; // provider → 签到/额度状态（hub /hub/api/checkin）
+
 async function loadHubAccounts() {
   if (!hubKey) return;
   try {
     const d = await hubApi('/hub/api/accounts');
     hubAccounts = (d.accounts || []).filter(a => a.provider !== 'workbuddy');
     renderHubAccounts();
+    hubApi('/hub/api/checkin').then(c => { hubCheckin = c; renderHubAccounts(); }).catch(() => {});
   } catch (e) { console.warn('hub accounts:', e.message); }
 }
 
@@ -283,16 +286,38 @@ function renderHubAccounts() {
     const st = a.status === 'disabled' ? '<span class="tag bad">已禁用</span>'
       : a.status === 'cooling' ? '<span class="tag warn">冷却</span>'
       : '<span class="tag ok">可用</span>';
-    const cred = a.credits == null ? '—' : String(a.credits);
+    let cred = '—';
+    if (a.credits != null) {
+      if (typeof a.credits === 'object' && a.credits.remain != null) {
+        cred = a.credits.total > 0 ? a.credits.remain + ' / ' + a.credits.total : String(a.credits.remain);
+      } else {
+        cred = String(a.credits);
+      }
+    }
+    const nick = a.nickname || 'Qoder 账号';
+    // 签到列：trae 看 checked_in（每日 9 点自动）；qoder 显示自动签到开关。
+    let checkinCell = '—';
+    if (a.provider === 'trae') {
+      const acc = ((hubCheckin.trae || {}).accounts || []).find(x => String(x.uid) === String(a.uid));
+      if (acc) checkinCell = acc.checked_in
+        ? '<span class="tag ok">已签 +' + esc(String(acc.checkin_credits || 0)) + '</span>'
+        : '<span class="tag warn">未签</span>';
+    } else if (a.provider === 'qoder') {
+      const q = hubCheckin.qoder || {};
+      checkinCell = q.auto_checkin
+        ? '<span class="tag ok">自动每日</span>'
+        : '<span class="tag warn">未开启</span>';
+    }
     return '<tr>' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + esc(a.nickname || '未命名') +
+      '<td class="who"><div class="nm">' + esc(nick) +
         ' <span class="provider-tag" style="color:' + meta.color + ';border-color:' + meta.color + '">' + meta.label + '</span>' +
         (a.realm ? ' <span class="realm-tag">' + esc(a.realm) + '</span>' : '') + '</div>' +
       '<div class="id">' + esc(String(a.uid || '').slice(0, 16)) + '</div></td>' +
       '<td>' + st + '</td>' +
+      '<td>' + checkinCell + '</td>' +
       '<td class="cred"><div class="n">' + esc(cred) + '</div></td>' +
-      '<td class="num">—</td>' +
+      '<td class="num"><button class="xs" data-checkin="' + a.provider + '">签到</button></td>' +
       '</tr>';
   }).join('');
 }

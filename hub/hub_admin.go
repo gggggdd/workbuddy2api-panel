@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sync"
 	"strings"
 	"time"
 )
@@ -150,19 +151,82 @@ func adminAccounts(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var list []struct {
+			ID       string `json:"id"`
 			UID      string `json:"uid"`
 			Nickname string `json:"nickname"`
+			Name     string `json:"name"`
 			Region   string `json:"region"`
 			Status   string `json:"status"`
+			Active   bool   `json:"active"`
 		}
 		if json.Unmarshal(raw, &list) != nil {
 			// 空账号时是 []，合法。
 			return
 		}
-		mu.Lock()
+		type qrow struct {
+			ID       string
+			Name     string
+			UID      string
+			Nickname string
+			Region   string
+			Status   string
+			Active   bool
+			Quota    any
+		}
+		rows := make([]qrow, 0, len(list))
+		var qwg sync.WaitGroup
+		var qmu sync.Mutex
 		for _, a := range list {
-			enabled := a.Status == "active" || a.Status == ""
-			out = append(out, hubAccount{Provider: "qoder", UID: a.UID, Nickname: a.Nickname, Realm: a.Region, Enabled: &enabled, Status: a.Status})
+			qwg.Add(1)
+			go func(a struct {
+				ID       string `json:"id"`
+				UID      string `json:"uid"`
+				Nickname string `json:"nickname"`
+				Name     string `json:"name"`
+				Region   string `json:"region"`
+				Status   string `json:"status"`
+				Active   bool   `json:"active"`
+			}) {
+				defer qwg.Done()
+				st := a.Status
+				if st == "" && a.Active {
+					st = "active"
+				}
+				row := qrow{ID: a.ID, Name: a.Name, UID: a.UID, Nickname: a.Nickname, Region: a.Region, Status: st, Active: a.Active}
+				// 额度：quota 接口按 id 查（remaining=剩余 credits）。
+				_, qraw := consoleReq("GET", "/api/accounts/quota?id="+a.ID, "", sid)
+				var q struct {
+					UserQuota struct {
+						Remaining int64 `json:"remaining"`
+						Total     int64 `json:"total"`
+					} `json:"user_quota"`
+				}
+				if json.Unmarshal(qraw, &q) == nil && q.UserQuota.Total > 0 {
+					row.Quota = map[string]int64{"remain": q.UserQuota.Remaining, "total": q.UserQuota.Total}
+				}
+				qmu.Lock()
+				rows = append(rows, row)
+				qmu.Unlock()
+			}(a)
+		}
+		qwg.Wait()
+		mu.Lock()
+		for _, row := range rows {
+			// console 只给 id/name（没有 uid/nickname）：name 作展示名，id 作稳定标识。
+			name := row.Nickname
+			if name == "" {
+				name = row.Name
+			}
+			uid := row.UID
+			if uid == "" {
+				uid = row.ID
+			}
+			enabled := row.Status == "active" || row.Status == ""
+			ha := hubAccount{Provider: "qoder", UID: uid, Nickname: name, Realm: row.Region, Enabled: &enabled, Status: row.Status}
+			if row.Quota != nil {
+				ha.Credits = row.Quota
+			}
+			out = append(out, ha)
 		}
 		mu.Unlock()
 	})
