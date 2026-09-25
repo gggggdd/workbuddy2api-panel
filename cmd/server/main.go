@@ -293,6 +293,7 @@ func main() {
 		PromptText:   cfg.PromptText,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		HubProxy:      panel.NewHubProxy(), // /gw/* → hub 网关（HUB_PROXY_TARGET 环境变量控制）
 	})
 
 	ctx, stopSig := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

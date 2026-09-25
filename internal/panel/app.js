@@ -250,7 +250,9 @@ let hubModels = {};     // provider → 模型数组（trae/qoder 的原始目�
 
 async function hubApi(path, opts) {
   if (!hubKey) throw new Error('未配置 Hub Key（设置页填入后使用跨厂商功能）');
-  const base = location.origin + '/gw';
+  // 同源相对路径：panel 后端把 /gw/* 反代到 hub（7860）。这样无论面板从
+  // 域名（Caddy → panel）还是 IP:7863 直连打开，fetch 都打到正确的地方。
+  const base = '/gw';
   const r = await fetch(base + path, Object.assign({}, opts || {}, {
     headers: Object.assign({ 'Authorization': 'Bearer ' + hubKey }, (opts && opts.headers) || {}),
   }));
