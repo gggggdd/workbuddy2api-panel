@@ -41,7 +41,14 @@ var (
 	traeKey   = envOr("HUB_TRAE_KEY", "")
 	qoderTarget = envOr("HUB_QODER_TARGET", "http://127.0.0.1:8963")
 	qoderKey  = envOr("HUB_QODER_KEY", "qccg")
+	qoderConsolePassword = envOr("HUB_QODER_CONSOLE_PASSWORD", "")
+	qoderConsoleTarget  = envOr("HUB_QODER_CONSOLE_TARGET", "http://127.0.0.1:3588")
+	errNoSession = errorString("qoder console session not obtained")
 )
+
+type errorString string
+
+func (e errorString) Error() string { return string(e) }
 
 func envOr(k, def string) string {
 	if v := os.Getenv(k); v != "" {
@@ -155,6 +162,11 @@ func main() {
 	mux.HandleFunc("POST /v1/chat/completions", withAuth(chat))
 	mux.HandleFunc("POST /v1/messages", withAuth(chat))       // Anthropic 形态：仅 qoder 支持，透传
 	mux.HandleFunc("POST /v1/responses", withAuth(chat))      // Responses 形态：仅 qoder 支持，透传
+	// 管理面聚合（panel 消费）：跨厂商账号列表 / OAuth 登录代理 / 分厂商模型目录。
+	mux.HandleFunc("GET /hub/api/accounts", withAuth(adminAccounts))
+	mux.HandleFunc("POST /hub/api/oauth/start", withAuth(adminOAuthStart))
+	mux.HandleFunc("POST /hub/api/oauth/wait", withAuth(adminOAuthWait))
+	mux.HandleFunc("GET /hub/api/models", withAuth(adminModels))
 	log.Printf("[hub] listening on %s", listen)
 	log.Fatal(http.ListenAndServe(listen, mux))
 }

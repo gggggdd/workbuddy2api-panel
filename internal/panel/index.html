@@ -235,6 +235,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
 /* 账号信息脱敏占位（「隐藏账号信息」开启时替换昵称与 uid）：等宽点号，列宽基本不变。 */
 .acc-mask { color: var(--ink-3); letter-spacing: 1.5px; user-select: none; }
+/* 厂商归属徽标（hub 跨厂商）：账号行与模型行通用，颜色按厂商区分。 */
+.provider-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); border: 1px solid var(--ink-3); vertical-align: 1px; }
 .realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
 .realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
 .realm-opt input { accent-color: var(--accent); margin: 0; }
@@ -490,6 +492,22 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
 
+      <div class="box" id="hubBox">
+        <header>
+          <h3>其他厂商账号</h3>
+          <span class="grow"></span>
+          <button class="xs" id="btnTraeAdd">添加 Trae（扫码）</button>
+          <button class="xs" id="btnQoderAdd">添加 Qoder（OAuth）</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th class="mark"></th><th>账号</th><th>状态</th><th class="num">积分</th><th class="num">请求</th>
+          </tr></thead>
+          <tbody id="hubBody"><tr><td colspan="5"><div class="empty">加载中…</div></td></tr></tbody>
+        </table>
+        </div>
+      </div>
       <div class="box">
         <header>
           <h3>账号池</h3>
@@ -662,6 +680,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
       </div>
     </section>
+
+    <!-- Hub 聚合网关 -->
+    <div class="box" style="margin-bottom:20px">
+      <header><h3>Hub 聚合网关</h3></header>
+      <div style="padding:14px 17px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <input class="inp" id="hubKeyInput" placeholder="粘贴 Hub Key（wbh-…）" style="flex:1;min-width:220px">
+        <button class="xs" id="btnHubKeySave">保存</button>
+        <span class="note">用于拉取 Trae/Qoder 账号与模型（/gw 网关）</span>
+      </div>
+    </div>
 
     <!-- 配置 -->
     <section class="view" id="view-config" hidden>
