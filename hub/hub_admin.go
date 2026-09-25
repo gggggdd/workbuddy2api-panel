@@ -326,3 +326,74 @@ func itoa(n int) string {
 	}
 	return digits
 }
+
+// ── 签到聚合 ──────────────────────────────────────────────────────────
+
+// adminCheckin POST /hub/api/checkin {"provider":"trae"|"qoder"} 手动触发签到：
+//   - trae 无手动签到 API（每日 9 点自动 + 3h 重试窗口），返回当前签到状态
+//   - qoder POST /api/checkin 即时签到（每日 100 credits，需先有账号）
+//
+// 另 GET 同路径返回两家的签到状态（checked_in / enable / credits）。
+func adminCheckin(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet {
+		out := map[string]any{}
+		// trae 状态：admin credits 接口带 checked_in。
+		tr := backends[1]
+		code, raw := backendReq(tr, http.MethodGet, "/admin/api/credits", "", map[string]string{"Authorization": "Bearer " + tr.key})
+		if code == 200 {
+			var d struct {
+				Accounts []map[string]any `json:"accounts"`
+			}
+			if json.Unmarshal(raw, &d) == nil {
+				sts := []map[string]any{}
+				for _, a := range d.Accounts {
+					sts = append(sts, map[string]any{
+						"uid": a["uid"], "nickname": a["nickname"],
+						"checked_in": a["checked_in"], "checkin_credits": a["checkin_credits"],
+					})
+				}
+				out["trae"] = map[string]any{"mode": "auto_daily_9am", "accounts": sts}
+			}
+		} else {
+			out["trae"] = map[string]any{"error": statusMsg(code)}
+		}
+		// qoder 状态：settings 里 auto_checkin 开关 + 今日结果看 checkin 接口。
+		if sid, err := qoderSession(); err == nil {
+			code, raw := consoleReq("GET", "/api/settings", "", sid)
+			if code == 200 {
+				var d struct {
+					Settings struct {
+						AutoCheckin bool `json:"auto_checkin"`
+					} `json:"settings"`
+				}
+				if json.Unmarshal(raw, &d) == nil {
+					out["qoder"] = map[string]any{"auto_checkin": d.Settings.AutoCheckin, "mode": "auto_daily_10am"}
+				}
+			}
+		}
+		writeJSON(w, out)
+		return
+	}
+	var req struct {
+		Provider string `json:"provider"`
+	}
+	if json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&req) != nil || req.Provider == "" {
+		writeErr(w, http.StatusBadRequest, `body: {"provider":"trae"|"qoder"}`)
+		return
+	}
+	switch req.Provider {
+	case "qoder":
+		sid, err := qoderSession()
+		if err != nil {
+			writeErr(w, http.StatusBadGateway, "qoder console login: "+err.Error())
+			return
+		}
+		code, raw := consoleReq("POST", "/api/checkin", "{}", sid)
+		proxyJSON(w, code, raw, "qoder")
+	case "trae":
+		// trae 无手动触发端点：返回说明 + 当前状态。
+		writeJSON(w, map[string]any{"ok": true, "note": "trae 签到为每日 9:00 自动（重试窗口 3h），无手动触发端点；可查 GET /hub/api/checkin 看状态"})
+	default:
+		writeErr(w, http.StatusBadRequest, "unknown provider")
+	}
+}

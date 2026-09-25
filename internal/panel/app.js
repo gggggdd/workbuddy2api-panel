@@ -275,7 +275,7 @@ function renderHubAccounts() {
   const tb = $('hubBody');
   if (!tb) return;
   if (!hubAccounts.length) {
-    tb.innerHTML = '<tr><td colspan="5"><div class="empty">暂无其他厂商账号（Trae / Qoder）——用上方按钮扫码添加</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="6"><div class="empty">暂无其他厂商账号（Trae / Qoder）——用上方按钮扫码添加</div></td></tr>';
     return;
   }
   tb.innerHTML = hubAccounts.map(a => {
@@ -368,6 +368,25 @@ $('btnTraeAdd').onclick = async () => {
     toast('已发起 Trae 授权：在新窗口完成扫码后回来点「刷新」', 'ok');
   } catch (e) { toast(e.message, 'err'); }
 };
+$('hubBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-checkin]');
+  if (!b) return;
+  b.disabled = true;
+  try {
+    const r = await hubCheckinNow(b.dataset.checkin);
+    if (r && r.summary) toast('Qoder 签到完成', 'ok');
+    else if (r && r.note) toast(r.note, 'ok');
+    else toast('已触发', 'ok');
+    loadHubAccounts();
+  } catch (e) { toast(e.message, 'err'); b.disabled = false; }
+});
+async function triggerCheckin(provider) {
+  const r = await hubCheckinNow(provider);
+  if (r && r.summary) toast('Qoder 签到完成', 'ok');
+  else if (r && r.note) toast(r.note, 'ok');
+  else toast('已触发', 'ok');
+  loadHubAccounts();
+}
 $('btnQoderAdd').onclick = async () => {
   try {
     const url = await hubOAuthStart('qoder', 'cn');
