@@ -616,7 +616,14 @@ async function loadModels() {
             // 显示名走官方全名（qoder display_name / workbuddy name），
             // 便于辨认代号型 id（qmodel_38max → Qwen3.8-Max）；trae 上游不给全名。
             const nm = m.display_name || m.name || '';
-            list.push({ id: prov + '/' + m.id, name: nm, credits: rate, _provider: prov, _raw: m });
+            // 推理档位：qoder bridge 给 efforts/default_effort/can_disable_thinking，
+            // 与 workbuddy 的 supported_efforts/default_effort 同义，统一字段名渲染。
+            list.push({
+              id: prov + '/' + m.id, name: nm, credits: rate,
+              supported_efforts: m.efforts || [], default_effort: m.default_effort || '',
+              can_disable_thinking: !!m.can_disable_thinking,
+              _provider: prov, _raw: m,
+            });
           }
         } catch (e) { /* 单厂商失败不拖累整页 */ }
       }

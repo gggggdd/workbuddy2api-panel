@@ -37,9 +37,12 @@ type backend struct {
 // "x0.79"），供 /v1/models 透出——三家口径不同（workbuddy 直接给 credits，
 // qoder 给数字 price_factor，trae 上游不提供），统一在这里收敛成字符串。
 type modelEntry struct {
-	ID   string
-	Name string // 官方全名（可空：trae 上游不给）
-	Rate string // 积分倍率（可空：trae 上游不给）
+	ID            string
+	Name          string   // 官方全名（可空：trae 上游不给）
+	Rate          string   // 积分倍率（可空：trae 上游不给）
+	Efforts       []string // 推理档位（可空：trae 上游不给）
+	DefaultEffort string
+	CanDisable    bool // 能否关闭思考
 }
 
 var (
@@ -137,6 +140,13 @@ func (b *backend) fetchModels() []modelEntry {
 			// workbuddy 给字符串 "x0.79"；qoder 给数字 price_factor；trae 两者都没有。
 			Credits     string   `json:"credits"`
 			PriceFactor *float64 `json:"price_factor"` // 指针：0（免费）与「字段缺失」要区分
+			// 推理档位：workbuddy 用 reasoning_* 前缀，qoder bridge 用 efforts，
+			// trae 上游不提供。
+			ReasoningEfforts []string `json:"reasoning_supported_efforts"`
+			Efforts          []string `json:"efforts"`
+			DefaultEffort    string   `json:"default_effort"`
+			ReasoningDefault string   `json:"reasoning_default_effort"`
+			CanDisable       bool     `json:"can_disable_thinking"`
 		} `json:"data"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out) != nil {
@@ -157,6 +167,15 @@ func (b *backend) fetchModels() []modelEntry {
 		case m.PriceFactor != nil:
 			e.Rate = fmt.Sprintf("x%g", *m.PriceFactor)
 		}
+		e.Efforts = m.ReasoningEfforts
+		if len(e.Efforts) == 0 {
+			e.Efforts = m.Efforts
+		}
+		e.DefaultEffort = m.ReasoningDefault
+		if e.DefaultEffort == "" {
+			e.DefaultEffort = m.DefaultEffort
+		}
+		e.CanDisable = m.CanDisable
 		entries = append(entries, e)
 	}
 	return entries
@@ -236,6 +255,10 @@ func listModels(w http.ResponseWriter, r *http.Request) {
 		OwnedBy string `json:"owned_by"`
 		Name    string `json:"name,omitempty"` // 官方全名，便于辨认代号型 id（如 qmodel_38max）
 		Rate    string `json:"rate,omitempty"` // 积分倍率（x0.79）；trae 上游不提供则缺省
+		// 推理档位（qoder/workbuddy 有，trae 上游不提供则缺省）
+		SupportedEfforts []string `json:"supported_efforts,omitempty"`
+		DefaultEffort    string   `json:"default_effort,omitempty"`
+		CanDisable       bool     `json:"can_disable_thinking,omitempty"`
 	}
 	out := make([]entry, 0, 64)
 	now := time.Now().Unix()
@@ -248,7 +271,11 @@ func listModels(w http.ResponseWriter, r *http.Request) {
 			if b.prefix != "" {
 				full = b.prefix + "/" + m.ID
 			}
-			out = append(out, entry{ID: full, Object: "model", Created: now, OwnedBy: b.name, Name: m.Name, Rate: m.Rate})
+			out = append(out, entry{
+				ID: full, Object: "model", Created: now, OwnedBy: b.name,
+				Name: m.Name, Rate: m.Rate,
+				SupportedEfforts: m.Efforts, DefaultEffort: m.DefaultEffort, CanDisable: m.CanDisable,
+			})
 		}
 	}
 	writeJSON(w, map[string]any{"object": "list", "data": out})
