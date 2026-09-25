@@ -46,6 +46,11 @@ var (
 	errNoSession = errorString("qoder console session not obtained")
 )
 
+// hubKeys 是网关接受的全部 API key：HUB_API_KEY 必填，HUB_EXTRA_KEYS 可追加
+// （逗号分隔）。加 workbuddy 面板 key 进来，是为了让 /v1/* 切到网关后既有客户端
+// 不用换 key——同一把 key 即可拿到三家聚合模型。
+var hubKeys = map[string]bool{}
+
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
@@ -146,6 +151,12 @@ func main() {
 	if hubKey == "" {
 		log.Fatal("HUB_API_KEY is required")
 	}
+	hubKeys[hubKey] = true
+	for _, k := range strings.Split(envOr("HUB_EXTRA_KEYS", ""), ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			hubKeys[k] = true
+		}
+	}
 	backends = []*backend{
 		newBackend("workbuddy", "", wbTarget, wbKey, "bearer"),
 		newBackend("trae", "trae", traeTarget, traeKey, "bearer"),
@@ -177,7 +188,7 @@ func main() {
 func withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authz := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authz, "Bearer ") || strings.TrimPrefix(authz, "Bearer ") != hubKey {
+		if !strings.HasPrefix(authz, "Bearer ") || !hubKeys[strings.TrimPrefix(authz, "Bearer ")] {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			io.WriteString(w, `{"error":{"message":"invalid api key","type":"auth_error","code":"401"}}`)
