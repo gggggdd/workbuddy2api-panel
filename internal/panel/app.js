@@ -331,6 +331,14 @@ async function hubOAuthStart(provider, region) {
   return d.login_url;
 }
 
+// 手动触发签到（qoder 即时签；trae 返回说明）。GET/POST 同端点。
+async function hubCheckinNow(provider) {
+  return hubApi('/hub/api/checkin', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: provider }),
+  });
+}
+
 function tokensEquiv(accounts, remSum) {
   if (!remSum || remSum <= 0) return '—';
   let weighted = 0, samples = 0;
@@ -391,10 +399,26 @@ async function hubOAuthFlow(provider, region) {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ provider: provider, region: region || 'cn' }),
   });
+  console.log('[hub-oauth] start', provider, start);
+  if (!start.login_url) throw new Error('后端未返回 login_url：' + JSON.stringify(start).slice(0, 200));
   window.open(start.login_url, '_blank');
   toast('授权页已打开，完成后本页自动继续…', 'ok');
   const body = { provider: provider, login_id: start.login_id };
-  // 轮询 wait：qoder 是长轮询（阻塞到完成），trae 是短查询。最多等 5 分钟。
+  // qoder 的 wait 是长轮询（hub 侧已放宽到 11 分钟）：一次调用阻塞到授权完成，
+  // 成功直接返回账号对象。trae 是短查询，需间隔轮询。
+  if (provider === 'qoder') {
+    const w = await hubApi('/hub/api/oauth/wait', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    console.log('[hub-oauth] wait(qoder)', w);
+    if (w && (w.id || w.uid || w.ok)) {
+      toast('授权成功：账号已加入 ' + provider + ' 账号池', 'ok');
+      loadHubAccounts();
+      return;
+    }
+    throw new Error('未拿到账号：' + JSON.stringify(w).slice(0, 200));
+  }
   for (let i = 0; i < 10; i++) {
     await new Promise(r => setTimeout(r, i === 0 ? 8000 : 30000));
     try {
@@ -408,6 +432,7 @@ async function hubOAuthFlow(provider, region) {
         return;
       }
     } catch (e) {
+      console.warn('[hub-oauth] poll', i, e.message);
       if (!/400/.test(e.message)) throw e; // 400=未完成，继续等
     }
   }

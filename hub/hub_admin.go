@@ -20,6 +20,11 @@ import (
 
 var adminClient = &http.Client{Timeout: 15 * time.Second}
 
+// qoder 的 /api/oauth/wait 是长轮询（后端 WriteTimeout 10 分钟，阻塞到用户
+// 完成授权才返回）。沿用 adminClient 的 15s 会把它掐断成空响应，前端永远等不到
+// 成功。这里给 wait 单独一个长超时 client。
+var adminWaitClient = &http.Client{Timeout: 11 * time.Minute}
+
 // backendReq 按后端各自的鉴权形态发起 GET。
 func backendReq(b *backend, method, path string, body string, hdr map[string]string) (int, []byte) {
 	var rd io.Reader
@@ -312,7 +317,7 @@ func adminOAuthWait(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadGateway, "qoder console login: "+err.Error())
 			return
 		}
-		code, respRaw := consoleReq("POST", "/api/oauth/wait", string(raw), sid)
+		code, respRaw := consoleReqWait("POST", "/api/oauth/wait", string(raw), sid)
 		proxyJSON(w, code, respRaw, "qoder")
 	default:
 		writeErr(w, http.StatusBadRequest, "unknown provider")
@@ -339,6 +344,15 @@ func adminModels(w http.ResponseWriter, r *http.Request) {
 
 // consoleReq 打 qoder console（3588）的管理接口，带 session cookie。
 func consoleReq(method, path, body, sid string) (int, []byte) {
+	return consoleReqWith(adminClient, method, path, body, sid)
+}
+
+// consoleReqWait 同 consoleReq，但用长超时 client（OAuth wait 长轮询专用）。
+func consoleReqWait(method, path, body, sid string) (int, []byte) {
+	return consoleReqWith(adminWaitClient, method, path, body, sid)
+}
+
+func consoleReqWith(c *http.Client, method, path, body, sid string) (int, []byte) {
 	req, err := http.NewRequest(method, qoderConsoleTarget+path, strings.NewReader(body))
 	if err != nil {
 		return 0, nil
@@ -347,7 +361,7 @@ func consoleReq(method, path, body, sid string) (int, []byte) {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Cookie", "qoder2api_session_3588="+sid)
-	resp, err := adminClient.Do(req)
+	resp, err := c.Do(req)
 	if err != nil {
 		return 0, nil
 	}
