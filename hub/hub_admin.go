@@ -293,6 +293,11 @@ func consoleReq(method, path, body, sid string) (int, []byte) {
 }
 
 func proxyJSON(w http.ResponseWriter, code int, raw []byte, provider string) {
+	if code == 0 {
+		// backendReq 请求失败（网络/超时）：没有状态码可透传。
+		writeErr(w, http.StatusBadGateway, provider+" backend unreachable")
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	if code >= 400 && len(raw) == 0 {
