@@ -130,8 +130,8 @@ func (b *backend) fetchModels() []modelEntry {
 		Data []struct {
 			ID string `json:"id"`
 			// workbuddy 给字符串 "x0.79"；qoder 给数字 price_factor；trae 两者都没有。
-			Credits     string  `json:"credits"`
-			PriceFactor float64 `json:"price_factor"`
+			Credits     string   `json:"credits"`
+			PriceFactor *float64 `json:"price_factor"` // 指针：0（免费）与「字段缺失」要区分
 		} `json:"data"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out) != nil {
@@ -146,8 +146,8 @@ func (b *backend) fetchModels() []modelEntry {
 		switch {
 		case m.Credits != "":
 			e.Rate = m.Credits
-		case m.PriceFactor != 0:
-			e.Rate = fmt.Sprintf("x%g", m.PriceFactor)
+		case m.PriceFactor != nil:
+			e.Rate = fmt.Sprintf("x%g", *m.PriceFactor)
 		}
 		entries = append(entries, e)
 	}
