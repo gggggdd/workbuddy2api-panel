@@ -613,7 +613,10 @@ async function loadModels() {
             // 倍率：qoder 上游给数字 price_factor，与 workbuddy 的 credits
             // （"x0.79"）收敛成同一格式；trae 上游不提供，留空由 rateCell 显示 —。
             const rate = m.credits || (typeof m.price_factor === 'number' ? 'x' + m.price_factor : '');
-            list.push({ id: prov + '/' + m.id, name: m.owned_by || '', credits: rate, _provider: prov, _raw: m });
+            // 显示名走官方全名（qoder display_name / workbuddy name），
+            // 便于辨认代号型 id（qmodel_38max → Qwen3.8-Max）；trae 上游不给全名。
+            const nm = m.display_name || m.name || '';
+            list.push({ id: prov + '/' + m.id, name: nm, credits: rate, _provider: prov, _raw: m });
           }
         } catch (e) { /* 单厂商失败不拖累整页 */ }
       }

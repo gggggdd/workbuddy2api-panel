@@ -38,7 +38,8 @@ type backend struct {
 // qoder 给数字 price_factor，trae 上游不提供），统一在这里收敛成字符串。
 type modelEntry struct {
 	ID   string
-	Rate string
+	Name string // 官方全名（可空：trae 上游不给）
+	Rate string // 积分倍率（可空：trae 上游不给）
 }
 
 var (
@@ -129,6 +130,10 @@ func (b *backend) fetchModels() []modelEntry {
 	var out struct {
 		Data []struct {
 			ID string `json:"id"`
+			// 官方全名：qoder 用 display_name（qmodel_38max → Qwen3.8-Max），
+			// workbuddy 用 name（cn:hy3 → Hy3），trae 两者都不给。
+			DisplayName string `json:"display_name"`
+			Name        string `json:"name"`
 			// workbuddy 给字符串 "x0.79"；qoder 给数字 price_factor；trae 两者都没有。
 			Credits     string   `json:"credits"`
 			PriceFactor *float64 `json:"price_factor"` // 指针：0（免费）与「字段缺失」要区分
@@ -142,7 +147,10 @@ func (b *backend) fetchModels() []modelEntry {
 		if m.ID == "" {
 			continue
 		}
-		e := modelEntry{ID: m.ID}
+		e := modelEntry{ID: m.ID, Name: m.DisplayName}
+		if e.Name == "" {
+			e.Name = m.Name
+		}
 		switch {
 		case m.Credits != "":
 			e.Rate = m.Credits
@@ -226,6 +234,7 @@ func listModels(w http.ResponseWriter, r *http.Request) {
 		Object  string `json:"object"`
 		Created int64  `json:"created"`
 		OwnedBy string `json:"owned_by"`
+		Name    string `json:"name,omitempty"` // 官方全名，便于辨认代号型 id（如 qmodel_38max）
 		Rate    string `json:"rate,omitempty"` // 积分倍率（x0.79）；trae 上游不提供则缺省
 	}
 	out := make([]entry, 0, 64)
@@ -239,7 +248,7 @@ func listModels(w http.ResponseWriter, r *http.Request) {
 			if b.prefix != "" {
 				full = b.prefix + "/" + m.ID
 			}
-			out = append(out, entry{ID: full, Object: "model", Created: now, OwnedBy: b.name, Rate: m.Rate})
+			out = append(out, entry{ID: full, Object: "model", Created: now, OwnedBy: b.name, Name: m.Name, Rate: m.Rate})
 		}
 	}
 	writeJSON(w, map[string]any{"object": "list", "data": out})
