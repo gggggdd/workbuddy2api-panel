@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -396,4 +397,30 @@ func adminCheckin(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeErr(w, http.StatusBadRequest, "unknown provider")
 	}
+}
+
+// adminOAuthComplete POST /hub/api/oauth/complete {"provider":"trae","callback_url":"http://127.0.0.1:18080/authorize?..."}
+// Trae 专用：其回调打在用户本机 127.0.0.1:18080（本机模式设计），服务器部署收不到。
+// 用户把浏览器最终跳转的完整 URL 粘回来，这里转发给 trae2api 的 /authorize 完成登录。
+func adminOAuthComplete(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Provider    string `json:"provider"`
+		CallbackURL string `json:"callback_url"`
+	}
+	if json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req) != nil || req.CallbackURL == "" {
+		writeErr(w, http.StatusBadRequest, `body: {"provider":"trae","callback_url":"..."}`)
+		return
+	}
+	if req.Provider != "trae" {
+		writeErr(w, http.StatusBadRequest, "only trae needs manual complete")
+		return
+	}
+	tr := backends[1]
+	u, err := url.Parse(req.CallbackURL)
+	if err != nil || u.Path == "" {
+		writeErr(w, http.StatusBadRequest, "callback_url parse failed")
+		return
+	}
+	code, raw := backendReq(tr, http.MethodGet, u.RequestURI(), "", nil)
+	proxyJSON(w, code, raw, "trae")
 }

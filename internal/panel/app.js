@@ -361,11 +361,51 @@ $('btnAccMask').onclick = () => {
 syncMaskBtn();
 
 // ── 跨厂商账号添加（hub OAuth）──────────────────────────────────
+async function hubOAuthFlow(provider, region) {
+  const start = await hubApi('/hub/api/oauth/start', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: provider, region: region || 'cn' }),
+  });
+  window.open(start.login_url, '_blank');
+  toast('授权页已打开，完成后本页自动继续…', 'ok');
+  const body = { provider: provider, login_id: start.login_id };
+  // 轮询 wait：qoder 是长轮询（阻塞到完成），trae 是短查询。最多等 5 分钟。
+  for (let i = 0; i < 10; i++) {
+    await new Promise(r => setTimeout(r, i === 0 ? 8000 : 30000));
+    try {
+      const w = await hubApi('/hub/api/oauth/wait', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (w && (w.id || w.uid || w.ok)) {
+        toast('授权成功：账号已加入 ' + provider + ' 账号池', 'ok');
+        loadHubAccounts();
+        return;
+      }
+    } catch (e) {
+      if (!/400/.test(e.message)) throw e; // 400=未完成，继续等
+    }
+  }
+  throw new Error('等待授权超时（5 分钟），请重试');
+}
 $('btnTraeAdd').onclick = async () => {
   try {
-    const url = await hubOAuthStart('trae');
-    window.open(url, '_blank');
-    toast('已发起 Trae 授权：在新窗口完成扫码后回来点「刷新」', 'ok');
+    // Trae 的授权回调打到 127.0.0.1:18080（本机模式），服务器部署收不到。
+    // 流程：打开授权页 → 授权后浏览器跳到 127.0.0.1:18080/authorize?...（会打不开）
+    // → 把地址栏完整 URL 粘回弹窗 → 经 hub 转发完成登录。
+    const start = await hubApi('/hub/api/oauth/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'trae' }),
+    });
+    window.open(start.login_url, '_blank');
+    const cb = prompt('授权页已在新窗口打开。完成授权后浏览器会跳转到 127.0.0.1:18080 开头的地址（打不开是正常的）。把地址栏完整 URL 粘贴到这里：');
+    if (!cb) return;
+    await hubApi('/hub/api/oauth/complete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'trae', callback_url: cb.trim() }),
+    });
+    toast('Trae 账号已加入账号池', 'ok');
+    loadHubAccounts();
   } catch (e) { toast(e.message, 'err'); }
 };
 $('hubBody').addEventListener('click', async ev => {
@@ -389,9 +429,7 @@ async function triggerCheckin(provider) {
 }
 $('btnQoderAdd').onclick = async () => {
   try {
-    const url = await hubOAuthStart('qoder', 'cn');
-    window.open(url, '_blank');
-    toast('已发起 Qoder OAuth：在新窗口授权后回来点「刷新」', 'ok');
+    await hubOAuthFlow('qoder', 'cn');
   } catch (e) { toast(e.message, 'err'); }
 };
 // hub key 设置入口：设置页存 localStorage（与 panel key 分离）。

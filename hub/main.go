@@ -167,7 +167,8 @@ func main() {
 	mux.HandleFunc("POST /hub/api/oauth/start", withAuth(adminOAuthStart))
 	mux.HandleFunc("POST /hub/api/oauth/wait", withAuth(adminOAuthWait))
 	mux.HandleFunc("GET /hub/api/models", withAuth(adminModels))
-	mux.HandleFunc("/hub/api/checkin", withAuth(adminCheckin)) // GET=状态 POST=手动触发
+	mux.HandleFunc("/hub/api/checkin", withAuth(adminCheckin))
+	mux.HandleFunc("POST /hub/api/oauth/complete", withAuth(adminOAuthComplete)) // GET=状态 POST=手动触发
 	log.Printf("[hub] listening on %s", listen)
 	log.Fatal(http.ListenAndServe(listen, mux))
 }
