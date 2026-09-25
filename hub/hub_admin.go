@@ -205,9 +205,18 @@ func adminAccounts(w http.ResponseWriter, r *http.Request) {
 						Remaining int64 `json:"remaining"`
 						Total     int64 `json:"total"`
 					} `json:"user_quota"`
+					AddOnQuota struct {
+						Remaining int64 `json:"remaining"`
+						Total     int64 `json:"total"`
+					} `json:"addon_quota"`
 				}
 				if json.Unmarshal(qraw, &q) == nil && q.UserQuota.Total > 0 {
-					row.Quota = map[string]int64{"remain": q.UserQuota.Remaining, "total": q.UserQuota.Total}
+					row.Quota = map[string]int64{
+						"remain":       q.UserQuota.Remaining,
+						"total":        q.UserQuota.Total,
+						"addon_remain": q.AddOnQuota.Remaining,
+						"addon_total":  q.AddOnQuota.Total,
+					}
 				}
 				qmu.Lock()
 				rows = append(rows, row)

@@ -290,6 +290,9 @@ function renderHubAccounts() {
     if (a.credits != null) {
       if (typeof a.credits === 'object' && a.credits.remain != null) {
         cred = a.credits.total > 0 ? a.credits.remain + ' / ' + a.credits.total : String(a.credits.remain);
+        if (a.credits.addon_total > 0) {
+          cred += '<div class="id">Addon ' + a.credits.addon_remain + ' / ' + a.credits.addon_total + '</div>';
+        }
       } else {
         cred = String(a.credits);
       }
