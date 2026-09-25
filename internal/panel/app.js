@@ -286,6 +286,8 @@ function renderHubAccounts() {
     const st = a.status === 'disabled' ? '<span class="tag bad">已禁用</span>'
       : a.status === 'cooling' ? '<span class="tag warn">冷却</span>'
       : '<span class="tag ok">可用</span>';
+    // 积分单元格（HTML，与 workbuddy 行同款直接拼接）：主额度 + Addon 池两行。
+    // 只含数字与本模板固定标签，无用户输入，安全。
     let cred = '—';
     if (a.credits != null) {
       if (typeof a.credits === 'object' && a.credits.remain != null) {
@@ -319,7 +321,7 @@ function renderHubAccounts() {
       '<div class="id">' + esc(String(a.uid || '').slice(0, 16)) + '</div></td>' +
       '<td>' + st + '</td>' +
       '<td>' + checkinCell + '</td>' +
-      '<td class="cred"><div class="n">' + esc(cred) + '</div></td>' +
+      '<td class="cred"><div class="n">' + cred + '</div></td>' +
       '<td class="num"><button class="xs" data-checkin="' + a.provider + '">签到</button></td>' +
       '</tr>';
   }).join('');
