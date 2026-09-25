@@ -255,7 +255,7 @@ async function hubApi(path, opts) {
     headers: Object.assign({ 'Authorization': 'Bearer ' + hubKey }, (opts && opts.headers) || {}),
   }));
   const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  if (!r.ok) throw new Error((d.error || ('HTTP ' + r.status)) + ' @ ' + base + path);
   return d;
 }
 
