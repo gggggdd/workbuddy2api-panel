@@ -469,7 +469,8 @@ $('hubBody').addEventListener('click', async ev => {
   b.disabled = true;
   try {
     const r = await hubCheckinNow(b.dataset.checkin);
-    if (r && r.summary) toast('Qoder 签到完成', 'ok');
+    if (r && r.message) toast(r.message, 'ok');       // trae：完成 + 待重试数
+    else if (r && r.summary) toast('Qoder 签到完成', 'ok');
     else if (r && r.note) toast(r.note, 'ok');
     else toast('已触发', 'ok');
     loadHubAccounts();
@@ -609,7 +610,10 @@ async function loadModels() {
         try {
           const md = await hubApi('/hub/api/models?provider=' + prov);
           for (const m of (md.data || [])) {
-            list.push({ id: prov + '/' + m.id, name: m.owned_by || '', _provider: prov, _raw: m });
+            // 倍率：qoder 上游给数字 price_factor，与 workbuddy 的 credits
+            // （"x0.79"）收敛成同一格式；trae 上游不提供，留空由 rateCell 显示 —。
+            const rate = m.credits || (typeof m.price_factor === 'number' ? 'x' + m.price_factor : '');
+            list.push({ id: prov + '/' + m.id, name: m.owned_by || '', credits: rate, _provider: prov, _raw: m });
           }
         } catch (e) { /* 单厂商失败不拖累整页 */ }
       }

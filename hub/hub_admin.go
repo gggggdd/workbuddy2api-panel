@@ -484,8 +484,10 @@ func adminCheckin(w http.ResponseWriter, r *http.Request) {
 		code, raw := consoleReq("POST", "/api/checkin", "{}", sid)
 		proxyJSON(w, code, raw, "qoder")
 	case "trae":
-		// trae 无手动触发端点：返回说明 + 当前状态。
-		writeJSON(w, map[string]any{"ok": true, "note": "trae 签到为每日 9:00 自动（重试窗口 3h），无手动触发端点；可查 GET /hub/api/checkin 看状态"})
+		// trae2api 的手动签到端点（与每日 9:00 自动窗口同一逻辑）。
+		tr := backends[1]
+		code, raw := backendReq(tr, http.MethodPost, "/admin/api/checkin", "{}", map[string]string{"Authorization": "Bearer " + tr.key, "Content-Type": "application/json"})
+		proxyJSON(w, code, raw, "trae")
 	default:
 		writeErr(w, http.StatusBadRequest, "unknown provider")
 	}

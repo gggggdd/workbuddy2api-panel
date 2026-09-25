@@ -12,6 +12,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -29,7 +30,15 @@ type backend struct {
 	key    string          // 上游 API key（替换 Authorization）
 	keyHdr string          // key 放哪个头（Qoder bridge 用 x-api-key，其余 Bearer）
 	proxy  *httputil.ReverseProxy
-	models []string // 启动时探测的模型 id（无前缀），聚合时加前缀
+	models []modelEntry // 启动时探测的模型（无前缀），聚合时加前缀
+}
+
+// modelEntry 是聚合目录里的一条：除 id 外保留后端给的积分倍率（rate，形如
+// "x0.79"），供 /v1/models 透出——三家口径不同（workbuddy 直接给 credits，
+// qoder 给数字 price_factor，trae 上游不提供），统一在这里收敛成字符串。
+type modelEntry struct {
+	ID   string
+	Rate string
 }
 
 var (
@@ -99,7 +108,7 @@ func newBackend(name, prefix, rawTarget, key, keyHdr string) *backend {
 
 // fetchModels 探测后端模型目录（启动时一次 + /healthz 复查）。失败不致命：返回
 // 空（该后端在 /v1/models 里缺席，转发仍可用）。
-func (b *backend) fetchModels() []string {
+func (b *backend) fetchModels() []modelEntry {
 	req, _ := http.NewRequest(http.MethodGet, b.target.String()+"/v1/models", nil)
 	if b.keyHdr == "x-api-key" {
 		req.Header.Set("x-api-key", b.key)
@@ -120,18 +129,29 @@ func (b *backend) fetchModels() []string {
 	var out struct {
 		Data []struct {
 			ID string `json:"id"`
+			// workbuddy 给字符串 "x0.79"；qoder 给数字 price_factor；trae 两者都没有。
+			Credits     string  `json:"credits"`
+			PriceFactor float64 `json:"price_factor"`
 		} `json:"data"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out) != nil {
 		return nil
 	}
-	ids := make([]string, 0, len(out.Data))
+	entries := make([]modelEntry, 0, len(out.Data))
 	for _, m := range out.Data {
-		if m.ID != "" {
-			ids = append(ids, m.ID)
+		if m.ID == "" {
+			continue
 		}
+		e := modelEntry{ID: m.ID}
+		switch {
+		case m.Credits != "":
+			e.Rate = m.Credits
+		case m.PriceFactor != 0:
+			e.Rate = fmt.Sprintf("x%g", m.PriceFactor)
+		}
+		entries = append(entries, e)
 	}
-	return ids
+	return entries
 }
 
 // pickBackend 按模型名前缀选后端：trae/、qoder/ 前缀精确匹配；其余走 workbuddy。
@@ -206,6 +226,7 @@ func listModels(w http.ResponseWriter, r *http.Request) {
 		Object  string `json:"object"`
 		Created int64  `json:"created"`
 		OwnedBy string `json:"owned_by"`
+		Rate    string `json:"rate,omitempty"` // 积分倍率（x0.79）；trae 上游不提供则缺省
 	}
 	out := make([]entry, 0, 64)
 	now := time.Now().Unix()
@@ -213,12 +234,12 @@ func listModels(w http.ResponseWriter, r *http.Request) {
 		if len(b.models) == 0 {
 			b.models = b.fetchModels() // 惰性重探：后端恢复后目录自动补全
 		}
-		for _, id := range b.models {
-			full := id
+		for _, m := range b.models {
+			full := m.ID
 			if b.prefix != "" {
-				full = b.prefix + "/" + id
+				full = b.prefix + "/" + m.ID
 			}
-			out = append(out, entry{ID: full, Object: "model", Created: now, OwnedBy: b.name})
+			out = append(out, entry{ID: full, Object: "model", Created: now, OwnedBy: b.name, Rate: m.Rate})
 		}
 	}
 	writeJSON(w, map[string]any{"object": "list", "data": out})
