@@ -227,6 +227,11 @@ func main() {
 	mux.HandleFunc("GET /hub/api/models", withAuth(adminModels))
 	mux.HandleFunc("/hub/api/checkin", withAuth(adminCheckin))
 	mux.HandleFunc("POST /hub/api/oauth/complete", withAuth(adminOAuthComplete)) // GET=状态 POST=手动触发
+	// 其余路径（面板页 /panel/、面板管理接口 /panel/api/*）原样透给 workbuddy 本体：
+	// 网关占住 7863 后面板不能凭空消失，且面板自己有独立鉴权，网关不再拦一道。
+	panelProxy := httputil.NewSingleHostReverseProxy(backends[0].target)
+	panelProxy.FlushInterval = -1
+	mux.Handle("/", panelProxy)
 	log.Printf("[hub] listening on %s", listen)
 	log.Fatal(http.ListenAndServe(listen, mux))
 }
