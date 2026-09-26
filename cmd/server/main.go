@@ -166,6 +166,13 @@ func main() {
 	// 积分账本 + 成员体系（fork 特性）：与 state 文件同目录。
 	lgr := ledger.New(ledger.DefaultPath(cfg.StateFile), ledger.DefaultMax)
 	members := member.NewStore(member.DefaultPath(cfg.StateFile))
+	members.StartFlusher() // 周期落盘：chat 记账只置脏，无此则重启丢窗口数据
+	if lp := member.DefaultPath(cfg.StateFile); lp != "" {
+		if _, err := os.Stat(lp); err == nil {
+			// members.json 旁的 ledger.json：回填因缺 Flush 丢失的记账（一次性幂等）。
+			members.BackfillFromLedger(filepath.Join(filepath.Dir(lp), "ledger.json"))
+		}
+	}
 
 	sch := scheduler.New(scheduler.Config{
 		Ledger:              lgr,
