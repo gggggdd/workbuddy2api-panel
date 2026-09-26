@@ -15,9 +15,9 @@ services:
       - TZ=Asia/Shanghai
       - GOMEMLIMIT=128MiB
       - GOGC=100
-      - HUB_PROXY_TARGET=http://172.18.0.1:7860
+      - HUB_PROXY_TARGET=http://172.18.0.1:7863
     ports:
-      - "7863:7863"
+      - "127.0.0.1:7865:7865"
     volumes:
       - ./auths:/app/auths
       - ./data:/app/data
