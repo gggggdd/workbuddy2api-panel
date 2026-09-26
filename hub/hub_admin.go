@@ -141,6 +141,44 @@ func adminAccounts(w http.ResponseWriter, r *http.Request) {
 			out = append(out, hubAccount{Provider: "trae", UID: a.UID, Nickname: a.Nickname, Enabled: &enabled, Credits: a.Credits, Status: st})
 		}
 		mu.Unlock()
+
+		// /admin/api/accounts 的 credits 来自内存 state，只在签到时回写——
+		// 日常消耗不会反映，面板数字会一直停在签到时的值。这里再拉一次实时
+		// 额度覆盖（失败就保留上面的缓存值，不拖累整页）。
+		lc, lraw := backendReq(tr, http.MethodGet, "/admin/api/credits", "", map[string]string{"Authorization": "Bearer " + tr.key})
+		if lc != 200 {
+			return
+		}
+		var cd struct {
+			Accounts []struct {
+				UID    string `json:"uid"`
+				Remain int64  `json:"remain"`
+				Limit  int64  `json:"limit"`
+				Error  string `json:"error,omitempty"`
+			} `json:"accounts"`
+		}
+		if json.Unmarshal(lraw, &cd) != nil {
+			return
+		}
+		live := make(map[string][2]int64, len(cd.Accounts))
+		for _, a := range cd.Accounts {
+			if a.Error == "" {
+				live[a.UID] = [2]int64{a.Remain, a.Limit}
+			}
+		}
+		if len(live) == 0 {
+			return
+		}
+		mu.Lock()
+		for i := range out {
+			if out[i].Provider != "trae" {
+				continue
+			}
+			if v, ok := live[out[i].UID]; ok {
+				out[i].Credits = map[string]int64{"remain": v[0], "total": v[1]}
+			}
+		}
+		mu.Unlock()
 	})
 
 	// qoder：console 需要 session cookie——用 console password 换会话。
