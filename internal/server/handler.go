@@ -41,6 +41,10 @@ type Config struct {
 	SoftCooldown time.Duration // 429/限流文案软冷却基数，默认 600s（连续触发指数退避，封顶 soft_rate_max）
 	RefreshSkew  time.Duration // token 提前刷新窗口，默认 10m
 
+	// HubProxy hub 聚合网关反代（可选；nil = /gw/* 404）。挂在顶层 mux：
+	// /gw/v1/* 是跨厂商 API（app.js hubApi 用同源相对路径访问）。
+	HubProxy http.Handler
+
 	// Panel 管理面板 handler（可选；nil = 不挂载）。挂载在 /panel/ 前缀下，
 	// 面板自带 Bearer 鉴权（同一 api_key）与内嵌静态资源，主路由只做转发。
 	Panel http.Handler
@@ -136,6 +140,11 @@ func NewHandler(cfg Config) *Handler {
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
+	}
+	if cfg.HubProxy != nil {
+		// /gw/* → hub 聚合网关（同源相对路径，供面板跨厂商功能；直连 7863 与
+		// 经域名两种入口都通）。hub 自带 HUB_API_KEY 鉴权，这里透传不二次校验。
+		h.mux.Handle("/gw/", cfg.HubProxy)
 	}
 	return h
 }

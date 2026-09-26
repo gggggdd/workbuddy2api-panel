@@ -232,6 +232,135 @@ function renderAccounts(list) {
   }).join('');
 }
 
+// tokensEquiv 估算当前剩余积分等价于多少 tokens：以各账号 model_costs 的实测
+// 单价（cost_per_1k，EMA 平滑，单位=积分/1K tokens）按观测样本数加权平均，得到
+// 池级平均单价，再折算 remSum 积分可服务的 token 量。无任何有效观测 → '—'。
+// 纯估算：不同模型单价差异大（免费/收费混跑时尤其），数值随近期流量结构漂移。
+// ── 跨厂商（hub）：厂商标识与 hub api ─────────────────────────────
+// hub 聚合三后端（workbuddy / trae / qoder）。PROVIDER_META 驱动账号行徽标
+// 与模型页的厂商列；hubKey 独立于 panel key（网关自己的鉴权）。
+const PROVIDER_META = {
+  workbuddy: { label: 'WorkBuddy', color: 'var(--ok)' },
+  trae:      { label: 'Trae',      color: '#7c9cff' },
+  qoder:     { label: 'Qoder',     color: '#e8a33d' },
+};
+let hubKey = localStorage.getItem('wb2api.hubkey') || '';
+let hubAccounts = [];   // 上次拉取的跨厂商账号（除 workbuddy 外的部分）
+let hubModels = {};     // provider → 模型数组（trae/qoder 的原始目录）
+
+async function hubApi(path, opts) {
+  if (!hubKey) throw new Error('未配置 Hub Key（设置页填入后使用跨厂商功能）');
+  // 同源相对路径：panel 后端把 /gw/* 反代到 hub（7860）。这样无论面板从
+  // 域名（Caddy → panel）还是 IP:7863 直连打开，fetch 都打到正确的地方。
+  const base = '/gw';
+  const r = await fetch(base + path, Object.assign({}, opts || {}, {
+    headers: Object.assign({ 'Authorization': 'Bearer ' + hubKey }, (opts && opts.headers) || {}),
+  }));
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error((d.error || ('HTTP ' + r.status)) + ' @ ' + base + path);
+  return d;
+}
+
+let hubCheckin = {}; // provider → 签到/额度状态（hub /hub/api/checkin）
+
+async function loadHubAccounts() {
+  if (!hubKey) return;
+  try {
+    const d = await hubApi('/hub/api/accounts');
+    hubAccounts = (d.accounts || []).filter(a => a.provider !== 'workbuddy');
+    renderHubAccounts();
+    hubApi('/hub/api/checkin').then(c => { hubCheckin = c; renderHubAccounts(); }).catch(() => {});
+  } catch (e) { console.warn('hub accounts:', e.message); }
+}
+
+// 账号池页追加跨厂商账号区块（workbuddy 行走原 renderAccounts，不动）。
+function renderHubAccounts() {
+  const tb = $('hubBody');
+  if (!tb) return;
+  if (!hubAccounts.length) {
+    tb.innerHTML = '<tr><td colspan="6"><div class="empty">暂无其他厂商账号（Trae / Qoder）——用上方按钮扫码添加</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = hubAccounts.map(a => {
+    const meta = PROVIDER_META[a.provider] || { label: a.provider, color: 'var(--ink-3)' };
+    const st = a.status === 'disabled' ? '<span class="tag bad">已禁用</span>'
+      : a.status === 'cooling' ? '<span class="tag warn">冷却</span>'
+      : '<span class="tag ok">可用</span>';
+    // 积分单元格（HTML，与 workbuddy 行同款直接拼接）：主额度 + Addon 池两行。
+    // 只含数字与本模板固定标签，无用户输入，安全。
+    let cred = '—';
+    if (a.credits != null) {
+      if (typeof a.credits === 'object' && a.credits.remain != null) {
+        cred = a.credits.total > 0 ? a.credits.remain + ' / ' + a.credits.total : String(a.credits.remain);
+        if (a.credits.addon_total > 0) {
+          cred += '<div class="id">Addon ' + a.credits.addon_remain + ' / ' + a.credits.addon_total + '</div>';
+        }
+      } else {
+        cred = String(a.credits);
+      }
+    }
+    const nick = a.nickname || 'Qoder 账号';
+    // 签到列：trae 看 checked_in（每日 9 点自动）；qoder 显示自动签到开关。
+    let checkinCell = '—';
+    if (a.provider === 'trae') {
+      const acc = ((hubCheckin.trae || {}).accounts || []).find(x => String(x.uid) === String(a.uid));
+      if (acc) checkinCell = acc.checked_in
+        ? '<span class="tag ok">已签 +' + esc(String(acc.checkin_credits || 0)) + '</span>'
+        : '<span class="tag warn">未签</span>';
+    } else if (a.provider === 'qoder') {
+      const q = hubCheckin.qoder || {};
+      checkinCell = q.auto_checkin
+        ? '<span class="tag ok">自动每日</span>'
+        : '<span class="tag warn">未开启</span>';
+    }
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"><i></i></td>' +
+      '<td class="who"><div class="nm">' + esc(nick) +
+        ' <span class="provider-tag" style="color:' + meta.color + ';border-color:' + meta.color + '">' + meta.label + '</span>' +
+        (a.realm ? ' <span class="realm-tag">' + esc(a.realm) + '</span>' : '') + '</div>' +
+      '<div class="id">' + esc(String(a.uid || '').slice(0, 16)) + '</div></td>' +
+      '<td>' + st + '</td>' +
+      '<td>' + checkinCell + '</td>' +
+      '<td class="cred"><div class="n">' + cred + '</div></td>' +
+      '<td class="num"><button class="xs" data-checkin="' + a.provider + '">签到</button></td>' +
+      '</tr>';
+  }).join('');
+}
+
+// OAuth 添加：发起 → 返回 login_url 给用户点开 → 轮询 wait（简单实现：手动刷新）。
+async function hubOAuthStart(provider, region) {
+  const d = await hubApi('/hub/api/oauth/start', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: provider, region: region || 'cn' }),
+  });
+  return d.login_url;
+}
+
+// 手动触发签到（qoder 即时签；trae 返回说明）。GET/POST 同端点。
+async function hubCheckinNow(provider) {
+  return hubApi('/hub/api/checkin', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: provider }),
+  });
+}
+
+function tokensEquiv(accounts, remSum) {
+  if (!remSum || remSum <= 0) return '—';
+  let weighted = 0, samples = 0;
+  for (const s of accounts) {
+    for (const c of (s.model_costs || [])) {
+      if (c.cost_per_1k > 0 && c.samples > 0) {
+        weighted += c.cost_per_1k * c.samples;
+        samples += c.samples;
+      }
+    }
+  }
+  if (samples === 0) return '—';
+  const per1k = weighted / samples;   // 积分 / 1K tokens
+  if (!Number.isFinite(per1k) || per1k <= 0) return '—';
+  return '≈ ' + formatTokenCount(Math.round(remSum / per1k * 1000)) + ' tokens';
+}
+
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
@@ -243,6 +372,7 @@ async function loadOverview(quiet) {
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
   const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
   $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
+    $('sTokensEquiv').textContent = tokensEquiv(d.accounts || [], remSum);
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
@@ -254,6 +384,7 @@ async function loadOverview(quiet) {
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
+    loadHubAccounts();
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
@@ -266,6 +397,108 @@ $('btnAccMask').onclick = () => {
   toast(accMask ? '已隐藏账号信息（截图分享用）' : '已显示账号信息', 'ok');
 };
 syncMaskBtn();
+
+// ── 跨厂商账号添加（hub OAuth）──────────────────────────────────
+async function hubOAuthFlow(provider, region) {
+  const start = await hubApi('/hub/api/oauth/start', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: provider, region: region || 'cn' }),
+  });
+  console.log('[hub-oauth] start', provider, start);
+  if (!start.login_url) throw new Error('后端未返回 login_url：' + JSON.stringify(start).slice(0, 200));
+  window.open(start.login_url, '_blank');
+  toast('授权页已打开，完成后本页自动继续…', 'ok');
+  const body = { provider: provider, login_id: start.login_id };
+  // qoder 的 wait 是长轮询（hub 侧已放宽到 11 分钟）：一次调用阻塞到授权完成，
+  // 成功直接返回账号对象。trae 是短查询，需间隔轮询。
+  if (provider === 'qoder') {
+    const w = await hubApi('/hub/api/oauth/wait', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    console.log('[hub-oauth] wait(qoder)', w);
+    if (w && (w.id || w.uid || w.ok)) {
+      toast('授权成功：账号已加入 ' + provider + ' 账号池', 'ok');
+      loadHubAccounts();
+      return;
+    }
+    throw new Error('未拿到账号：' + JSON.stringify(w).slice(0, 200));
+  }
+  for (let i = 0; i < 10; i++) {
+    await new Promise(r => setTimeout(r, i === 0 ? 8000 : 30000));
+    try {
+      const w = await hubApi('/hub/api/oauth/wait', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (w && (w.id || w.uid || w.ok)) {
+        toast('授权成功：账号已加入 ' + provider + ' 账号池', 'ok');
+        loadHubAccounts();
+        return;
+      }
+    } catch (e) {
+      console.warn('[hub-oauth] poll', i, e.message);
+      if (!/400/.test(e.message)) throw e; // 400=未完成，继续等
+    }
+  }
+  throw new Error('等待授权超时（5 分钟），请重试');
+}
+$('btnTraeAdd').onclick = async () => {
+  try {
+    // Trae 的授权回调打到 127.0.0.1:18080（本机模式），服务器部署收不到。
+    // 流程：打开授权页 → 授权后浏览器跳到 127.0.0.1:18080/authorize?...（会打不开）
+    // → 把地址栏完整 URL 粘回弹窗 → 经 hub 转发完成登录。
+    const start = await hubApi('/hub/api/oauth/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'trae' }),
+    });
+    window.open(start.login_url, '_blank');
+    const cb = prompt('授权页已在新窗口打开。完成授权后浏览器会跳转到 127.0.0.1:18080 开头的地址（打不开是正常的）。把地址栏完整 URL 粘贴到这里：');
+    if (!cb) return;
+    await hubApi('/hub/api/oauth/complete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: 'trae', callback_url: cb.trim() }),
+    });
+    toast('Trae 账号已加入账号池', 'ok');
+    loadHubAccounts();
+  } catch (e) { toast(e.message, 'err'); }
+};
+$('hubBody').addEventListener('click', async ev => {
+  const b = ev.target.closest('button[data-checkin]');
+  if (!b) return;
+  b.disabled = true;
+  try {
+    const r = await hubCheckinNow(b.dataset.checkin);
+    if (r && r.message) toast(r.message, 'ok');       // trae：完成 + 待重试数
+    else if (r && r.summary) toast('Qoder 签到完成', 'ok');
+    else if (r && r.note) toast(r.note, 'ok');
+    else toast('已触发', 'ok');
+    loadHubAccounts();
+  } catch (e) { toast(e.message, 'err'); b.disabled = false; }
+});
+async function triggerCheckin(provider) {
+  const r = await hubCheckinNow(provider);
+  if (r && r.summary) toast('Qoder 签到完成', 'ok');
+  else if (r && r.note) toast(r.note, 'ok');
+  else toast('已触发', 'ok');
+  loadHubAccounts();
+}
+$('btnQoderAdd').onclick = async () => {
+  try {
+    await hubOAuthFlow('qoder', 'cn');
+  } catch (e) { toast(e.message, 'err'); }
+};
+// hub key 设置入口：设置页存 localStorage（与 panel key 分离）。
+const hubKeyInput = $('hubKeyInput');
+if (hubKeyInput) {
+  hubKeyInput.value = hubKey;
+  $('btnHubKeySave').onclick = () => {
+    hubKey = hubKeyInput.value.trim();
+    localStorage.setItem('wb2api.hubkey', hubKey);
+    toast('Hub Key 已保存', 'ok');
+    loadHubAccounts();
+  };
+}
 
 $('accBody').addEventListener('click', async ev => {
   const b = ev.target.closest('button[data-a]');
@@ -370,7 +603,18 @@ async function loadModels() {
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
     const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
-    const list = d.models || [];
+    let list = (d.models || []).map(m => Object.assign({}, m, { _provider: 'workbuddy' }));
+    // 跨厂商模型：hub key 配置时拉 trae/qoder 目录，加前缀 id 与厂商标。
+    if (hubKey) {
+      for (const prov of ['trae', 'qoder']) {
+        try {
+          const md = await hubApi('/hub/api/models?provider=' + prov);
+          for (const m of (md.data || [])) {
+            list.push({ id: prov + '/' + m.id, name: m.owned_by || '', _provider: prov, _raw: m });
+          }
+        } catch (e) { /* 单厂商失败不拖累整页 */ }
+      }
+    }
     if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
     const probes = pr.probes || {};
     const probeKeys = Object.keys(probes);
@@ -388,7 +632,11 @@ async function loadModels() {
       if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
       const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
       const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+      const pmeta = PROVIDER_META[m._provider] || { label: m._provider, color: 'var(--ink-3)' };
+      const provTag = m._provider !== 'workbuddy'
+        ? ' <span class="provider-tag" style="color:' + pmeta.color + ';border-color:' + pmeta.color + '">' + pmeta.label + '</span>'
+        : '';
+      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + provTag + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
         '<td class="num">' + rateCell(m) + '</td>' +
         '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="efs" style="white-space:normal">' + effs + '</td>' +
