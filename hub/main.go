@@ -20,8 +20,13 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
+
+// modelsClient 供 fetchModels 复用：每次新建会丢弃连接池，healthz 高频调用时
+// 产生大量 TIME_WAIT。
+var modelsClient = &http.Client{Timeout: 15 * time.Second}
 
 type backend struct {
 	name   string          // 诊断用
@@ -30,7 +35,31 @@ type backend struct {
 	key    string          // 上游 API key（替换 Authorization）
 	keyHdr string          // key 放哪个头（Qoder bridge 用 x-api-key，其余 Bearer）
 	proxy  *httputil.ReverseProxy
+
+	mu     sync.RWMutex
 	models []modelEntry // 启动时探测的模型（无前缀），聚合时加前缀
+}
+
+// modelsSnapshot 读副本：遍历期间 backend 可能正被 healthz 重探写入，
+// 无锁会导致 data race。返回浅拷贝（[]modelEntry 元素不可变，安全）。
+func (b *backend) modelsSnapshot() []modelEntry {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return append([]modelEntry(nil), b.models...)
+}
+
+// setModels 写入探测结果（healthz 复查 / 惰性重探共用）。
+func (b *backend) setModels(ms []modelEntry) {
+	b.mu.Lock()
+	b.models = ms
+	b.mu.Unlock()
+}
+
+// modelsCount 只取长度（供日志/健康检查，不需要整份拷贝）。
+func (b *backend) modelsCount() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return len(b.models)
 }
 
 // modelEntry 是聚合目录里的一条：除 id 外保留后端给的积分倍率（rate，形如
@@ -119,8 +148,7 @@ func (b *backend) fetchModels() []modelEntry {
 	} else if b.key != "" {
 		req.Header.Set("Authorization", "Bearer "+b.key)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := modelsClient.Do(req)
 	if err != nil {
 		log.Printf("[hub] %s models probe failed: %v", b.name, err)
 		return nil
@@ -210,8 +238,8 @@ func main() {
 		newBackend("qoder", "qoder", qoderTarget, qoderKey, "x-api-key"),
 	}
 	for _, b := range backends {
-		b.models = b.fetchModels()
-		log.Printf("[hub] %s: %d models", b.name, len(b.models))
+		b.setModels(b.fetchModels())
+		log.Printf("[hub] %s: %d models", b.name, b.modelsCount())
 	}
 
 	mux := http.NewServeMux()
@@ -231,6 +259,14 @@ func main() {
 	// 网关占住 7863 后面板不能凭空消失，且面板自己有独立鉴权，网关不再拦一道。
 	panelProxy := httputil.NewSingleHostReverseProxy(backends[0].target)
 	panelProxy.FlushInterval = -1
+	// 与 backends 的 ErrorHandler 对齐：workbuddy 不可达时也返回 JSON，
+	// 否则面板路径在故障时输出 Go 默认的 502 文本，破坏客户端 JSON 解析。
+	panelProxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("[hub] panel proxy error: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		io.WriteString(w, `{"error":{"message":"workbuddy unavailable","type":"hub_bad_gateway","code":"hub_502"}}`)
+	}
 	mux.Handle("/", panelProxy)
 	log.Printf("[hub] listening on %s", listen)
 	log.Fatal(http.ListenAndServe(listen, mux))
@@ -268,10 +304,12 @@ func listModels(w http.ResponseWriter, r *http.Request) {
 	out := make([]entry, 0, 64)
 	now := time.Now().Unix()
 	for _, b := range backends {
-		if len(b.models) == 0 {
-			b.models = b.fetchModels() // 惰性重探：后端恢复后目录自动补全
+		ms := b.modelsSnapshot()
+		if len(ms) == 0 {
+			ms = b.fetchModels() // 惰性重探：后端恢复后目录自动补全
+			b.setModels(ms)
 		}
-		for _, m := range b.models {
+		for _, m := range ms {
 			full := m.ID
 			if b.prefix != "" {
 				full = b.prefix + "/" + m.ID
@@ -289,6 +327,7 @@ func listModels(w http.ResponseWriter, r *http.Request) {
 // chat 转发核心：读 body 取 model → 选后端 → 剥前缀 → 整包转发。
 // body 大小钳 32M（workbuddy 上游限 32M），SSE 由 ReverseProxy 流式透传。
 func chat(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close() // 替换 body 前先关闭原始的，避免连接资源滞留
 	body, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "read body: "+err.Error())
@@ -321,7 +360,7 @@ func healthz(w http.ResponseWriter, r *http.Request) {
 	status := map[string]any{"ok": true}
 	for _, b := range backends {
 		ms := b.fetchModels()
-		b.models = ms
+		b.setModels(ms)
 		status[b.name] = map[string]any{"reachable": len(ms) > 0 || probeOK(b), "models": len(ms)}
 	}
 	writeJSON(w, status)
