@@ -269,6 +269,7 @@ async function loadHubAccounts() {
     const d = await hubApi('/hub/api/accounts');
     hubAccounts = (d.accounts || []).filter(a => a.provider !== 'workbuddy');
     renderHubAccounts();
+    renderCreditSummary(); // 跨厂商积分并入顶部汇总
     hubApi('/hub/api/checkin').then(c => { hubCheckin = c; renderHubAccounts(); }).catch(() => {});
   } catch (e) { console.warn('hub accounts:', e.message); }
 }
@@ -361,6 +362,33 @@ function tokensEquiv(accounts, remSum) {
   return '≈ ' + formatTokenCount(Math.round(remSum / per1k * 1000)) + ' tokens';
 }
 
+// 跨厂商积分归一：trae 给整数（剩余额度），qoder 给 {remain,total,addon_*}。
+// 统一取「剩余 / 总量」，总量缺失时用剩余顶上（只显示一个数）。
+function hubCreditParts(a) {
+  const c = a && a.credits;
+  if (c == null) return { remain: 0, total: 0 };
+  if (typeof c === 'number') return { remain: c, total: 0 };
+  const remain = (c.remain || 0) + (c.addon_remain || 0);
+  const total = (c.total || 0) + (c.addon_total || 0);
+  return { remain: remain, total: total };
+}
+
+// 顶部积分汇总 = workbuddy 池 + 跨厂商（trae/qoder）池。
+// loadOverview 先跑、loadHubAccounts 后跑，所以两处都要调：hub 账号到位后重算一次。
+function renderCreditSummary() {
+  if (!$('sCredits')) return;
+  const wb = (overviewData && overviewData.accounts) || [];
+  let remSum = wb.reduce((a, s) => a + (s.credits || 0), 0);
+  let totSum = wb.reduce((a, s) => a + (s.credits_total || 0), 0);
+  for (const a of (hubAccounts || [])) {
+    const p = hubCreditParts(a);
+    remSum += p.remain;
+    totSum += p.total;
+  }
+  $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
+  $('sTokensEquiv').textContent = tokensEquiv(wb, remSum);
+}
+
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
@@ -369,10 +397,7 @@ async function loadOverview(quiet) {
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
     $('sDisabled').textContent = d.disabled;
-    const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
-  const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
-  $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
-    $('sTokensEquiv').textContent = tokensEquiv(d.accounts || [], remSum);
+    renderCreditSummary();
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
     $('navVer').textContent = 'v' + d.version;
