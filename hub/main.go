@@ -72,6 +72,9 @@ type modelEntry struct {
 	Efforts       []string // 推理档位（可空：trae 上游不给）
 	DefaultEffort string
 	CanDisable    bool // 能否关闭思考
+	// 上游原始字段全量保留（context_length / max_output_tokens / supports_* /
+	// description / tags 等），透传给 /v1/models 让客户端能拿到与上游一致的元数据。
+	Raw map[string]any
 }
 
 var (
@@ -159,51 +162,47 @@ func (b *backend) fetchModels() []modelEntry {
 		return nil
 	}
 	var out struct {
-		Data []struct {
-			ID string `json:"id"`
-			// 官方全名：qoder 用 display_name（qmodel_38max → Qwen3.8-Max），
-			// workbuddy 用 name（cn:hy3 → Hy3），trae 两者都不给。
-			DisplayName string `json:"display_name"`
-			Name        string `json:"name"`
-			// workbuddy 给字符串 "x0.79"；qoder 给数字 price_factor；trae 两者都没有。
-			Credits     string   `json:"credits"`
-			PriceFactor *float64 `json:"price_factor"` // 指针：0（免费）与「字段缺失」要区分
-			// 推理档位：workbuddy 用 reasoning_* 前缀，qoder bridge 用 efforts，
-			// trae 上游不提供。
-			ReasoningEfforts []string `json:"reasoning_supported_efforts"`
-			Efforts          []string `json:"efforts"`
-			DefaultEffort    string   `json:"default_effort"`
-			ReasoningDefault string   `json:"reasoning_default_effort"`
-			CanDisable       bool     `json:"can_disable_thinking"`
-		} `json:"data"`
+		Data []map[string]any `json:"data"`
 	}
 	if json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out) != nil {
 		return nil
 	}
 	entries := make([]modelEntry, 0, len(out.Data))
-	for _, m := range out.Data {
-		if m.ID == "" {
+	for _, raw := range out.Data {
+		id, _ := raw["id"].(string)
+		if id == "" {
 			continue
 		}
-		e := modelEntry{ID: m.ID, Name: m.DisplayName}
-		if e.Name == "" {
-			e.Name = m.Name
+		e := modelEntry{ID: id, Raw: raw}
+		// 官方全名：qoder 用 display_name（qmodel_38max → Qwen3.8-Max），
+		// workbuddy 用 name（cn:hy3 → Hy3），trae 两者都不给。
+		if v, _ := raw["display_name"].(string); v != "" {
+			e.Name = v
+		} else if v, _ := raw["name"].(string); v != "" {
+			e.Name = v
 		}
-		switch {
-		case m.Credits != "":
-			e.Rate = m.Credits
-		case m.PriceFactor != nil:
-			e.Rate = fmt.Sprintf("x%g", *m.PriceFactor)
+		// 倍率：workbuddy 给字符串 "x0.79"；qoder 给数字 price_factor。
+		if v, _ := raw["credits"].(string); v != "" {
+			e.Rate = v
+		} else if v, ok := raw["price_factor"]; ok && v != nil {
+			if f, ok := v.(float64); ok {
+				e.Rate = fmt.Sprintf("x%g", f)
+			}
 		}
-		e.Efforts = m.ReasoningEfforts
-		if len(e.Efforts) == 0 {
-			e.Efforts = m.Efforts
+		// 档位：workbuddy 用 reasoning_* 前缀，qoder bridge 用 efforts。
+		if v, ok := raw["reasoning_supported_efforts"].([]any); ok {
+			e.Efforts = toStrings(v)
+		} else if v, ok := raw["efforts"].([]any); ok {
+			e.Efforts = toStrings(v)
 		}
-		e.DefaultEffort = m.ReasoningDefault
-		if e.DefaultEffort == "" {
-			e.DefaultEffort = m.DefaultEffort
+		if v, _ := raw["reasoning_default_effort"].(string); v != "" {
+			e.DefaultEffort = v
+		} else if v, _ := raw["default_effort"].(string); v != "" {
+			e.DefaultEffort = v
 		}
-		e.CanDisable = m.CanDisable
+		if v, _ := raw["can_disable_thinking"].(bool); v {
+			e.CanDisable = true
+		}
 		entries = append(entries, e)
 	}
 	return entries
@@ -288,20 +287,12 @@ func withAuth(next http.HandlerFunc) http.HandlerFunc {
 
 // listModels 聚合三家目录：workbuddy 裸名直出，trae/qoder 加前缀。
 // model 字段带 prefix 的同时， owned_by 标后端名，客户端可据此区分。
+//
+// 输出策略：上游原始字段全量保留（context_length / max_output_tokens /
+// supports_* / description / tags 等），外加统一字段名（name / rate /
+// supported_efforts / default_effort / can_disable_thinking）——客户端可按需取用。
 func listModels(w http.ResponseWriter, r *http.Request) {
-	type entry struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		OwnedBy string `json:"owned_by"`
-		Name    string `json:"name,omitempty"` // 官方全名，便于辨认代号型 id（如 qmodel_38max）
-		Rate    string `json:"rate,omitempty"` // 积分倍率（x0.79）；trae 上游不提供则缺省
-		// 推理档位（qoder/workbuddy 有，trae 上游不提供则缺省）
-		SupportedEfforts []string `json:"supported_efforts,omitempty"`
-		DefaultEffort    string   `json:"default_effort,omitempty"`
-		CanDisable       bool     `json:"can_disable_thinking,omitempty"`
-	}
-	out := make([]entry, 0, 64)
+	out := make([]map[string]any, 0, 64)
 	now := time.Now().Unix()
 	for _, b := range backends {
 		ms := b.modelsSnapshot()
@@ -314,11 +305,31 @@ func listModels(w http.ResponseWriter, r *http.Request) {
 			if b.prefix != "" {
 				full = b.prefix + "/" + m.ID
 			}
-			out = append(out, entry{
-				ID: full, Object: "model", Created: now, OwnedBy: b.name,
-				Name: m.Name, Rate: m.Rate,
-				SupportedEfforts: m.Efforts, DefaultEffort: m.DefaultEffort, CanDisable: m.CanDisable,
-			})
+			// 以原始字段为底，再叠加统一字段与厂商标记。
+			e := map[string]any{}
+			for k, v := range m.Raw {
+				e[k] = v
+			}
+			e["id"] = full
+			e["object"] = "model"
+			e["created"] = now
+			e["owned_by"] = b.name
+			if m.Name != "" {
+				e["name"] = m.Name
+			}
+			if m.Rate != "" {
+				e["rate"] = m.Rate
+			}
+			if len(m.Efforts) > 0 {
+				e["supported_efforts"] = m.Efforts
+			}
+			if m.DefaultEffort != "" {
+				e["default_effort"] = m.DefaultEffort
+			}
+			if m.CanDisable {
+				e["can_disable_thinking"] = true
+			}
+			out = append(out, e)
 		}
 	}
 	writeJSON(w, map[string]any{"object": "list", "data": out})
@@ -380,6 +391,17 @@ func probeOK(b *backend) bool {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
+}
+
+// toStrings 把 []any 收拢成 []string（上游 JSON 数组里的元素都是 string）。
+func toStrings(v []any) []string {
+	out := make([]string, 0, len(v))
+	for _, x := range v {
+		if s, ok := x.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
