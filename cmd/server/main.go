@@ -32,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.11.6-panel"
+const appVersion = "1.11.7-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -166,6 +166,13 @@ func main() {
 	// 积分账本 + 成员体系（fork 特性）：与 state 文件同目录。
 	lgr := ledger.New(ledger.DefaultPath(cfg.StateFile), ledger.DefaultMax)
 	members := member.NewStore(member.DefaultPath(cfg.StateFile))
+	members.StartFlusher() // 周期落盘：chat 记账只置脏，无此则重启丢窗口数据
+	if lp := member.DefaultPath(cfg.StateFile); lp != "" {
+		if _, err := os.Stat(lp); err == nil {
+			// members.json 旁的 ledger.json：回填因缺 Flush 丢失的记账（一次性幂等）。
+			members.BackfillFromLedger(filepath.Join(filepath.Dir(lp), "ledger.json"))
+		}
+	}
 
 	sch := scheduler.New(scheduler.Config{
 		Ledger:              lgr,
@@ -176,6 +183,7 @@ func main() {
 		ActivityHours:  cfg.Schedule.ActivityHours,
 		KeepaliveHours: cfg.Schedule.KeepaliveHours,
 		BlackcatHours:  cfg.Schedule.BlackcatHours,
+		GrowthHours:    cfg.Schedule.GrowthHours,
 		// 快过期积分优先消耗：签到/余额刷新按此窗口分桶（issue:积分过期）。
 		ExpiringSoonWindow: cfg.ExpiringSoonDur,
 		CheckinDisabled:    !cfg.Schedule.CheckinEnabled,
@@ -183,6 +191,7 @@ func main() {
 		ActivityDisabled:   !cfg.Schedule.ActivityEnabled,
 		KeepaliveDisabled:  !cfg.Schedule.KeepaliveEnabled,
 		BlackcatDisabled:   !cfg.Schedule.BlackcatEnabled,
+		GrowthDisabled:     !cfg.Schedule.GrowthEnabled,
 	})
 	switch {
 	case !cfg.Schedule.CheckinEnabled:
@@ -273,6 +282,9 @@ func main() {
 			os.Exit(0) // 兜底：信号未就绪时直接退出（容器策略同样拉起）
 		},
 	})
+	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
+	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
+	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
 	log.SetOutput(io.MultiWriter(os.Stderr, pn.Logs()))
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
@@ -401,8 +413,10 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
 		newCfg.Schedule.ActivityHours, newCfg.Schedule.KeepaliveHours, newCfg.Schedule.BlackcatHours,
+		newCfg.Schedule.GrowthHours,
 		!newCfg.Schedule.CheckinEnabled, !newCfg.Schedule.TravelEnabled,
-		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled)
+		!newCfg.Schedule.ActivityEnabled, !newCfg.Schedule.KeepaliveEnabled, !newCfg.Schedule.BlackcatEnabled,
+		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 
 	return restartRequiredFields(newCfg), nil

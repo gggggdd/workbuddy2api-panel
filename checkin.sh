@@ -45,14 +45,14 @@ command -v jq >/dev/null 2>&1 || HAS_JQ=0
 
 # ─── 解析服务地址与密钥：优先 WB2A_URL，其次 config.json ──────────────────────
 CFG=${WB2A_CONFIG:-config.json}
-PORT=7863
+PORT=7865
 KEY=""
 if [[ -f "$CFG" ]] && [[ "$HAS_JQ" == "1" ]]; then
-    LISTEN=$(jq -r '.listen // ":7863"' "$CFG")
+    LISTEN=$(jq -r '.listen // ":7865"' "$CFG")
     PORT=${LISTEN##*:}
     KEY=$(jq -r '.api_key // ""' "$CFG")
 fi
-PORT=${PORT:-7863}
+PORT=${PORT:-7865}
 BASE=${WB2A_URL:-http://localhost:$PORT}
 
 AUTH=()

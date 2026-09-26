@@ -142,10 +142,9 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
-  if (v === 'taskscenter') { loadSchoolStatus(true); reattachQueueView(); }
+  if (v === 'taskscenter') reattachQueueView();
   if (v === 'members') loadMembers();
-  if (v === 'ledger') loadLedger();
-}
+  if (v === 'ledger') loadLedger();}
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
 
@@ -690,7 +689,7 @@ $('btnLogPin').onclick = () => {
 /* ── 配置 ─────────────────────────────────────────────────────────── */
 const CFG_MAP = {
   listen: ['listen'], api_key: ['api_key'],
-  checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'],
+  checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
@@ -1110,13 +1109,6 @@ $('taskBody').addEventListener('click', async ev => {
 });
 
 /* ── 任务中心：开学季 + 全账号扫描/队列 ──────────────────────────── */
-const SCHOOL_META = [
-  ['share_invite', '分享'],
-  ['desktop_chat_1_time', '桌面'],
-  ['chat_3_times', '对话×3'],
-  ['expert_use', '专家'],
-  ['task_student_verify', '认证'],
-];
 // 开学季任务单元：✓ 已领（绿）｜◐ x/y 进行中（琥珀）｜○ 未做（灰）
 function staskHTML(t) {
   if (!t) return '<span class="stask todo"><span class="mark">·</span>—</span>';
@@ -1129,58 +1121,10 @@ function staskHTML(t) {
   return '<span class="stask todo"><span class="mark">○</span>未做</span>';
 }
 const LUCK_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.2 5.2 5 1.8l3 2.4 3-2.4 1.8 3.4-1.4 2.6 1.4 2.6-3.4 2.2H6l-3.4-2.2 1.4-2.6z" opacity=".9"/><circle cx="8" cy="9" r="1.1" fill="currentColor" stroke="none"/></svg>';
-async function loadSchoolStatus(quiet) {
-  const st = $('schoolState'), list = $('schoolList');
-  if (!quiet) { st.hidden = false; st.className = 'state'; st.innerHTML = '<span class="dots">查询中</span>'; list.innerHTML = ''; }
-  try {
-    const d = await api('school/status');
-    const arr = d.accounts || [];
-    if (!arr.length) {
-      st.hidden = false; st.className = 'state'; st.textContent = '暂无可用账号';
-      list.innerHTML = ''; return;
-    }
-    let allDone = 0;
-    const head = '<div class="shead"><div class="who">账号</div><div class="stasks">' +
-      SCHOOL_META.map(([, name]) => '<span>' + esc(name) + '</span>').join('') +
-      '</div><div class="luck">剩余抽奖</div></div>';
-    list.innerHTML = head + arr.map(v => {
-      const by = {};
-      (v.tasks || []).forEach(t => by[t.task_code] = t);
-      const cells = SCHOOL_META.map(([code]) => {
-        const t = by[code];
-        const html = code === 'task_student_verify'
-          ? '<span class="stask todo"><span class="mark">—</span>不做</span>'
-          : staskHTML(t);
-        return '<span title="' + esc(SCHOOL_TITLES[code] || code) + '">' + html + '</span>';
-      }).join('');
-      const done = SCHOOL_META.filter(([code]) => code !== 'task_student_verify' && by[code] && by[code].status === 'claimed').length;
-      allDone += done === 4 ? 1 : 0;
-      return '<div class="srow">' +
-        '<div class="who"><div class="nm" title="' + esc(v.nickname || '') + '">' + esc(v.nickname || '未命名') + '</div><div class="id">' + esc(v.uid) + '</div></div>' +
-        '<div class="stasks">' + cells + '</div>' +
-        '<div class="luck" title="剩余抽奖次数">' + LUCK_SVG + (v.chances == null ? '—' : v.chances) + '</div>' +
-        (v.error ? '<div class="err">' + esc(v.error) + '</div>' : '') +
-        '</div>';
-    }).join('');
-    $('schoolSummary').textContent = allDone === arr.length ? '今日全部完成 🎉' : allDone + '/' + arr.length + ' 个账号今日全部完成';
-    st.hidden = true;
-  } catch (e) {
-    st.hidden = false; st.className = 'state err'; st.textContent = e.message;
-  }
-}
 const SCHOOL_TITLES = {
   share_invite: '分享活动 +100c', desktop_chat_1_time: '桌面端体验 +100c（单次）',
   chat_3_times: '和 AI 对话 3 次 +50c', expert_use: '召唤开学季专家 +50c',
   task_student_verify: '学生认证 +100c（需真实认证，不做）',
-};
-$('btnSchoolRefresh').onclick = () => loadSchoolStatus(false);
-$('btnSchoolRunAll').onclick = async () => {
-  if (!confirm('将对全部账号执行开学季闭环（分享/桌面/对话/专家 + 抽奖），约 1-2 分钟。确认继续？')) return;
-  try {
-    await api('school/run_all', { method: 'POST' });
-    toast('开学季闭环已开始，结果看任务日志', 'ok');
-    setTimeout(() => loadSchoolStatus(true), 15000);
-  } catch (e) { toast(e.message, 'err'); }
 };
 
 /* ── 精简 QR 编码器（券码二维码用）────────────────────────────────────
@@ -1457,10 +1401,6 @@ function groupItems(d) {
       GROWTH_TITLES[t.task_code] = t.title || t.task_code;
       rows.push({ kind: 'growth', code: t.task_code, prog: t.target ? t.current + '/' + t.target : '—', status: 'scan' });
     }
-    for (const t of (a.school || [])) {
-      if (t.task_code === 'task_student_verify') continue; // 需真实认证，永不出现在待办
-      rows.push({ kind: 'school', code: t.task_code, prog: t.target_count ? t.progress + '/' + t.target_count : '—', status: 'scan' });
-    }
     if (rows.length) groups.push({ uid: a.uid, nick: a.nickname, rows });
   }
   return groups;
@@ -1538,7 +1478,6 @@ function startQueuePolling() {
     renderQueue(groupsFromQueue(q.items || []), q);
     clearInterval(queueTimer); queueTimer = null;
     toast('任务队列执行结束', 'ok');
-    loadSchoolStatus(true);
   }, 3000);
 }
 // reattachQueueView 切回任务中心视图时恢复队列进度：仅当本页启动的队列仍在

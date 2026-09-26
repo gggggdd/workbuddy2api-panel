@@ -199,7 +199,7 @@ func normalizeRoles(obj map[string]any) {
 	if !ok {
 		return
 	}
-	for i, m := range msgs {
+	for _, m := range msgs {
 		msg, ok := m.(map[string]any)
 		if !ok {
 			continue
@@ -210,7 +210,9 @@ func normalizeRoles(obj map[string]any) {
 		}
 		if strings.EqualFold(strings.TrimSpace(role), "developer") {
 			msg["role"] = "system"
-			log.Printf("role normalized developer->system idx=%d", i)
+			// 有意不打日志：本归一化对每个含 developer 的请求都会命中，逐条打会把
+			// 面板日志环形缓冲刷满并挤掉任务日志——曾因此让「签到 / 猫猫旅行」在
+			// 面板日志视图里不可见。需要排查时按需临时加回。
 		}
 	}
 }
