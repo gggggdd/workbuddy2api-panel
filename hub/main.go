@@ -9,7 +9,7 @@
 // 后端各自独立鉴权，互不知晓。workbuddy 后端例外：调用方用的是本体签发的 key
 // （主 key / 成员 key）时原样透传，本体才能把用量归因到成员。
 // SSE 场景 flush_interval 关闭逐字透传，超时对齐 Caddy 现有配置
-//（response header 600s）。
+// （response header 600s）。
 package main
 
 import (
@@ -31,13 +31,13 @@ import (
 var modelsClient = &http.Client{Timeout: 15 * time.Second}
 
 type backend struct {
-	name   string          // 诊断用
-	prefix string          // 模型 id 前缀（"" = workbuddy 默认）
-	target *url.URL        // 上游 base
-	key    string          // 上游 API key（替换 Authorization）
-	keyHdr string          // key 放哪个头（Qoder bridge 用 x-api-key，其余 Bearer）
+	name          string   // 诊断用
+	prefix        string   // 模型 id 前缀（"" = workbuddy 默认）
+	target        *url.URL // 上游 base
+	key           string   // 上游 API key（替换 Authorization）
+	keyHdr        string   // key 放哪个头（Qoder bridge 用 x-api-key，其余 Bearer）
 	keepCallerKey bool     // 调用方 key 由该后端签发时原样透传（保留成员用量归因）
-	proxy  *httputil.ReverseProxy
+	proxy         *httputil.ReverseProxy
 
 	mu     sync.RWMutex
 	models []modelEntry // 启动时探测的模型（无前缀），聚合时加前缀
@@ -81,28 +81,100 @@ type modelEntry struct {
 }
 
 var (
-	listen    = envOr("HUB_LISTEN", ":7860")
-	hubKey    = envOr("HUB_API_KEY", "")
-	wbTarget  = envOr("HUB_WB_TARGET", "http://127.0.0.1:7863")
-	wbKey     = envOr("HUB_WB_KEY", "")
-	traeTarget = envOr("HUB_TRAE_TARGET", "http://127.0.0.1:7864")
-	traeKey   = envOr("HUB_TRAE_KEY", "")
-	qoderTarget = envOr("HUB_QODER_TARGET", "http://127.0.0.1:8963")
-	qoderKey  = envOr("HUB_QODER_KEY", "qccg")
+	listen               = envOr("HUB_LISTEN", ":7860")
+	hubKey               = envOr("HUB_API_KEY", "")
+	wbTarget             = envOr("HUB_WB_TARGET", "http://127.0.0.1:7863")
+	wbKey                = envOr("HUB_WB_KEY", "")
+	traeTarget           = envOr("HUB_TRAE_TARGET", "http://127.0.0.1:7864")
+	traeKey              = envOr("HUB_TRAE_KEY", "")
+	qoderTarget          = envOr("HUB_QODER_TARGET", "http://127.0.0.1:8963")
+	qoderKey             = envOr("HUB_QODER_KEY", "qccg")
 	qoderConsolePassword = envOr("HUB_QODER_CONSOLE_PASSWORD", "")
-	qoderConsoleTarget  = envOr("HUB_QODER_CONSOLE_TARGET", "http://127.0.0.1:3588")
-	errNoSession = errorString("qoder console session not obtained")
+	qoderConsoleTarget   = envOr("HUB_QODER_CONSOLE_TARGET", "http://127.0.0.1:3588")
+	errNoSession         = errorString("qoder console session not obtained")
 )
 
 // hubKeys 是网关接受的全部 API key：HUB_API_KEY 必填，HUB_EXTRA_KEYS 可追加
 // （逗号分隔）。加 workbuddy 面板 key 进来，是为了让 /v1/* 切到网关后既有客户端
 // 不用换 key——同一把 key 即可拿到三家聚合模型。
-var hubKeys = map[string]bool{}
+//
+// wbOriginKeys 是 workbuddy 本体签发的 key：主 key + 面板成员 key。这些 key 对
+// workbuddy 后端原样透传，本体才能把用量归因到成员。
+//
+// 两表均由 rebuildKeys 重建（env 口径 + HUB_KEYS_FILE 热加载口径），读写走
+// keysMu：面板签发/轮换/删除成员写 members.json 后，网关 5s 内自动跟进——
+// 新 key 即签即用，删除/轮换后旧 key 自动失效，不再依赖 sync-keys.sh 手动
+// 同步 + 重启（曾导致新签成员 key 被 401、成员用量归因丢失）。
+var (
+	keysMu       sync.RWMutex
+	hubKeys      = map[string]bool{}
+	wbOriginKeys = map[string]bool{}
+)
 
-// wbOriginKeys 是 workbuddy 本体签发的 key：主 key + 面板成员 key（由 sync-keys.sh
-// 从 config.json / data/members.json 同步进 HUB_EXTRA_KEYS）。这些 key 对 workbuddy
-// 后端原样透传，本体才能把用量归因到成员。
-var wbOriginKeys = map[string]bool{}
+// keysFile 面板成员密钥文件（HUB_KEYS_FILE，默认 /srv/keys/members.json，
+// 由 docker-compose 从 workbuddy2api-panel/data/members.json 只读挂载）。
+var keysFile = envOr("HUB_KEYS_FILE", "/srv/keys/members.json")
+
+// loadFileKeys 读 members.json（顶层数组）里的全部成员 key（解析失败/文件缺失
+// 返回 nil，维持 env 口径不动；本体写文件是原子语义，读侧最多错过一轮，下轮自愈）。
+func loadFileKeys() map[string]bool {
+	b, err := os.ReadFile(keysFile)
+	if err != nil {
+		return nil
+	}
+	var members []struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(b, &members); err != nil {
+		log.Printf("[hub] keys file %s parse: %v", keysFile, err)
+		return nil
+	}
+	m := map[string]bool{}
+	for _, x := range members {
+		if k := strings.TrimSpace(x.Key); k != "" {
+			m[k] = true
+		}
+	}
+	return m
+}
+
+// rebuildKeys 从 env + 密钥文件整体重建两表后原子换入。
+func rebuildKeys() {
+	hub := map[string]bool{hubKey: true}
+	origin := map[string]bool{}
+	for _, k := range strings.Split(envOr("HUB_EXTRA_KEYS", ""), ",") {
+		if k = strings.TrimSpace(k); k != "" {
+			hub[k] = true
+			origin[k] = true
+		}
+	}
+	if fileKeys := loadFileKeys(); fileKeys != nil {
+		for k := range fileKeys {
+			hub[k] = true
+			origin[k] = true
+		}
+	}
+	keysMu.Lock()
+	hubKeys, wbOriginKeys = hub, origin
+	keysMu.Unlock()
+}
+
+// watchKeys 启动时装载一次，之后每 5s 看 mtime/size，变了才重建。
+func watchKeys() {
+	rebuildKeys()
+	var lastM time.Time
+	var lastS int64
+	go func() {
+		for range time.Tick(5 * time.Second) {
+			st, err := os.Stat(keysFile)
+			if err != nil || (st.ModTime() == lastM && st.Size() == lastS) {
+				continue
+			}
+			lastM, lastS = st.ModTime(), st.Size()
+			rebuildKeys()
+		}
+	}()
+}
 
 type errorString string
 
@@ -146,9 +218,12 @@ func newBackend(name, prefix, rawTarget, key, keyHdr string, keepCallerKey bool)
 		// 主 key，成员用量会全部记不上（面板「成员管理」恒为 0）。
 		caller := bearerOf(r)
 		r.Header.Del("Authorization")
+		keysMu.RLock()
+		originKey := wbOriginKeys[caller]
+		keysMu.RUnlock()
 		if keyHdr == "x-api-key" {
 			r.Header.Set("x-api-key", key)
-		} else if b.keepCallerKey && wbOriginKeys[caller] {
+		} else if b.keepCallerKey && originKey {
 			r.Header.Set("Authorization", "Bearer "+caller)
 		} else if key != "" {
 			r.Header.Set("Authorization", "Bearer "+key)
@@ -249,13 +324,7 @@ func main() {
 	if hubKey == "" {
 		log.Fatal("HUB_API_KEY is required")
 	}
-	hubKeys[hubKey] = true
-	for _, k := range strings.Split(envOr("HUB_EXTRA_KEYS", ""), ",") {
-		if k = strings.TrimSpace(k); k != "" {
-			hubKeys[k] = true
-			wbOriginKeys[k] = true
-		}
-	}
+	watchKeys() // env 口径 + members.json 热加载（签发/轮换/删除成员自动生效）
 	backends = []*backend{
 		newBackend("workbuddy", "", wbTarget, wbKey, "bearer", true),
 		newBackend("trae", "trae", traeTarget, traeKey, "bearer", false),
@@ -270,8 +339,8 @@ func main() {
 	mux.HandleFunc("GET /healthz", healthz)
 	mux.HandleFunc("GET /v1/models", withAuth(listModels))
 	mux.HandleFunc("POST /v1/chat/completions", withAuth(chat))
-	mux.HandleFunc("POST /v1/messages", withAuth(chat))       // Anthropic 形态：仅 qoder 支持，透传
-	mux.HandleFunc("POST /v1/responses", withAuth(chat))      // Responses 形态：仅 qoder 支持，透传
+	mux.HandleFunc("POST /v1/messages", withAuth(chat))  // Anthropic 形态：仅 qoder 支持，透传
+	mux.HandleFunc("POST /v1/responses", withAuth(chat)) // Responses 形态：仅 qoder 支持，透传
 	// 管理面聚合（panel 消费）：跨厂商账号列表 / OAuth 登录代理 / 分厂商模型目录。
 	mux.HandleFunc("GET /hub/api/accounts", withAuth(adminAccounts))
 	mux.HandleFunc("POST /hub/api/oauth/start", withAuth(adminOAuthStart))
@@ -296,11 +365,15 @@ func main() {
 	log.Fatal(http.ListenAndServe(listen, mux))
 }
 
-// withAuth 校验 hub 自身 key（Bearer 形态）。
+// withAuth 校验 hub 自身 key（Bearer 形态）。key 表可能被 watchKeys 并发重建，
+// 读快照走读锁。
 func withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		authz := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authz, "Bearer ") || !hubKeys[strings.TrimPrefix(authz, "Bearer ")] {
+		keysMu.RLock()
+		ok := strings.HasPrefix(authz, "Bearer ") && hubKeys[strings.TrimPrefix(authz, "Bearer ")]
+		keysMu.RUnlock()
+		if !ok {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			io.WriteString(w, `{"error":{"message":"invalid api key","type":"auth_error","code":"401"}}`)
