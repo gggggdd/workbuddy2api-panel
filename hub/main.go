@@ -6,8 +6,10 @@
 //   - GET  /healthz               网关自身健康 + 三后端可达性快照
 //
 // 转发语义：网关只校验自己的 key，通过后**替换**为对应后端的 key 转发——三家
-// 后端各自独立鉴权，互不知晓。SSE 场景 flush_interval 关闭逐字透传，超时对齐
-// Caddy 现有配置（response header 600s）。
+// 后端各自独立鉴权，互不知晓。workbuddy 后端例外：调用方用的是本体签发的 key
+// （主 key / 成员 key）时原样透传，本体才能把用量归因到成员。
+// SSE 场景 flush_interval 关闭逐字透传，超时对齐 Caddy 现有配置
+//（response header 600s）。
 package main
 
 import (
@@ -34,6 +36,7 @@ type backend struct {
 	target *url.URL        // 上游 base
 	key    string          // 上游 API key（替换 Authorization）
 	keyHdr string          // key 放哪个头（Qoder bridge 用 x-api-key，其余 Bearer）
+	keepCallerKey bool     // 调用方 key 由该后端签发时原样透传（保留成员用量归因）
 	proxy  *httputil.ReverseProxy
 
 	mu     sync.RWMutex
@@ -96,6 +99,11 @@ var (
 // 不用换 key——同一把 key 即可拿到三家聚合模型。
 var hubKeys = map[string]bool{}
 
+// wbOriginKeys 是 workbuddy 本体签发的 key：主 key + 面板成员 key（由 sync-keys.sh
+// 从 config.json / data/members.json 同步进 HUB_EXTRA_KEYS）。这些 key 对 workbuddy
+// 后端原样透传，本体才能把用量归因到成员。
+var wbOriginKeys = map[string]bool{}
+
 type errorString string
 
 func (e errorString) Error() string { return string(e) }
@@ -115,17 +123,33 @@ func mustTarget(raw string) *url.URL {
 	return u
 }
 
-func newBackend(name, prefix, rawTarget, key, keyHdr string) *backend {
-	b := &backend{name: name, prefix: prefix, target: mustTarget(rawTarget), key: key, keyHdr: keyHdr}
+// bearerOf 取 Authorization 头里的 Bearer token（无则空串）。
+func bearerOf(r *http.Request) string {
+	authz := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authz, "Bearer ") {
+		return ""
+	}
+	return strings.TrimPrefix(authz, "Bearer ")
+}
+
+func newBackend(name, prefix, rawTarget, key, keyHdr string, keepCallerKey bool) *backend {
+	b := &backend{name: name, prefix: prefix, target: mustTarget(rawTarget), key: key, keyHdr: keyHdr, keepCallerKey: keepCallerKey}
 	p := httputil.NewSingleHostReverseProxy(b.target)
 	orig := p.Director
 	p.Director = func(r *http.Request) {
 		orig(r)
 		r.Host = b.target.Host
 		// 鉴权替换：剥掉调用方的 hub key，换成后端自己的 key。
+		//
+		// 例外：workbuddy 本体认得自己签发的 key（主 key 与成员 key，见 wbOriginKeys），
+		// 原样透传——本体据此把用量归因到具体成员。若一律换成 HUB_WB_KEY，本体只看到
+		// 主 key，成员用量会全部记不上（面板「成员管理」恒为 0）。
+		caller := bearerOf(r)
 		r.Header.Del("Authorization")
 		if keyHdr == "x-api-key" {
 			r.Header.Set("x-api-key", key)
+		} else if b.keepCallerKey && wbOriginKeys[caller] {
+			r.Header.Set("Authorization", "Bearer "+caller)
 		} else if key != "" {
 			r.Header.Set("Authorization", "Bearer "+key)
 		}
@@ -229,12 +253,13 @@ func main() {
 	for _, k := range strings.Split(envOr("HUB_EXTRA_KEYS", ""), ",") {
 		if k = strings.TrimSpace(k); k != "" {
 			hubKeys[k] = true
+			wbOriginKeys[k] = true
 		}
 	}
 	backends = []*backend{
-		newBackend("workbuddy", "", wbTarget, wbKey, "bearer"),
-		newBackend("trae", "trae", traeTarget, traeKey, "bearer"),
-		newBackend("qoder", "qoder", qoderTarget, qoderKey, "x-api-key"),
+		newBackend("workbuddy", "", wbTarget, wbKey, "bearer", true),
+		newBackend("trae", "trae", traeTarget, traeKey, "bearer", false),
+		newBackend("qoder", "qoder", qoderTarget, qoderKey, "x-api-key", false),
 	}
 	for _, b := range backends {
 		b.setModels(b.fetchModels())
