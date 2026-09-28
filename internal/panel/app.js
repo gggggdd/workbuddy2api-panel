@@ -2121,16 +2121,6 @@ function renderPackages(d, detailLimit) {
       '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
       '<th class="num">发放</th><th class="num">到期</th>' +
       '</tr></thead><tbody>' + rows + restSummary + usedSummary + '</tbody></table></div></div>';
-    }).join('');
-    return '<div class="box"><header><h3>' +
-      esc(a.nickname || a.uid.slice(0, 8)) + ' · ' + esc(a.realm || '') +
-      '</h3><span class="grow"></span><span class="note">余额 ' + fmtTok(a.remain) +
-      ' / 总额 ' + fmtTok(a.size) + ' · ' + packs.length + ' 个包（按面额降序）</span>' +
-      '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
-      '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
-      '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
-      '<th class="num">发放</th><th class="num">到期</th>' +
-      '</tr></thead><tbody>' + rows + '</tbody></table></div></div>';
   }).join('');
 }
 
