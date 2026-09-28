@@ -2002,6 +2002,9 @@ function renderPackages(d, detailLimit) {
     $('pkSummary').innerHTML = '<div class="empty">没有账号</div>';
     return;
   }
+  const now = Date.now();
+  const expiryColors = pkAccountColorMap(list);
+  renderExpiryDistribution(list, now);
 
   // 包名 → 稳定色号（跨账号一致，方便肉眼对齐）
   const names = [];
