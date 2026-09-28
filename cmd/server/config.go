@@ -17,7 +17,11 @@ import (
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7865"
+	Listen string `json:"listen"` // ":7865"
+	Panel  struct {
+		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
+		PackageDetailLimit int `json:"package_detail_limit"`
+	} `json:"panel"`
 	APIKey    string `json:"api_key"`    // 空 = 不鉴权
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
@@ -138,8 +142,11 @@ type Config struct {
 		DegradeCooldownMax string  `json:"degrade_cooldown_max"` // 降权时长的上限钳制，默认 "2h"（仅当 cooldown 超该值才钳制）
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
+		// PreferExpiring 最早到期优先路由开关，默认 true。开启且 expiring_soon 窗口内
+		// 存在有效批次时，按最早到期时间排序；关闭后完全不使用到期信息选号。
+		PreferExpiring bool `json:"prefer_expiring"`
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
-		// 此窗口内的积分被标记为"快过期"，选号优先消耗。空/0 = 禁用分桶。
+		// 此窗口内的积分进入优先集，再按最早到期排序。空/0 = 禁用该路由门槛。
 		ExpiringSoon string `json:"expiring_soon"`
 		// CostExploreInterval costTier 条件探索窗口（issue #136 方案 a′）：tier 0
 		// 垄断层存在且 tier 1 有成员时，距上次探索 ≥ 窗口则本次 pick 生效层切
@@ -219,6 +226,8 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5.0
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
+	c.Pool.PreferExpiring = true
+	c.Panel.PackageDetailLimit = 5
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
 	c.SessionSticky.Enabled = true
@@ -375,6 +384,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_EXPIRING_SOON"); v != "" {
 		c.Pool.ExpiringSoon = v
 	}
+	if v := os.Getenv("WB2A_PREFER_EXPIRING"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.Pool.PreferExpiring = b
+		}
+	}
 }
 
 func (c *Config) normalize() error {
@@ -412,6 +426,14 @@ func (c *Config) normalize() error {
 		if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {
 			return fmt.Errorf("pool.expiring_soon: %w", err)
 		}
+	}
+	if c.ExpiringSoonDur < 0 {
+		c.ExpiringSoonDur = 0
+		c.Pool.ExpiringSoon = "0"
+	}
+	// 积分构成页单账号明细默认条数：<=0 回落 5。
+	if c.Panel.PackageDetailLimit <= 0 {
+		c.Panel.PackageDetailLimit = 5
 	}
 	// costTier 探索窗口（issue #136）：空值回落默认 30m（Default 已置；此兜底覆盖
 	// 显式 ""）；"0" 是合法值（关停，完全回到现状行为），不回落；负值钳 0 同关停

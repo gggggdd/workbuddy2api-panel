@@ -7,45 +7,18 @@ import (
 	"workbuddy2api/internal/auth"
 )
 
-// TestExpiringCreditBoostsWeight 快过期积分占比高的号权重大于占比低/无的号（同总量下）。
-func TestExpiringCreditBoostsWeight(t *testing.T) {
-	p := New("")
-	p.Add(&auth.Auth{UID: "expiring-heavy"})          // 总量相同,快过期占比高
-	p.Add(&auth.Auth{UID: "stable-heavy"})            // 总量相同,快过期占比低
-	p.SetCreditsDetailed("expiring-heavy", 1000, 1000, 900) // 90% 快过期
-	p.SetCreditsDetailed("stable-heavy", 1000, 1000, 50)    // 5% 快过期
-
-	p.mu.RLock()
-	eExp := p.byUID["expiring-heavy"]
-	eSta := p.byUID["stable-heavy"]
-	maxC := int64(1000)
-	now := time.Now()
-	wExp := p.weightOf(eExp, maxC, now)
-	wSta := p.weightOf(eSta, maxC, now)
-	p.mu.RUnlock()
-
-	if wExp <= wSta {
-		t.Errorf("expiring-heavy weight %.3f <= stable-heavy %.3f; 快过期积分应加权", wExp, wSta)
-	}
-	// 差值应约等于 (0.9-0.05)*expiringWeight = 0.85*8 = 6.8
-	diff := wExp - wSta
-	if diff < 6.0 || diff > 7.5 {
-		t.Errorf("weight diff %.3f, want ~6.8 (0.85*expiringWeight)", diff)
-	}
-}
-
-// TestExpiringClampedToCredits expiring 超过总量/负值时被钳制,不污染权重。
+// TestExpiringClampedToCredits expiring 超过总量/负值时被钳制,不污染快照。
 func TestExpiringClampedToCredits(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCreditsDetailed("u1", 100, 100, 9999) // expiring > credits
+	p.SetCreditsDetailed("u1", 100, 100, 9999, time.Time{}, 0) // expiring > credits
 	p.mu.RLock()
 	if p.byUID["u1"].creditsExpiring != 100 {
 		t.Errorf("creditsExpiring=%d want 100 (clamped to credits)", p.byUID["u1"].creditsExpiring)
 	}
 	p.mu.RUnlock()
 
-	p.SetCreditsDetailed("u1", 100, 100, -5) // 负值
+	p.SetCreditsDetailed("u1", 100, 100, -5, time.Time{}, 0) // 负值
 	p.mu.RLock()
 	if p.byUID["u1"].creditsExpiring != 0 {
 		t.Errorf("creditsExpiring=%d want 0 (negative clamped)", p.byUID["u1"].creditsExpiring)
@@ -57,7 +30,7 @@ func TestExpiringClampedToCredits(t *testing.T) {
 func TestSetCreditsLeavesExpiringUnchanged(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCreditsDetailed("u1", 500, 500, 200)
+	p.SetCreditsDetailed("u1", 500, 500, 200, time.Now().Add(time.Hour), 200)
 	p.SetCredits("u1", 600, 600) // 旧入口只更新总量
 	p.mu.RLock()
 	e := p.byUID["u1"]
@@ -66,6 +39,27 @@ func TestSetCreditsLeavesExpiringUnchanged(t *testing.T) {
 	}
 	if e.creditsExpiring != 200 {
 		t.Errorf("creditsExpiring=%d want 200 (SetCredits 不应清)", e.creditsExpiring)
+	}
+	p.mu.RUnlock()
+}
+
+// TestEarliestExpirySnapshotClears 最早到期批次在零值/过期时刻被清空(上游 1.11.8 口径)。
+func TestEarliestExpirySnapshotClears(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+	p.SetCreditsDetailed("u1", 100, 100, 50, time.Now().Add(time.Hour), 50)
+	p.mu.RLock()
+	if p.byUID["u1"].creditsEarliestRemaining != 50 {
+		t.Errorf("earliestRemaining=%d want 50", p.byUID["u1"].creditsEarliestRemaining)
+	}
+	p.mu.RUnlock()
+
+	// 过期时刻 → 快照清空
+	p.SetCreditsDetailed("u1", 100, 100, 50, time.Now().Add(-time.Hour), 50)
+	p.mu.RLock()
+	if p.byUID["u1"].creditsEarliestRemaining != 0 || !p.byUID["u1"].creditsEarliestExpiry.IsZero() {
+		t.Errorf("past expiry should clear snapshot, got remaining=%d expiry=%v",
+			p.byUID["u1"].creditsEarliestRemaining, p.byUID["u1"].creditsEarliestExpiry)
 	}
 	p.mu.RUnlock()
 }
