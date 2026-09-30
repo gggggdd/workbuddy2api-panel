@@ -61,12 +61,92 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 
 	var accounts []cockpitAccount
 	if err := json.Unmarshal(raw, &accounts); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid json: "+err.Error())
+		// 非数组（如本机 cockpit 的 {account,auth} 单对象导出）：不报错，
+		// 留空数组交给下方嵌套形分支统一解出。
+		accounts = nil
+	}
+	if len(accounts) == 0 && !json.Valid(raw) {
+		writeErr(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	if len(accounts) == 0 {
-		writeErr(w, http.StatusBadRequest, "empty accounts array")
-		return
+
+	// 兼容本机 cockpit 的 auths 导出（嵌套形 {account:{uid,nickname}, auth:{accessToken,...},
+	// camelCase）——这类条目 uid/access_token/refresh_token 全空，会整批 skipped。
+	// 判定：扁平形数组至少一条带 uid 或 access_token；否则按嵌套形解。
+	// 支持三种嵌套形态：{account,auth} 单对象、[{account,auth},...]、{accounts:[...]}。
+	flattenNested := false
+	{
+		var probe []struct {
+			UID         string `json:"uid"`
+			AccessToken string `json:"access_token"`
+		}
+		if err := json.Unmarshal(raw, &probe); err != nil {
+			flattenNested = true // 不是扁平数组 → 单对象或其他嵌套形态
+		} else {
+			has := false
+			for _, a := range probe {
+				if a.UID != "" || a.AccessToken != "" {
+					has = true
+					break
+				}
+			}
+			flattenNested = !has // 数组存在但全部无 required 字段 → 嵌套数组
+		}
+	}
+	if flattenNested {
+		type nestedFile struct {
+			Account struct {
+				UID      string `json:"uid"`
+				Nickname string `json:"nickname"`
+			} `json:"account"`
+			Auth struct {
+				AccessToken  string `json:"accessToken"`
+				RefreshToken string `json:"refreshToken"`
+				ExpiresAt    int64  `json:"expiresAt"`
+				Domain       string `json:"domain"`
+			} `json:"auth"`
+		}
+		type nestedList struct {
+			Items []nestedFile `json:"accounts"`
+		}
+		var flat []cockpitAccount
+		appendNested := func(n nestedFile) {
+			flat = append(flat, cockpitAccount{
+				UID:          n.Account.UID,
+				Nickname:     n.Account.Nickname,
+				AccessToken:  n.Auth.AccessToken,
+				RefreshToken: n.Auth.RefreshToken,
+				ExpiresAt:    n.Auth.ExpiresAt,
+				Domain:       n.Auth.Domain,
+			})
+		}
+		// 形态 A：{account, auth} 单对象
+		var single nestedFile
+		if err := json.Unmarshal(raw, &single); err == nil && single.Account.UID != "" {
+			appendNested(single)
+		}
+		// 形态 B：[{account, auth}, ...] 数组
+		if len(flat) == 0 {
+			var arr []nestedFile
+			if err := json.Unmarshal(raw, &arr); err == nil && len(arr) > 0 {
+				for _, n := range arr {
+					appendNested(n)
+				}
+			}
+		}
+		// 形态 C：{accounts: [{account, auth}, ...]}（cockpit tools 整包导出）
+		if len(flat) == 0 {
+			var nl nestedList
+			if err := json.Unmarshal(raw, &nl); err == nil && len(nl.Items) > 0 {
+				for _, n := range nl.Items {
+					appendNested(n)
+				}
+			}
+		}
+		if len(flat) > 0 {
+			accounts = flat
+			log.Printf("panel: cockpit import 检测到嵌套形 auths 导出，摊平 %d 条", len(flat))
+		}
 	}
 
 	var total, imported, skipped int
