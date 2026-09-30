@@ -153,9 +153,14 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 	var errs []string
 
 	for _, acc := range accounts {
-		uid := strings.TrimSpace(acc.UID)
 		at := strings.TrimSpace(acc.AccessToken)
 		rt := strings.TrimSpace(acc.RefreshToken)
+		uid := strings.TrimSpace(acc.UID)
+		// cockpit tools 新版导出无 uid 字段：从 access_token（JWT）的 sub claim
+		// 解出真实账号 id；preferred_username 作昵称兜底。
+		if uid == "" && at != "" {
+			uid = jwtSub(at)
+		}
 		if uid == "" || at == "" || rt == "" {
 			skipped++
 			errs = append(errs, fmt.Sprintf("missing required fields (id=%s)", acc.ID))
@@ -177,6 +182,10 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 		}
 
 		nickname := acc.Nickname
+		if strings.TrimSpace(nickname) == "" {
+			// cockpit 新版导出无 nickname：用 JWT 里的 preferred_username 或 email。
+			nickname = jwtPreferredUsername(at)
+		}
 		if strings.TrimSpace(nickname) == "" {
 			nickname = acc.Email
 		}
