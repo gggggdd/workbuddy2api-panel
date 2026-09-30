@@ -938,7 +938,9 @@ $('importFile').onchange = async () => {
     $('importDone').hidden = false;
     $('importDone').textContent = '导入完成：成功 ' + d.imported + ' 个' + (d.skipped ? '，跳过 ' + d.skipped + ' 个' : '');
     if (d.errors && d.errors.length) {
-      console.warn('import errors:', d.errors);
+      const box = $('importErr');
+      box.hidden = false;
+      box.textContent = '跳过原因：' + d.errors.slice(0, 10).join('；') + (d.errors.length > 10 ? '（其余 ' + (d.errors.length - 10) + ' 条见服务端日志）' : '');
     }
     loadOverview(true);
   } catch (e) {
