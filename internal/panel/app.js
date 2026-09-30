@@ -1,4 +1,10 @@
 'use strict';
+/* ── 全局常量：多视图共用，必须定义在使用点之前（防 TDZ）── */
+const PK_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6', '#e2607a',
+                   '#5aa9e6', '#8fbf3f', '#b58b5a', '#7d8fa8', '#d4785c'];
+function pkColor(i) { return PK_COLORS[i % PK_COLORS.length]; }
+const LG_KIND = { chat: '对话消耗', checkin: '签到', task: '任务奖励', travel: '猫猫旅行', lottery: '抽奖', gift: '新手礼包', compensation: '补偿', adjust: '校准' };
+const lgFmt = n => (n >= 0 ? '+' : '') + (Math.round(n * 100) / 100);
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme', LS_MASK = 'wb2api.accmask';
 // URL ?key= 自动写入（分享直达与自动化测试）
@@ -1841,11 +1847,6 @@ if ($('usWindow')) $('usWindow').onchange = loadUsage;
    完全一致的账号，余额可能差上千——差别只在包里。这里把逐包明细摊开，并给每个
    包名一个稳定配色，跨账号对比时同色即同类。 */
 
-const PK_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6', '#e2607a',
-                   '#5aa9e6', '#8fbf3f', '#b58b5a', '#7d8fa8', '#d4785c'];
-
-function pkColor(i) { return PK_COLORS[i % PK_COLORS.length]; }
-
 /* pkBySource 把包按名称归并，得到「来源 → 面额/余额/个数」。这是对比的关键视图：
    两个号的差异一定体现在某几个来源的面额上。 */
 function pkBySource(packs) {
@@ -2102,8 +2103,6 @@ $('memBody').addEventListener('click', async ev => {
   }
 });
 
-const LG_KIND = { chat: '对话消耗', checkin: '签到', task: '任务奖励', travel: '猫猫旅行', lottery: '抽奖', gift: '新手礼包', compensation: '补偿', adjust: '校准' };
-const lgFmt = n => (n >= 0 ? '+' : '') + (Math.round(n * 100) / 100);
 function lgTime(iso) { const d = new Date(iso); return isNaN(d) ? iso : d.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }); }
 function lgDetail(e) {
   const parts = [];
