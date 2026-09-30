@@ -17,6 +17,14 @@ let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
+/* 视图级筛选状态（模块级声明放在文件顶部，避免顶层 go() 早于声明执行时踩 TDZ）。 */
+let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
+let mdAll = [], mdProbes = {}, mdProbeOf = () => undefined;
+let reqFilter = { q: '', outcome: '' };
+let reqEntries = [];
+let usDim = 'account', usCreditDim = 'account', usSort = 'total';
+let usageData = null;
+let reqRangeState = null; // 请求记录的时间范围（用量页的见 trangeState）
 
 const $ = id => document.getElementById(id);
 
@@ -84,6 +92,191 @@ function dur(sec) {
   sec = Math.max(0, Math.round(sec));
   const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
   return h ? h + '时' + String(m).padStart(2, '0') + '分' : m ? m + '分' + String(s).padStart(2, '0') + '秒' : s + '秒';
+}
+function parseAPITime(value) {
+  const text = String(value || '');
+  if (!text || text.startsWith('0001-')) return 0;
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) ? ms : 0;
+}
+function fmtLocalDateTime(ms) {
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+    p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+/* ── 时间范围控件（用量 / 请求记录共用）────────────────────────────────
+   预设项：今天 / 近 24 小时 / 近 3 天 / 近 7 天 / 近 30 天 / 全部历史 / 自定义。
+
+   为什么区间一律由前端算好再发：
+     - 「今天」必须是**浏览器本地时区**的 00:00 起。服务端时区未必与浏览器一致
+       （容器常挂 TZ=Asia/Shanghai，而浏览器可能在任何时区），让服务端算"今天"
+       会在跨时区时切错日子。
+     - 「自定义」本来就是用户挑的具体时刻，没有任何服务端推导空间。
+
+   滚动预设（近 N 小时/天）则保留 hours 参数：服务端按整点对齐的滚动窗口与旧
+   行为逐位一致，前端自己减 N 小时会多算/少算一个边界桶。 */
+const TRANGE_PRESETS = [
+  ['today', '今天'],
+  ['24', '近 24 小时'],
+  ['72', '近 3 天'],
+  ['168', '近 7 天'],
+  ['720', '近 30 天'],
+  ['0', '全部历史'],
+  ['custom', '自定义…'],
+];
+const TRANGE_DEFAULT = '72';
+const trangeStates = new Map(); // hostId → { preset, from: Date|null, to: Date|null }
+
+// dtLocalValue / dtLocalParse 与 <input type=datetime-local> 的取值格式互转
+// （YYYY-MM-DDTHH:mm，本地时区；ES 里"带时间的日期串"按本地解析，正是我们要的）。
+function dtLocalValue(d) {
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' +
+    p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function dtLocalParse(s) {
+  if (!s) return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// trangeMidnight 今天 00:00（本地时区）。
+function trangeMidnight() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function trangeState(id) {
+  if (!trangeStates.has(id)) {
+    // 「自定义」的初始值给一段有意义的默认：今天 00:00 → 现在。
+    trangeStates.set(id, { preset: TRANGE_DEFAULT, from: trangeMidnight(), to: new Date() });
+  }
+  return trangeStates.get(id);
+}
+
+// trangeRender 画出控件骨架（幂等：重复调用会保留当前状态）。
+function trangeRender(id) {
+  const host = $(id);
+  if (!host) return;
+  const st = trangeState(id);
+  const custom = st.preset === 'custom';
+  host.innerHTML =
+    '<select class="tr-preset" aria-label="时间范围">' +
+    TRANGE_PRESETS.map(([v, label]) =>
+      '<option value="' + v + '"' + (v === st.preset ? ' selected' : '') + '>' + esc(label) + '</option>').join('') +
+    '</select>' +
+    '<span class="tr-custom"' + (custom ? '' : ' hidden') + '>' +
+    '<input type="datetime-local" class="tr-from" value="' + esc(st.from ? dtLocalValue(st.from) : '') + '" aria-label="起始时间">' +
+    '<span class="tr-sep">→</span>' +
+    '<input type="datetime-local" class="tr-to" value="' + esc(st.to ? dtLocalValue(st.to) : '') + '" aria-label="结束时间">' +
+    '</span>';
+  const preset = host.querySelector('.tr-preset');
+  if (preset) preset.onchange = () => {
+    st.preset = preset.value;
+    // 从别的预设切到自定义时，把区间重置为"今天 00:00 → 现在"，
+    // 免得用户上次留下的半年区间被无声沿用。
+    if (st.preset === 'custom' && (!st.from || !st.to)) { st.from = trangeMidnight(); st.to = new Date(); }
+    trangeRender(id);
+    trangeEmit(id);
+  };
+  const fromEl = host.querySelector('.tr-from');
+  const toEl = host.querySelector('.tr-to');
+  const readCustom = () => {
+    st.from = dtLocalParse(fromEl.value);
+    st.to = dtLocalParse(toEl.value);
+    // 起止颠倒就地标红（不静默纠正：用户可能正输到一半）。
+    const bad = st.from && st.to && st.from > st.to;
+    fromEl.classList.toggle('tr-bad', !!bad);
+    toEl.classList.toggle('tr-bad', !!bad);
+    if (bad) return;
+    trangeEmit(id);
+  };
+  if (fromEl) fromEl.onchange = readCustom;
+  if (toEl) toEl.onchange = readCustom;
+}
+
+const trangeHandlers = new Map();
+// trangeBind 渲染控件并登记变化回调。**不**在绑定时触发回调：各视图的首次加载
+// 由 go() 统一驱动，这里再触发一次会让打开页面时打两遍接口。
+function trangeBind(id, onChange, preset) {
+  trangeHandlers.set(id, onChange);
+  if (preset) trangeState(id).preset = preset;
+  trangeRender(id);
+}
+function trangeEmit(id) {
+  const fn = trangeHandlers.get(id);
+  if (fn) fn();
+}
+
+// trangeQuery 把当前选择翻译成查询参数。
+//   rolling=true  → 滚动预设发 hours（服务端整点对齐），今天/自定义发 from/to
+//   rolling=false → 一律发 from/to（归档是线性日志，前端算区间更直观）
+// 「全部历史」两者都不发。
+function trangeQuery(id, rolling) {
+  const st = trangeState(id);
+  const q = new URLSearchParams();
+  const sec = d => Math.floor(d.getTime() / 1000);
+  if (st.preset === 'custom') {
+    if (st.from) q.set('from', sec(st.from));
+    if (st.to) q.set('to', sec(st.to));
+    return q;
+  }
+  if (st.preset === 'today') {
+    q.set('from', sec(trangeMidnight()));
+    return q;
+  }
+  if (st.preset === '0') return q;
+  if (rolling) { q.set('hours', st.preset); return q; }
+  q.set('from', sec(new Date(Date.now() - Number(st.preset) * 3600 * 1000)));
+  return q;
+}
+
+// trangeLabel 人读口径，用于「用量总览」右上角这类需要回显区间的位置。
+function trangeLabel(id) {
+  const st = trangeState(id);
+  const found = TRANGE_PRESETS.find(p => p[0] === st.preset);
+  if (st.preset !== 'custom') return found ? found[1] : '';
+  if (!st.from && !st.to) return '自定义';
+  const f = d => d ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0') + ' ' +
+    String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') : '…';
+  return f(st.from) + ' → ' + f(st.to);
+}
+function rateLimitMeta(row, now) {
+  const model = String(row && row.model || '未知模型');
+  const kind = String(row && row.kind || 'rate_limit');
+  const resetAt = parseAPITime(row && row.reset_at);
+  const until = parseAPITime(row && row.until);
+  const deadline = resetAt || until;
+  const remaining = deadline > now ? Math.round((deadline - now) / 1000) : 0;
+  if (kind === 'model_unavailable') {
+    return {
+      model,
+      kind,
+      detail: remaining ? '预计 ' + dur(remaining) + ' 后重试' : '等待重新探测',
+      title: model + '\n模型当前不可用' + (deadline ? '\n最早重试：' + fmtLocalDateTime(deadline) : ''),
+    };
+  }
+  let detail = resetAt
+    ? '预计 ' + fmtLocalDateTime(resetAt) + ' 解封' + (remaining ? '（剩余 ' + dur(remaining) + '）' : '')
+    : (until ? '预计 ' + fmtLocalDateTime(until) + ' 恢复（剩余 ' + dur(remaining) + '）' : '预计解封时间未知');
+  const title = [model, resetAt ? '上游重置：' + fmtLocalDateTime(resetAt) : '上游重置：时间未知'];
+  if (until && resetAt && until < resetAt) {
+    detail += ' · 网关最快 ' + dur(Math.max(0, Math.round((until - now) / 1000))) + ' 后重试';
+    title.push('网关最早重试：' + fmtLocalDateTime(until));
+  }
+  return { model, kind, detail, title: title.join('\n') };
+}
+function rateLimitRowsHtml(rows, now) {
+  const list = Array.isArray(rows) ? rows.filter(row => row && row.model) : [];
+  if (!list.length) return '';
+  return '<div class="rate-limits">' + list.map(row => {
+    const m = rateLimitMeta(row, now);
+    return '<div class="rate-limit ' + (m.kind === 'model_unavailable' ? 'model-unavailable' : '') +
+      '" title="' + esc(m.title) + '"><b>' + esc(m.model) + '</b><span>' + esc(m.detail) + '</span></div>';
+  }).join('') + '</div>';
 }
 
 function formatTokenCount(tokens) {
@@ -153,7 +346,16 @@ function go(v) {
   if (v === 'ledger') loadLedger();
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
-go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
+/* 首次进入延到本轮脚本求值之后再 go()。
+   原因：go() 会同步触发视图的数据加载（loadUsage/loadLogs/loadPackages…），而这些
+   函数读到的模块级 let/const（usageRateWarmAt、PK_* 等）在文件后半段才初始化——
+   直接深链 #usage / #packages 打开页面时会踩 TDZ（"Cannot access 'x' before
+   initialization"），表现为该页永远显示"读取失败"，而点导航进去一切正常。
+   延迟 0ms 让整份脚本先求值完，是修这一类问题最省事也最不容易再犯的办法。 */
+setTimeout(() => {
+  const hash = (location.hash || '#accounts').slice(1);
+  go(hash in TITLES ? hash : 'accounts');
+}, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
 // 账号信息脱敏：截图 / 分享面板时隐藏昵称与 uid。纯前端显示层开关——不改变任何
@@ -185,6 +387,7 @@ function renderAccounts(list) {
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
     const pct = s.credits_total > 0
@@ -216,7 +419,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '"' + rowTitle + '>' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + nmHtml + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + idHtml + '</div></td>' +
-      '<td>' + tag + note + '</td>' +
+      '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
@@ -228,7 +431,7 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
-        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '">签到</button>' +
+        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
@@ -659,40 +862,150 @@ async function loadModels() {
         } catch (e) { /* 单厂商失败不拖累整页 */ }
       }
     }
-    if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
-    const probes = pr.probes || {};
-    const probeKeys = Object.keys(probes);
-    const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
-    tb.innerHTML = list.map(m => {
-      const eff = (m.supported_efforts || []).slice();
-      if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
-      const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
-        : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
-      // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
-      const caps = [];
-      if (m.is_default) caps.push('<span class="tag ok">默认</span>');
-      if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
-      if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
-      if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
-      const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
-      const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-      const pmeta = PROVIDER_META[m._provider] || { label: m._provider, color: 'var(--ink-3)' };
-      const provTag = m._provider !== 'workbuddy'
-        ? ' <span class="provider-tag" style="color:' + pmeta.color + ';border-color:' + pmeta.color + '">' + pmeta.label + '</span>'
-        : '';
-      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + provTag + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
-        '<td class="num">' + rateCell(m) + '</td>' +
-        '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
-        '<td class="efs" style="white-space:normal">' + effs + '</td>' +
-        '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
-        outCell(m, probeOf(m.id)) + '</tr>';
-    }).join('');
-    const hit = list.filter(m => probeOf(m.id)).length;
-    $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    mdAll = list;
+    mdProbes = pr.probes || {};
+    if (!mdAll.length) {
+      tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
+      if ($('mdCount')) $('mdCount').textContent = '';
+      if ($('mdNote')) $('mdNote').textContent = '上游未返回模型';
+      return;
+    }
+    // 探测键带域前缀（cn:glm-5.2），模型表显示裸名，按「精确命中或 :后缀」关联。
+    const probeKeys = Object.keys(mdProbes);
+    mdProbeOf = id => mdProbes[id] || mdProbes[probeKeys.find(k => k.endsWith(':' + id))];
+    const hit = mdAll.filter(m => mdProbeOf(m.id)).length;
+    if ($('mdNote')) $('mdNote').textContent = mdAll.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    renderModels();
   } catch (e) {
+    mdAll = [];
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    if ($('mdCount')) $('mdCount').textContent = '';
   }
 }
+
+/* ── 模型筛选（按条件查询）───────────────────────────────────────────
+   模型目录一次拉全（几十条），筛选与排序全部在前端完成：改条件零延迟，且不会
+   因为调一次筛选就打一次上游——/panel/api/models 是直连上游的实时查询，很贵。
+   条件之间是 AND；每个条件为空即不参与判定。 */
+// mdRateValue 当前生效的积分倍率数值：优先促销价（限时免费 = 0），无倍率记为
+// Infinity 排到最后（排序时"没有价格"不该冒充最便宜）。
+function mdRateValue(m) {
+  const raw = (m.promo_credits != null && m.promo_credits !== '') ? m.promo_credits : m.credits;
+  const n = parseFloat(String(raw == null ? '' : raw).replace(/[^\d.]/g, ''));
+  return Number.isFinite(n) ? n : Infinity;
+}
+
+// mdSearchText 参与关键字搜索的字段（ID / 展示名 / 厂商 / 描述 / 标签）。
+function mdSearchText(m) {
+  return [m.id, m.name, m.vendor, m.description, (m.tags || []).join(' ')]
+    .filter(Boolean).join(' ').toLowerCase();
+}
+
+// mdMatch 单个模型是否满足全部筛选条件。
+function mdMatch(m, f) {
+  f = f || mdFilter;
+  if (f.q) {
+    const text = mdSearchText(m);
+    // 空格分词后逐个匹配：多关键词是 AND，便于"cn 视觉"这类组合查询。
+    for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
+      if (!text.includes(kw)) return false;
+    }
+  }
+  if (f.realm && !String(m.id || '').startsWith(f.realm + ':')) return false;
+  if (f.cap === 'tool' && !m.supports_tool_call) return false;
+  if (f.cap === 'vision' && !m.supports_images) return false;
+  if (f.cap === 'reasoning' && !m.supports_reasoning) return false;
+  if (f.cap === 'default' && !m.is_default) return false;
+  if (f.effort === 'off') {
+    if (!m.can_disable_thinking) return false;
+  } else if (f.effort && !(m.supported_efforts || []).includes(f.effort)) {
+    return false;
+  }
+  const factor = m.promo_factor == null ? null : Number(m.promo_factor);
+  if (f.promo === 'promo' && factor == null && !m.promo_label) return false;
+  if (f.promo === 'free' && !(factor === 0)) return false;
+  if (f.promo === 'discount' && !(factor != null && factor > 0)) return false;
+  return true;
+}
+
+// mdSortList 按当前排序条件返回新数组（不改动入参，保持上游原始顺序可回溯）。
+function mdSortList(list, f) {
+  f = f || mdFilter;
+  const out = list.slice();
+  const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
+  if (f.sort === 'rate') out.sort((a, b) => mdRateValue(a) - mdRateValue(b));
+  else if (f.sort === 'context') out.sort((a, b) => num(b.context_length) - num(a.context_length));
+  else if (f.sort === 'output') out.sort((a, b) => num(b.max_output_tokens) - num(a.max_output_tokens));
+  else if (f.sort === 'name') out.sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
+  return out;
+}
+
+// mdRowHtml 单个模型行（纯渲染，便于独立测试）。
+function mdRowHtml(m, pr) {
+  const eff = (m.supported_efforts || []).slice();
+  if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
+  const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
+    : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
+  // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
+  const caps = [];
+  if (m.is_default) caps.push('<span class="tag ok">默认</span>');
+  if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
+  if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
+  if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
+  const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+  const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
+  // 厂商徽标：hub 聚合来的 trae/qoder 模型带 _provider，workbuddy 行保持原样。
+  const pmeta = PROVIDER_META[m._provider] || { label: m._provider, color: 'var(--ink-3)' };
+  const provTag = m._provider && m._provider !== 'workbuddy'
+    ? ' <span class="provider-tag" style="color:' + pmeta.color + ';border-color:' + pmeta.color + '">' + esc(pmeta.label) + '</span>'
+    : '';
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + provTag + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+    '<td class="num">' + rateCell(m) + '</td>' +
+    '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
+    '<td class="efs" style="white-space:normal">' + effs + '</td>' +
+    '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
+    outCell(m, pr) + '</tr>';
+}
+
+function renderModels() {
+  const tb = $('mdBody');
+  if (!tb) return;
+  const list = mdSortList(mdAll.filter(m => mdMatch(m)));
+  if (!list.length) {
+    tb.innerHTML = '<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
+  } else {
+    tb.innerHTML = list.map(m => mdRowHtml(m, mdProbeOf(m.id))).join('');
+  }
+  const filtered = list.length !== mdAll.length;
+  const cnt = $('mdCount');
+  if (cnt) {
+    cnt.textContent = !mdAll.length ? ''
+      : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型'
+      : mdAll.length + ' 个模型';
+    cnt.className = filtered ? 'note src-off' : 'note';
+  }
+}
+
+function resetModelFilter() {
+  mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
+  for (const [id, val] of [['mdQ', ''], ['mdRealm', ''], ['mdCap', ''], ['mdEffort', ''], ['mdPromo', ''], ['mdSort', 'default']]) {
+    if ($(id)) $(id).value = val;
+  }
+  renderModels();
+}
+
+// 筛选控件：输入框防抖 120ms（长列表逐字符重排不必每键一次），下拉即时。
+let mdQTimer = null;
+if ($('mdQ')) $('mdQ').oninput = () => {
+  clearTimeout(mdQTimer);
+  mdQTimer = setTimeout(() => { mdFilter.q = $('mdQ').value.trim(); renderModels(); }, 120);
+};
+for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'effort'], ['mdPromo', 'promo'], ['mdSort', 'sort']]) {
+  const el = $(id);
+  if (!el) continue;
+  el.onchange = () => { mdFilter[key] = el.value; renderModels(); };
+}
+if ($('mdReset')) $('mdReset').onclick = resetModelFilter;
 $('btnModels').onclick = loadModels;
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
@@ -707,8 +1020,23 @@ $('logChips').addEventListener('click', ev => {
 async function loadLogs() {
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+  const limit = ($('reqLimit') && $('reqLimit').value) || 100;
+  // 时间范围由归档侧过滤（不是前端筛已拉取的条目）：区间落在更早的时间段时，
+  // 「最近 N 条」里根本不会有那些记录，必须让服务端按时间取。
+  const rq = trangeQuery('reqRange', false);
+  rq.set('limit', limit);
   try {
-    const d = await api('logs');
+    const [d, metrics, requestRows] = await Promise.all([
+      api('logs'),
+      api('request_metrics').catch(() => ({})),
+      api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
+    ]);
+    // 归档开启时以归档为准——「区间内没有记录」是一个真实结果，不能回落成内存里
+    // 的最近 100 条（那会把筛选条件之外、时间范围之外的请求显示出来）。
+    // 只有归档关闭时才回落到内存指标，保证没有归档的部署仍能看到最近请求。
+    const archiveOn = !!(metrics && metrics.archive && metrics.archive.enabled);
+    const recent = archiveOn ? (requestRows.entries || []) : (metrics.recent || []);
+    renderRequestMetrics(metrics, recent);
     const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
     box.innerHTML = entries.length
       ? entries.map(e => {
@@ -725,6 +1053,149 @@ async function loadLogs() {
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
   } catch (e) { /* 概览已提示 */ }
+}
+
+/* ── 请求记录（运行日志页：指标卡 + 可筛选表格）───────────────────────
+   归档开启时展示 JSONL 归档（带来源 IP/UA），关闭时回落到内存里的最近请求。
+   来源字段是后加的，旧归档条目没有——这里如实显示「—」，不做猜测。 */
+function renderRequestMetrics(m, entries) {
+  m = m || {};
+  const a = m.archive || {};
+  if ($('reqStats')) $('reqStats').innerHTML =
+    usStat(fmtTok(m.completed), '已完成') +
+    usStat(m.success_rate == null ? '—' : Number(m.success_rate).toFixed(1) + '%', '完成成功率') +
+    usStat(m.http_success_rate == null ? '—' : Number(m.http_success_rate).toFixed(1) + '%', 'HTTP 成功率') +
+    usStat(fmtMs(m.avg_duration_ms), '平均耗时') +
+    usStat(String(m.in_flight || 0), '进行中') +
+    usStat(fmtTok(a.files), '归档文件');
+  if ($('reqNote')) $('reqNote').textContent = a.enabled
+    ? 'JSONL 归档 ' + fmtBytes(a.bytes) + (a.dropped_writes ? ' · 丢弃 ' + a.dropped_writes + ' 条' : '') +
+      (a.last_error ? ' · 错误：' + a.last_error : '')
+    : '仅内存指标，JSONL 归档已关闭';
+
+  reqEntries = entries || [];
+  renderRequestTable();
+}
+
+/* reqMatch 请求记录筛选：q 对 IP/UA/模型/账号/请求 ID 做空格分词的 AND 包含匹配，
+   outcome 精确匹配。两者都在已拉取的条目上做（最多 1000 条），不发新请求。 */
+function reqMatch(e, f) {
+  f = f || reqFilter;
+  if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
+  if (f.q) {
+    const text = [e && e.client_ip, e && e.user_agent, e && e.model, e && e.account, e && e.request_id]
+      .filter(Boolean).join(' ').toLowerCase();
+    for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
+      if (!text.includes(kw)) return false;
+    }
+  }
+  return true;
+}
+
+function reqOutcomeTag(e) {
+  const outcome = String(e && e.outcome || '');
+  const label = { success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' }[outcome] || outcome || '—';
+  const cls = outcome === 'success' ? 'ok'
+    : outcome === 'interrupted' ? 'warn'
+    : outcome ? 'bad' : 'mute';
+  return '<span class="tag ' + cls + '">' + esc(String(e && e.status || '—') + ' ' + label) + '</span>';
+}
+
+function reqTokenCell(e) {
+  const total = Number(e && e.total_tokens || 0) ||
+    (Number(e && e.prompt_tokens || 0) + Number(e && e.completion_tokens || 0));
+  return total ? fmtTok(total) : '—';
+}
+
+function reqCreditCell(e) {
+  if (!e || !e.credit_known) return '<span class="muted">—</span>';
+  const v = Number(e.credit);
+  return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
+}
+
+/* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
+   UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。 */
+function renderRequestTable() {
+  const list = reqEntries.filter(e => reqMatch(e));
+  const tb = $('reqBody');
+  if (!tb) return;
+  tb.innerHTML = list.map(e => {
+    const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+    const ip = e && e.client_ip ? e.client_ip : '';
+    const ua = e && e.user_agent ? e.user_agent : '';
+    const rid = e && e.request_id ? e.request_id : '';
+    return '<tr title="' + esc(requestLogText(e)) + '">' +
+      '<td class="num">' + esc(when) + '</td>' +
+      '<td>' + reqOutcomeTag(e) + '</td>' +
+      '<td>' + esc(e && e.model || '—') + '</td>' +
+      '<td>' + esc(e && e.account || '—') + '</td>' +
+      '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td class="num">' + fmtMs(e && e.duration_ms) + '</td>' +
+      '<td class="num">' + reqTokenCell(e) + '</td>' +
+      '<td class="num">' + reqCreditCell(e) + '</td>' +
+      '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="10" class="empty">' +
+      (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
+
+  const filtered = list.length !== reqEntries.length;
+  // 归档里的旧条目没有来源字段（该功能上线前写入）：这时提示开关/历史原因，
+  // 而不是让人以为筛选坏了。
+  const hasSource = reqEntries.some(e => e && (e.client_ip || e.user_agent));
+  if ($('reqCount')) {
+    $('reqCount').textContent = !reqEntries.length ? ''
+      : (filtered ? '命中 ' + list.length + ' / ' + reqEntries.length + ' 条' : reqEntries.length + ' 条') +
+        (hasSource ? '' : ' · 来源未记录');
+    $('reqCount').className = (filtered || !hasSource) ? 'note src-off' : 'note';
+  }
+}
+
+/* 请求记录筛选控件。搜索框防抖 150ms：最多 1000 行重渲染，不必每键一次。 */
+let reqQTimer = null;
+if ($('reqQ')) $('reqQ').oninput = () => {
+  clearTimeout(reqQTimer);
+  reqQTimer = setTimeout(() => { reqFilter.q = $('reqQ').value.trim(); renderRequestTable(); }, 150);
+};
+if ($('reqOutcome')) $('reqOutcome').onchange = () => {
+  reqFilter.outcome = $('reqOutcome').value;
+  renderRequestTable();
+};
+if ($('reqLimit')) $('reqLimit').onchange = loadLogs;
+if ($('btnReqReload')) $('btnReqReload').onclick = loadLogs;
+// 时间范围：默认「全部历史」——请求记录页的历史行为就是"取最近 N 条"，
+// 加一个默认收窄的区间会让打开页面时看到的条数凭空变少。
+if ($('reqRange')) trangeBind('reqRange', loadLogs, '0');
+
+function requestLogText(e) {
+  const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+  const outcomeLabel = { success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' };
+  const token = Number(e && e.total_tokens || 0) ||
+    (Number(e && e.prompt_tokens || 0) + Number(e && e.completion_tokens || 0));
+  let credit = 'credit —';
+  if (e && e.credit_known) {
+    const value = Number(e.credit);
+    if (Number.isFinite(value)) credit = String(Number(value.toFixed(2))) + ' credit';
+  }
+  return [
+    when,
+    String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
+    e && e.model || '—',
+    e && e.account || '—',
+    e && e.client_ip || '—',
+    e && e.user_agent || '—',
+    fmtMs(e && e.duration_ms),
+    fmtTok(token) + ' tok',
+    credit,
+    e && e.request_id || '—',
+  ].join(' | ');
+}
+
+function fmtBytes(bytes) {
+  const n = Number(bytes || 0);
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
 }
 $('btnLogPin').onclick = () => {
   logPin = !logPin;
@@ -753,6 +1224,9 @@ const CFG_MAP = {
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
+  // 上游新增：面板侧开关（缺 form 控件时 loadConfig/collectConfig 自动跳过）
+  request_client_info: ['logging', 'request_client_info'],
+  package_detail_limit: ['panel', 'package_detail_limit'],
 };
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -1621,27 +2095,63 @@ function fmtMs(ms) {
   return Math.round(ms) + 'ms';
 }
 function fmtRate(r) { return r ? Number(r).toFixed(1) + ' tok/s' : '—'; }
+/* trimFixed 去掉定点小数的尾零（12.50 → 12.5，12.00 → 12）；上游 fmtCredit /
+   fmtCreditRatio / 请求记录的积分列共用它。
+   注意：本仓库的 fmtCredit（积分明细账本用）是另一套实现（恒两位小数、非数回落 0），
+   定义在文件后段，二者不可互相替换——故这里只吸收 trimFixed，不重定义 fmtCredit。 */
+function trimFixed(s) {
+  if (!String(s).includes('.')) return String(s);
+  return String(s).replace(/0+$/, '').replace(/\.$/, '');
+}
+function fmtCreditRatio(v, samples, tokens) {
+  if (!samples || !tokens) return '—';
+  const n = Number(v || 0);
+  if (!Number.isFinite(n)) return '—';
+  return trimFixed(n.toFixed(4)) + ' / 1M';
+}
+function fmtModelRate(rate) {
+  const s = String(rate || '').trim();
+  return s ? 'x' + s : '—';
+}
 
 function usStat(v, k, cls) {
   return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
          '</div><div class="k">' + esc(k) + '</div></div>';
 }
 
-function usBar(prompt, completion, total) {
+/* usKpi 用量页的指标卡。比账号池的 .stat 多两样：语义色轨（cls）与副标题（sub，
+   放"占比 / 均速率"这类解释性数字）；bar 是卡片内的构成条 HTML，只有需要时才传。 */
+function usKpi(v, k, cls, sub, bar) {
+  return '<div class="kpi ' + (cls || '') + '">' +
+    '<div class="k">' + esc(k) + '</div>' +
+    '<div class="v">' + esc(v) + '</div>' +
+    (bar || '') +
+    (sub ? '<div class="s">' + esc(sub) + '</div>' : '') +
+    '</div>';
+}
+
+/* usMixBar prompt/completion 占比条。宽度按百分比而不是固定像素：表列宽随窗口变化，
+   像素宽度在窄屏会溢出、宽屏又显得没信息。 */
+function usMixBar(prompt, completion, total) {
   const t = Number(total || 0);
   if (!t) return '';
   const pp = Math.max(0, Math.min(100, Number(prompt || 0) / t * 100));
   const pc = Math.max(0, Math.min(100, Number(completion || 0) / t * 100));
-  return '<span class="us-wrapbar">' +
-    '<span class="bar bar-p" style="width:' + (pp * 0.8).toFixed(1) + 'px" title="prompt"></span>' +
-    '<span class="bar bar-c" style="width:' + Math.max(2, pc * 0.8).toFixed(1) + 'px" title="completion"></span>' +
+  return '<span class="us-mix" title="prompt ' + pp.toFixed(1) + '% · completion ' + pc.toFixed(1) + '%">' +
+    '<i class="p" style="width:' + pp.toFixed(2) + '%"></i>' +
+    '<i class="c" style="width:' + pc.toFixed(2) + '%"></i>' +
     '</span>';
 }
 
+/* usPct 占比文案（0 值不显示 "0.0%"，直接 —，避免一行全是零）。 */
+function usPct(part, total) {
+  const t = Number(total || 0);
+  if (!t) return '—';
+  return (Number(part || 0) / t * 100).toFixed(1) + '%';
+}
+
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
-   withPerf 控制是否追加延迟/速率两列——只有「按账号」表的表头带这两列；
-   模型表与域表没有，多输出会造成列错位。早先靠「mid 是否为 undefined」隐式
-   判断，调用方稍一改动就会错列，故改为显式参数。 */
+   withPerf 控制延迟/速率两列；列开关显式传入，避免调用方改动后与表头错列。 */
 function usRow(name, sub, a, mid, withPerf) {
   return '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
@@ -1651,7 +2161,8 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td class="num">' + (a.errors ? '<span style="color:var(--warn)">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
     '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
-    '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
+    '<td class="num">' + fmtTok(a.total_tokens) +
+      usMixBar(a.prompt_tokens, a.completion_tokens, a.total_tokens) + '</td>' +
     (withPerf
       ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
@@ -1659,39 +2170,213 @@ function usRow(name, sub, a, mid, withPerf) {
     '</tr>';
 }
 
-function renderUsage(d) {
-  const t = d.totals || {};
-  $('usStats').innerHTML =
-    usStat(fmtTok(t.requests), '请求数') +
-    usStat(fmtTok(t.total_tokens), '总 token') +
-    usStat(fmtTok(t.prompt_tokens), 'prompt') +
-    usStat(fmtTok(t.completion_tokens), 'completion') +
-    usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
-    usStat(fmtMs(t.avg_latency_ms), '平均延迟');
+/* ── 用量明细：三个维度共用一张表 + 页内切换 ──────────────────────────
+   账号 / 模型 / 域三张表此前各自占一个 box，页面纵向拉得很长且表头结构几乎一样。
+   现在合成一个 box：表头由维度定义生成，行渲染复用 usRow，切换零请求。
+   容器 id 由 index.html 提供（usDimTabs/usDimHead/usDimBody/…）；缺失时各渲染
+   函数直接返回，老页面上仍是原来的三张独立表。 */
+const US_DIMS = {
+  account: { key: 'by_account', title: '账号', withRealm: true, withPerf: true, span: 10 },
+  model: { key: 'by_model', title: '模型', withRealm: false, withPerf: false, span: 7 },
+  realm: { key: 'by_realm', title: 'realm', withRealm: false, withPerf: false, span: 7 },
+};
 
-  // 卡片、三张表与时序图全部按所选窗口统计（切窗口数字随之变化）；
-  // 「全部历史」含 90 天前折叠出的日桶。这里标注当前口径与数据起点。
-  const winLabel = ($('usWindow') && $('usWindow').selectedOptions[0]) ?
-    $('usWindow').selectedOptions[0].textContent.trim() : '';
-  $('usNote').textContent =
-    (winLabel ? winLabel + ' · ' : '') +
-    (d.buckets || 0) + ' 个分桶' +
-    (d.since ? ' · 数据自 ' + d.since.replace('T', ' ') : '') +
-    (d.file_bytes ? ' · 文件 ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
-
-  $('usAccBody').innerHTML = (d.by_account || []).map(x =>
-    usRow(x.key.slice(0, 8), x.extra || '', x,
-      '<td class="num">' + esc(x.realm || '') + '</td>', true)
-  ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
-
-  $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
-
-  $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
-
-  renderUsageChart(d.series || []);
+// usSortRows 按当前排序字段降序（默认合计 Token，最大者最相关）。
+function usSortRows(rows, sort) {
+  const out = rows.slice();
+  const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
+  const val = a => sort === 'requests' ? num(a.requests)
+    : sort === 'errors' ? num(a.errors)
+    : sort === 'latency' ? num(a.avg_latency_ms)
+    : num(a.total_tokens);
+  out.sort((a, b) => val(b) - val(a));
+  return out;
 }
+
+function usDimHead(dim) {
+  const m = US_DIMS[dim] || US_DIMS.account;
+  return '<tr><th class="mark" aria-hidden="true"></th><th>' + esc(m.title) + '</th>' +
+    (m.withRealm ? '<th>域</th>' : '') +
+    '<th class="num">请求</th><th class="num">失败</th>' +
+    '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>' +
+    (m.withPerf ? '<th class="num">均延迟</th><th class="num">均速率</th>' : '') +
+    '</tr>';
+}
+
+/* usTabsHtml 维度切换按钮（带条数徽标）。整段 innerHTML 重写而不是逐个改 class：
+   容器的 click 监听是委托式的，换掉子节点不会丢事件，代码也更短。 */
+function usTabsHtml(dims, active, counts) {
+  return dims.map(([k, label]) => {
+    const n = counts ? counts[k] : null;
+    return '<button data-dim="' + k + '"' + (k === active ? ' class="on"' : '') + '>' +
+      esc(label) + (n == null ? '' : '<span class="cnt">' + n + '</span>') + '</button>';
+  }).join('');
+}
+
+const US_DIM_TABS = [['account', '按账号'], ['model', '按模型'], ['realm', '按域']];
+
+function renderUsageDim() {
+  const d = usageData || {};
+  const m = US_DIMS[usDim] || US_DIMS.account;
+  const body = $('usDimBody');
+  if (!body) return;
+  const rows = usSortRows(d[m.key] || [], usSort);
+  if ($('usDimTabs')) $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, {
+    account: (d.by_account || []).length,
+    model: (d.by_model || []).length,
+    realm: (d.by_realm || []).length,
+  });
+  if ($('usDimHead')) $('usDimHead').innerHTML = usDimHead(usDim);
+  body.innerHTML = rows.map(x =>
+    usRow(usDim === 'account' ? String(x.key || '').slice(0, 8) : x.key,
+      usDim === 'account' ? (x.extra || '') : '',
+      x,
+      usDim === 'account' ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
+      m.withPerf)
+  ).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
+  if ($('usDimNote')) $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
+}
+
+/* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。 */
+function usCreditHead(dim) {
+  return dim === 'model'
+    ? '<tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>' +
+      '<th class="num">请求</th><th class="num">扣除积分</th>' +
+      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th></tr>'
+    : '<tr><th class="mark" aria-hidden="true"></th><th>账号</th>' +
+      '<th class="num">请求</th><th class="num">扣除积分</th>' +
+      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th></tr>';
+}
+
+function renderCreditDim() {
+  const d = usageData || {};
+  const body = $('usCreditBody');
+  if (!body) return;
+  if ($('usCreditHead')) $('usCreditHead').innerHTML = usCreditHead(usCreditDim);
+  const empty = '暂无积分扣除记录；升级前仅含 Token 的历史不会伪造积分。';
+  if (usCreditDim === 'model') {
+    const models = d.credit_by_model || [];
+    body.innerHTML = models.map(row =>
+      '<tr>' +
+        '<td class="mark" aria-hidden="true"></td>' +
+        '<td>' + esc(row.key || '—') + '</td>' +
+        '<td>' + esc(fmtModelRate(row.rate)) + '</td>' +
+        '<td class="num">' + fmtTok(row.requests) + '</td>' +
+        '<td class="num">' + fmtCredit(row.credits) + '</td>' +
+        '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
+        '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+      '</tr>'
+    ).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>';
+  } else {
+    const accounts = d.credit_by_account || [];
+    body.innerHTML = accounts.map(row => {
+      const uid = String(row.key || '');
+      const account = row.nickname || uid.slice(0, 8) || '—';
+      return '<tr>' +
+        '<td class="mark" aria-hidden="true"></td>' +
+        '<td>' + esc(account) + '<div class="note">' + esc(row.realm || '') + ' · ' + esc(uid.slice(0, 8)) + '</div></td>' +
+        '<td class="num">' + fmtTok(row.requests) + '</td>' +
+        '<td class="num">' + fmtCredit(row.credits) + '</td>' +
+        '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
+        '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+        '</tr>';
+    }).join('') || '<tr><td colspan="6" class="empty">' + empty + '</td></tr>';
+  }
+  if ($('usCreditTabs')) $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, {
+    account: (d.credit_by_account || []).length,
+    model: (d.credit_by_model || []).length,
+  });
+}
+
+function renderUsage(d) {
+  usageData = d || {};
+  const t = usageData.totals || {};
+  const total = Number(t.total_tokens || 0);
+  const pt = Number(t.prompt_tokens || 0);
+  const ct = Number(t.completion_tokens || 0);
+  const reqs = Number(t.requests || 0);
+  const errs = Number(t.errors || 0);
+  const okRate = reqs ? (reqs - errs) / reqs * 100 : null;
+  // 构成条要的是合法 CSS 宽度，usPct 在无样本时返回 "—"，不能直接拼进 style。
+  const pctW = (part) => total ? Math.max(0, Math.min(100, Number(part || 0) / total * 100)).toFixed(2) + '%' : '0%';
+  // 主指标用强调色，completion 用成功色（与图表里的绿柱呼应），
+  // 失败/延迟只在有值时上语义色——全绿全黄的仪表盘等于没有重点。
+  $('usStats').innerHTML =
+    usKpi(fmtTok(reqs), '请求数', 'c-accent',
+      errs ? '其中失败 ' + errs + ' 次' : '全部成功') +
+    usKpi(fmtTok(total), '总 token', 'c-accent',
+      'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total),
+      '<div class="kbar"><i style="width:' + pctW(pt) + ';background:var(--accent)"></i>' +
+      '<i style="width:' + pctW(ct) + ';background:var(--ok)"></i></div>') +
+    usKpi(fmtTok(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
+    usKpi(fmtTok(ct), 'completion', 'c-ok', '占比 ' + usPct(ct, total)) +
+    usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
+      okRate == null ? '—' : (errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%')) +
+    usKpi(fmtMs(t.avg_latency_ms), '平均延迟', 'c-soft',
+      t.avg_tokens_per_second ? '吐字 ' + fmtRate(t.avg_tokens_per_second) : '无速率样本');
+
+  // 卡片、明细表与时序图全部按所选窗口统计（切窗口数字随之变化）；
+  // 「全部历史」含 90 天前折叠出的日桶。这里标注当前口径与数据起点。
+  const winLabel = $('usRange') ? trangeLabel('usRange') : (($('usWindow') && $('usWindow').selectedOptions[0]) ?
+    $('usWindow').selectedOptions[0].textContent.trim() : '');
+  // 服务端回显的实际区间优先（自定义区间下它就是权威口径）；滚动窗口没有回显，
+  // 用控件自己的标签。
+  const rangeEcho = usageData.window_from
+    ? String(usageData.window_from).replace('T', ' ').slice(0, 16) +
+      (usageData.window_to ? ' → ' + String(usageData.window_to).replace('T', ' ').slice(0, 16) : ' → 现在')
+    : '';
+  const note = (rangeEcho || winLabel ? (rangeEcho || winLabel) + ' · ' : '') +
+    (usageData.buckets || 0) + ' 个分桶' +
+    (usageData.since ? ' · 数据自 ' + usageData.since.replace('T', ' ') : '') +
+    (usageData.file_bytes ? ' · 文件 ' + (usageData.file_bytes / 1024).toFixed(1) + ' KB' : '');
+  $('usNote').textContent = note;
+  $('usNote').title = note; // 窄屏单行截断时靠悬停看全
+
+  // 积分扣除的四张卡片与说明。
+  if ($('usCreditStats')) $('usCreditStats').innerHTML =
+    usKpi(fmtCredit(t.credits), '扣除积分', 'c-accent', '按上游 usage.credit 累计') +
+    usKpi(fmtTok(t.credit_tokens), '匹配 Token', 'c-mute', '与积分同时观测到的 Token') +
+    usKpi(fmtCreditRatio(t.credits_per_1m_tokens, t.credit_samples, t.credit_tokens),
+      '平均积分 / 1M Token', 'c-ok', '越低越划算') +
+    usKpi(String(t.credit_samples || 0), '有效积分样本', 'c-mute', '缺字段的历史不参与折算');
+  if ($('usCreditNote')) $('usCreditNote').textContent =
+    (usageData.credit_by_account || []).length + ' 个账号 · ' +
+    (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
+
+  // 维度切换容器存在时走合表视图；否则回落到原来三张独立表（老 index.html）。
+  if ($('usDimBody')) {
+    renderUsageDim();
+  } else {
+    $('usAccBody').innerHTML = (usageData.by_account || []).map(x =>
+      usRow(x.key.slice(0, 8), x.extra || '', x,
+        '<td class="num">' + esc(x.realm || '') + '</td>', true)
+    ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+    $('usModelBody').innerHTML = (usageData.by_model || []).map(x =>
+      usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    $('usRealmBody').innerHTML = (usageData.by_realm || []).map(x =>
+      usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+  }
+  renderCreditDim();
+  renderUsageChart(usageData.series || []);
+}
+
+// 维度切换 / 排序控件。
+if ($('usDimTabs')) $('usDimTabs').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-dim]');
+  if (!b) return;
+  usDim = b.dataset.dim;
+  renderUsageDim();
+});
+if ($('usCreditTabs')) $('usCreditTabs').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-dim]');
+  if (!b) return;
+  usCreditDim = b.dataset.dim;
+  renderCreditDim();
+});
+if ($('usSort')) $('usSort').onchange = () => {
+  usSort = $('usSort').value;
+  renderUsageDim();
+};
 
 /* renderUsageChart 画堆叠柱状图。
  *
@@ -1714,6 +2399,14 @@ function parsePointTime(p) {
   return isNaN(d.getTime()) ? null : d.getTime();
 }
 
+/* fmtTokTimeLabel 时间桶的短标签，与 x 轴刻度同一口径（日桶 MM-DD，小时桶 HH:00）。 */
+function fmtTokTimeLabel(p) {
+  const d = new Date(p.t);
+  return p.scope === 'day'
+    ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
+    : String(d.getHours()).padStart(2, '0') + ':00';
+}
+
 function renderUsageChart(series) {
   const host = $('usChart');
 
@@ -1729,10 +2422,11 @@ function renderUsageChart(series) {
   }
   if (!pts.length) {
     host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
+    if ($('usChartNote')) $('usChartNote').textContent = '—';
     return;
   }
 
-  const W = 760, H = 180, PL = 52, PR = 12, PT = 12, PB = 30;
+  const W = 1200, H = 200, PL = 58, PR = 14, PT = 18, PB = 30;
   const iw = W - PL - PR, ih = H - PT - PB;
 
   const t0 = pts[0].t;
@@ -1740,6 +2434,11 @@ function renderUsageChart(series) {
   const span = Math.max(1, t1 - t0);
 
   const max = Math.max(1, ...pts.map(p => p.tt));
+  const peak = pts.reduce((a, b) => (b.tt > a.tt ? b : a), pts[0]);
+  const avg = pts.reduce((s, p) => s + p.tt, 0) / pts.length;
+  if ($('usChartNote')) $('usChartNote').textContent =
+    pts.length + ' 个点 · 峰值 ' + fmtTok(peak.tt) + ' @ ' + fmtTokTimeLabel(peak) +
+    ' · 均值 ' + fmtTok(avg);
 
   // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
   // 变细，但不会细到看不见。
@@ -1747,12 +2446,27 @@ function renderUsageChart(series) {
   for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
   if (!isFinite(minGap) || minGap <= 0) minGap = span;
   const slot = iw * (minGap / span);
-  const bw = Math.max(1.5, Math.min(30, slot * 0.7));
+  const bw = Math.max(2, Math.min(30, slot * 0.7));
 
-  const xOf = t => PL + (t - t0) / span * iw;
+  // 首尾各让出半个柱宽：否则第一个点和最后一个点的柱子会各有一半跑到绘图区外
+  // （末点柱子贴着卡片右边缘被切掉），刻度仍用同一个 xOf，标签与柱子始终对齐。
+  const xOf = t => PL + bw / 2 + (t - t0) / span * Math.max(1, iw - bw);
+  const yOf = v => PT + ih - ih * (v / max);
 
   let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
             'preserveAspectRatio="xMidYMid meet">';
+
+  // 柱体渐变：顶部实、底部略透，堆叠时两段仍能一眼分清（纯色块并排会糊成一片）。
+  // 注意 stop-color 必须走 style 而不是 presentation 属性——Blink/WebKit 不解析
+  // 属性里的 var()，写成 stop-color="var(--accent)" 会整条渐变失效（柱子全透明）。
+  out += '<defs>' +
+    '<linearGradient id="usGradP" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" style="stop-color:var(--accent);stop-opacity:1"/>' +
+    '<stop offset="1" style="stop-color:var(--accent);stop-opacity:.6"/></linearGradient>' +
+    '<linearGradient id="usGradC" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" style="stop-color:var(--ok);stop-opacity:1"/>' +
+    '<stop offset="1" style="stop-color:var(--ok);stop-opacity:.6"/></linearGradient>' +
+    '</defs>';
 
   // y 轴网格 + 刻度
   for (let i = 0; i <= 4; i++) {
@@ -1763,27 +2477,49 @@ function renderUsageChart(series) {
            '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
   }
 
+  // 均值参考线：一眼看出"这根是不是异常高"，比只给刻度省心。
+  // 标签放左侧：右侧常被峰值柱占用（峰值柱往往就是最后一根），贴左不会被压住。
+  if (avg > 0 && avg < max) {
+    const y = yOf(avg);
+    out += '<line class="avg" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+           '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk-avg" x="' + (PL + 5) + '" y="' + (y - 4).toFixed(1) +
+           '" text-anchor="start">均值 ' + fmtTok(avg) + '</text>';
+  }
+
   // 柱子
+  const yBase = PT + ih;
   for (const p of pts) {
-    const cx = xOf(p.t);
-    const x = cx - bw / 2;
+    const x = xOf(p.t) - bw / 2;
     const hTot = ih * (p.tt / max);
     const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
     const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
-    const yBase = PT + ih;
-    if (hP > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
+    // 圆角只给堆叠顶端（贴轴的底边保持方角，柱子才像"立"在基线上）。
+    // 类名用 usbar 而不是 bar：账号池的积分条是 .bar{height:3px}，而 SVG2 里
+    // height 是 rect 的 CSS 几何属性，同名类会把每根柱子压成 3px 高（踩过）。
+    if (hP > 0) out += '<rect class="usbar" x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hP.toFixed(2) +
-      '" fill="var(--accent)" rx="1.5"/>';
-    if (hC > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
+      '" fill="url(#usGradP)"' + (hC > 0 ? '' : ' rx="1.5"') + '/>';
+    if (hC > 0) out += '<rect class="usbar" x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
-      '" fill="var(--ok)" rx="1.5"/>';
+      '" fill="url(#usGradC)" rx="1.5"/>';
     out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
            fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
   }
 
+  // 峰值标注：柱子够窄时文字压在柱顶，够宽时贴右侧避免和柱体重叠。
+  {
+    const px = xOf(peak.t);
+    const py = yOf(peak.tt);
+    const anchor = px > W - PR - 90 ? 'end' : 'middle';
+    out += '<text class="tk-peak" x="' + Math.max(PL, Math.min(W - PR, px)).toFixed(1) +
+           '" y="' + Math.max(10, py - 5).toFixed(1) + '" text-anchor="' + anchor + '">' +
+           '峰值 ' + fmtTok(peak.tt) + '</text>';
+  }
+
   // x 轴基线画在柱子之后，避免压在柱底
-  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) +
-         '" y2="' + (PT + ih) + '"/>';
+  out += '<line class="ax" x1="' + PL + '" y1="' + yBase + '" x2="' + (W - PR) +
+         '" y2="' + yBase + '"/>';
 
   // x 轴刻度：按真实时间等距取 6 个位置，取该位置**最近的实际柱子**做标签，
   // 所以标签永远落在有数据的点上，不会指到空档里。
@@ -1799,15 +2535,11 @@ function renderUsageChart(series) {
     if (usedLabel.has(bi)) continue;
     usedLabel.add(bi);
     const p = pts[bi];
-    const d = new Date(p.t);
-    const lab = p.scope === 'day'
-      ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
-      : String(d.getHours()).padStart(2, '0') + ':00';
     // 首尾标签靠边对齐，避免被裁掉
     const cx = xOf(p.t);
     const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
     out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
-           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
+           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' + esc(fmtTokTimeLabel(p)) + '</text>';
   }
 
   // 跨天时补一条日期分隔线，让「日界」在长窗口里可见
@@ -1828,17 +2560,53 @@ function renderUsageChart(series) {
 
 function fmtTokTip(v) { return fmtTok(v); }
 
-async function loadUsage() {
-  const hours = ($('usWindow') && $('usWindow').value) || 72;
+let usageRateWarmAt = 0;
+async function warmUsageModelRates() {
+  if (Date.now() - usageRateWarmAt < 10 * 60 * 1000) return;
   try {
-    const d = await api('usage?hours=' + encodeURIComponent(hours));
+    await api('models');
+  } catch (e) {
+    // 倍率回填是可选增强；失败不阻塞用量统计，10 分钟后再试。
+  }
+  usageRateWarmAt = Date.now();
+}
+
+async function loadUsage() {
+  // 时间范围控件存在时走区间参数（今天/自定义由浏览器按本地时区算好再发）；
+  // 否则回落到旧的 usWindow 小时选择，行为与改动前一致。
+  let qs;
+  if ($('usRange')) {
+    qs = trangeQuery('usRange', true).toString();
+  } else {
+    const hours = ($('usWindow') && $('usWindow').value) || 72;
+    qs = 'hours=' + encodeURIComponent(hours);
+  }
+  try {
+    await warmUsageModelRates();
+    const d = await api('usage?' + qs);
     renderUsage(d);
   } catch (e) {
+    // 失败时各块都要清干净：只改图表会留下上一次窗口的数字，看起来像"刷新成功"。
+    usageData = null;
     $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
+    if ($('usChartNote')) $('usChartNote').textContent = '—';
+    $('usStats').innerHTML = '';
+    $('usNote').textContent = '—';
+    if ($('usCreditStats')) $('usCreditStats').innerHTML = '';
+    if ($('usCreditNote')) $('usCreditNote').textContent = '—';
+    if ($('usDimNote')) $('usDimNote').textContent = '—';
+    if ($('usDimHead')) $('usDimHead').innerHTML = '';
+    if ($('usCreditHead')) $('usCreditHead').innerHTML = '';
+    if ($('usDimTabs')) $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, null);
+    if ($('usCreditTabs')) $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null);
+    if ($('usDimBody')) $('usDimBody').innerHTML = '<tr><td colspan="10" class="empty">读取用量失败</td></tr>';
+    if ($('usCreditBody')) $('usCreditBody').innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>';
   }
 }
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
+// 时间范围控件绑定：任何改动（预设切换 / 自定义起止）都重新拉一次用量。
+if ($('usRange')) trangeBind('usRange', loadUsage);
 if ($('usWindow')) $('usWindow').onchange = loadUsage;
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
@@ -1874,36 +2642,208 @@ function pkBySource(packs) {
   return [...m.values()].sort((a, b) => b.size - a.size);
 }
 
-// expiryLabel 把到期日渲染为「还剩 N 天」并按紧迫度着色。
-//
-// 积分按套餐分批过期、过期即作废，所以「还有多少分快没了」比「总额多少」
-// 更需要一眼可见。分档：≤3 天 warn（红），≤7 天 caution（黄），其余中性。
-// 已过期（<0 天）标 bad——理论上后端只返回 Status 0/3（未过期/冻结），
-// 出现负值是上游时钟或字段异常，如实标出不隐藏。
-function expiryLabel(minEnd) {
-  if (!minEnd) return '';
-  const end = new Date(minEnd + 'T23:59:59');
-  if (isNaN(end)) return '';
-  const days = Math.floor((end - Date.now()) / 86400000);
-  if (days < 0)  return { text: '已过期', cls: 'bad' };
-  if (days <= 3) return { text: '剩 ' + days + ' 天', cls: 'bad' };
-  if (days <= 7) return { text: '剩 ' + days + ' 天', cls: 'warn' };
-  return { text: minEnd.slice(5) + ' 到期', cls: '' };
+/* ── 到期分布与账号配色（6bc7a7ce 吸收）───────────────────────────────
+   同一批积分的"什么时候过期"比"还剩多少"更影响可用性：这里按精确剩余天数
+   逐行聚合成横条，段宽=该批金额占比，颜色=账号，透明度=紧迫度。 */
+const PK_ACCOUNT_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6',
+                           '#e2607a', '#20a4a4', '#8fbf3f', '#d4785c',
+                           '#7c83db', '#c48a2f', '#b45f8c', '#5aa9e6'];
+
+// pkAccountColorMap 按 UID 稳定分配颜色：排序后分配，账号刷新/重排不会换色。
+function pkAccountColorMap(list) {
+  const uids = (list || [])
+    .filter(a => a && !a.error && a.uid)
+    .map(a => String(a.uid))
+    .sort();
+  const colors = new Map();
+  uids.forEach((uid, i) => colors.set(uid, PK_ACCOUNT_COLORS[i % PK_ACCOUNT_COLORS.length]));
+  return colors;
 }
 
-// nearestExpiry 全部包里最近的一个未到期时刻（只看仍有余额的包）。
-// 余额为 0 的包到期无所谓，不该成为卡片上的「最近到期」。
-function nearestExpiry(packs) {
-  let best = '';
-  for (const p of packs) {
-    if (!p.end_time || Number(p.remain || 0) <= 0) continue;
-    if (!best || p.end_time < best) best = p.end_time;
+function pkExpiryMs(p) {
+  const raw = Number(p && p.expires_at);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  const text = String((p && p.end_time) || '').trim();
+  if (!text) return null;
+  let iso = text.includes('T') ? text : text.replace(' ', 'T');
+  if (!/(?:Z|[+-]\d\d:\d\d)$/.test(iso)) iso += '+08:00';
+  const parsed = Date.parse(iso);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function pkCreditOpacity(days) {
+  if (days == null || !Number.isFinite(Number(days))) return 1;
+  return 0.25 + 0.75 * Math.max(0, Math.min(29, Number(days) - 1)) / 29;
+}
+
+function pkExpiryText(expiresAt) {
+  if (!expiresAt) return '无到期时间';
+  const diff = expiresAt - Date.now();
+  if (diff <= 0) return '已到期';
+  const minutes = Math.max(1, Math.ceil(diff / 60000));
+  if (minutes < 60) return '剩余 ' + minutes + ' 分钟';
+  const hours = Math.ceil(diff / 3600000);
+  if (hours < 24) return '剩余 ' + hours + ' 小时';
+  return '剩余 ' + Math.ceil(diff / 86400000) + ' 天';
+}
+
+function pkExpiryDateTime(expiresAt) {
+  if (!expiresAt) return '—';
+  return new Date(expiresAt).toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+  });
+}
+
+function pkAccountSegments(a, now) {
+  let balance = Math.max(0, Number(a.remain || 0));
+  const out = [];
+  for (const p of a.packages || []) {
+    const remain = Number(p.remain || 0);
+    if (!Number.isFinite(remain) || remain <= 0 || balance <= 0) continue;
+    const amount = Math.min(balance, remain);
+    const expiresAt = pkExpiryMs(p);
+    out.push({
+      amount,
+      expiresAt,
+      days: expiresAt == null ? null : Math.max(0, Math.ceil((expiresAt - now) / 86400000)),
+      source: p.name || '积分',
+      uid: String(a.uid || ''),
+      accountName: a.nickname || String(a.uid || '').slice(0, 8) || '未命名账号',
+    });
+    balance -= amount;
   }
-  return best ? expiryLabel(best.slice(0, 10)) : null;
+  return out.sort((x, y) => {
+    if (x.expiresAt == null && y.expiresAt != null) return 1;
+    if (x.expiresAt != null && y.expiresAt == null) return -1;
+    return (x.expiresAt || 0) - (y.expiresAt || 0);
+  });
 }
 
-function renderPackages(d) {
+// summarizeCreditDays 按精确剩余天数逐行聚合，无有效到期时间的余额不进入图表，
+// 也不猜测到期日。账号内先按总余额约束逐包金额，避免上游重复记录膨胀。
+function summarizeCreditDays(list, now) {
+  const buckets = new Map();
+  let unavailable = 0;
+  for (const a of list || []) {
+    if (a.error || !Number.isFinite(Number(a.remain))) {
+      unavailable++;
+      continue;
+    }
+    for (const segment of pkAccountSegments(a, now)) {
+      if (segment.days == null) continue;
+      let row = buckets.get(segment.days);
+      if (!row) {
+        row = { days: segment.days, credits: 0, segments: [] };
+        buckets.set(segment.days, row);
+      }
+      row.credits += segment.amount;
+      row.segments.push(segment);
+    }
+  }
+  const rows = [...buckets.values()].sort((a, b) => a.days - b.days);
+  for (const row of rows) {
+    row.segments.sort((a, b) =>
+      (a.expiresAt || Infinity) - (b.expiresAt || Infinity) ||
+      a.accountName.localeCompare(b.accountName) ||
+      a.source.localeCompare(b.source));
+  }
+  return { rows, accountCount: (list || []).length, unavailable };
+}
+
+function renderExpiryDistribution(list, now) {
+  const host = $('pkExpiry');
+  if (!host) return;
+  const summary = summarizeCreditDays(list, now);
+  const colors = pkAccountColorMap(list);
+  const rows = summary.rows.map(row => {
+    const total = row.credits || 1;
+    const nodes = row.segments.map(segment => {
+      const color = colors.get(segment.uid) || 'var(--accent)';
+      const title = segment.source + '\n' + fmtTok(segment.amount) + ' 积分\n到期时间 ' +
+        pkExpiryDateTime(segment.expiresAt) + '（' + pkExpiryText(segment.expiresAt) + '）\n' +
+        segment.accountName;
+      return '<span class="pk-expiry-seg" style="--seg-color:' + color +
+        ';opacity:' + pkCreditOpacity(segment.days).toFixed(5) +
+        ';flex:' + Math.max(0.008, segment.amount / total).toFixed(4) +
+        ' 1 0" title="' + esc(title) + '" aria-label="' + esc(title) + '"></span>';
+    }).join('');
+    return '<div class="pk-expiry-row"><span>' + esc(row.days === 0 ? '已到期' : row.days + ' 天') +
+      '</span><div class="pk-expiry-track">' + nodes + '</div><b>' + esc(fmtTok(row.credits)) +
+      '</b></div>';
+  }).join('');
+  const foot = summary.accountCount + ' 个账号' +
+    (summary.unavailable ? ' · ' + summary.unavailable + ' 个未获取余额' : '');
+  const legend = (list || []).filter(a =>
+    a && !a.error && a.uid && pkAccountSegments(a, now).some(s => s.days != null)
+  ).map(a => '<span><i style="background:' + (colors.get(String(a.uid)) || 'var(--accent)') +
+    '"></i>' + esc(a.nickname || String(a.uid).slice(0, 8)) + '</span>').join('');
+  const hdr = '<div class="pk-expiry-hdr"><span>剩余天数</span><span style="text-align:center">各账号该批剩余</span><b>剩余积分</b></div>';
+  host.innerHTML = (rows
+    ? hdr + '<div class="pk-expiry-chart">' + rows + '</div>'
+    : '<div class="pk-expiry-empty">暂无可汇总积分</div>') +
+    (legend ? '<div class="pk-expiry-legend">' + legend + '</div>' : '') +
+    '<div class="pk-expiry-foot">' + esc(foot) + '</div>';
+}
+
+/* ── 逐包明细折叠（df533258 吸收）─────────────────────────────────────
+   默认只摊开「最早到期」的前 N 条（N 由 panel.package_detail_limit 配置，
+   缺省 5），其余未用完与已用完各折叠成一行可展开的汇总。 */
+const PK_DEFAULT_DETAIL_LIMIT = 5;
+
+function pkDetailLimitValue(raw) {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : PK_DEFAULT_DETAIL_LIMIT;
+}
+
+function pkDetailLimit(cfg) {
+  return pkDetailLimitValue(cfg && cfg.panel && cfg.panel.package_detail_limit);
+}
+
+function pkDetailCompare(a, b) {
+  const sizeOf = p => {
+    const n = Number(p && p.size);
+    return Number.isFinite(n) ? n : 0;
+  };
+  const ea = pkExpiryMs(a), eb = pkExpiryMs(b);
+  if (ea == null && eb != null) return 1;
+  if (ea != null && eb == null) return -1;
+  if (ea != null && eb != null && ea !== eb) return ea - eb;
+  return sizeOf(b) - sizeOf(a);
+}
+
+function pkDetailGroups(packs, limit) {
+  const active = [], used = [];
+  let usedSize = 0, restSize = 0, restRemain = 0;
+  for (const p of packs || []) {
+    const remain = Number(p && p.remain);
+    if (remain > 0) {
+      active.push(p);
+      continue;
+    }
+    used.push(p);
+    const size = Number(p && p.size);
+    if (Number.isFinite(size)) usedSize += size;
+  }
+  active.sort(pkDetailCompare);
+  used.sort(pkDetailCompare);
+  const visible = active.slice(0, pkDetailLimitValue(limit));
+  const rest = active.slice(visible.length);
+  for (const p of rest) {
+    const size = Number(p && p.size);
+    if (Number.isFinite(size)) restSize += size;
+    const remain = Number(p && p.remain);
+    if (Number.isFinite(remain)) restRemain += remain;
+  }
+  return { visible, rest, used, restSize, restRemain, usedSize };
+}
+
+function renderPackages(d, detailLimit) {
   const list = (d.accounts || []);
+  const now = Date.now();
+  const expiryColors = pkAccountColorMap(list);
+  renderExpiryDistribution(list, now);
   if (!list.length) {
     $('pkSummary').innerHTML = '<div class="empty">没有账号</div>';
     return;
@@ -1941,39 +2881,53 @@ function renderPackages(d) {
       '<i style="width:' + (s.size / total * 100).toFixed(2) + '%;background:' +
       colorOf(s.key) + '" title="' + esc(s.name) + ' ' + fmtTok(s.size) + '"></i>'
     ).join('');
-    // legend 每个来源补「最早到期」——minEnd 此前只算不显，积分何时作废无从得知。
-    // 该来源已用尽的（remain 0）不标到期，避免满屏「剩 N 天」干扰。
-    const legend = srcs.map(s => {
-      const ex = s.remain > 0 ? expiryLabel(s.minEnd) : '';
-      return '<span><i style="background:' + colorOf(s.key) + '"></i>' +
+    // legend 每个来源只给面额与首发时间；「什么时候到期」改由卡片下方的到期条
+    // （account 级）与顶部到期分布图回答（6bc7a7ce：原来塞在 legend 里的「剩 N 天」
+    // 逐来源四五个，密度低且与到期分布重复）。
+    const legend = srcs.map(s =>
+      '<span><i style="background:' + colorOf(s.key) + '"></i>' +
       esc(s.name.replace(/^CodeBuddy/, '')) + ' x' + s.n + ' · ' + fmtTok(s.size) +
-      (ex ? ' · <b class="' + ex.cls + '">' + esc(ex.text) + '</b>' : '') +
-      (s.minCreated ? ' · 首发 ' + esc(s.minCreated.slice(5)) : '') + '</span>';
-    }).join('');
+      (s.minCreated ? ' · 首发 ' + esc(s.minCreated.slice(5)) : '') + '</span>'
+    ).join('');
+    // 该账号逐包到期条：段宽=该批金额占比，颜色=账号，透明度=紧迫度。
+    const expiry = pkAccountSegments(a, now);
+    const expiryTotal = Math.max(1, expiry.reduce((sum, s) => sum + s.amount, 0));
+    const expiryColor = expiryColors.get(String(a.uid)) || 'var(--accent)';
+    const expiryBar = expiry.length ? '<div class="expirybar" role="img" aria-label="积分到期分布">' +
+      expiry.map(s => {
+        const title = s.source + '\n' + fmtTok(s.amount) + ' 积分\n到期时间 ' +
+          pkExpiryDateTime(s.expiresAt) + '（' + pkExpiryText(s.expiresAt) + '）';
+        return '<i style="background:' + expiryColor +
+          ';opacity:' + pkCreditOpacity(s.days).toFixed(5) +
+          ';flex:' + Math.max(0.008, s.amount / expiryTotal).toFixed(4) +
+          ' 1 0" title="' + esc(title) + '"></i>';
+      }).join('') + '</div>' : '';
     return '<div class="pk-card">' +
       '<div class="who"><span class="nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
       '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
       '<div class="big">' + fmtTok(a.remain) + '</div>' +
       '<div class="sub">共 ' + fmtTok(a.size) + ' · ' + (a.packages || []).length +
-      ' 个包 · 占最高 ' + (Number(a.remain || 0) / maxRemain * 100).toFixed(0) + '%' +
-      (() => { const e = nearestExpiry((a.packages || [])); if (!e) return '';
-        return ' · <b class="' + e.cls + '">最近 ' + esc(e.text) + '</b>'; })() + '</div>' +
+      ' 个包 · 占最高 ' + (Number(a.remain || 0) / maxRemain * 100).toFixed(0) + '%</div>' +
       '<div class="mixbar">' + bar + '</div>' +
+      expiryBar +
       '<div class="pk-legend">' + legend + '</div>' +
       '</div>';
   }).join('');
 
   $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
 
-  // 逐包明细：每个账号一个表，包的**面额**列是重点
+  // 逐包明细：每个账号一个表，包的**面额**列是重点。
+  // 默认只摊开最早到期的前 N 条，其余未用完/已用完折叠（df533258）。
   $('pkDetail').innerHTML = list.map(a => {
     if (a.error) return '';
-    const packs = (a.packages || []);
-    const rows = packs.map(p => {
+    const groups = pkDetailGroups(a.packages || [], detailLimit);
+    const rowOf = (p, rowGroup) => {
       const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
       const sub = (p.sub_product_code || '').replace(/^sp_tcaca_codebuddyide_?/, '') ||
                   (p.package_code || '').replace(/^TCACA_/, '');
-      return '<tr><td class="mark" aria-hidden="true"><i style="background:' +
+      return '<tr' + (rowGroup ? ' class="pk-hidden-row pk-' + rowGroup +
+        '-row" data-pk-row="' + rowGroup + '" hidden' : '') +
+        '><td class="mark" aria-hidden="true"><i style="background:' +
         colorOf(k) + '"></i></td>' +
       '<td>' + esc(p.name || '(未命名)') +
         (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
@@ -1983,27 +2937,74 @@ function renderPackages(d) {
       '<td class="num">' + esc((p.created_at || '').slice(0, 16).replace('T', ' ') || '—') + '</td>' +
       '<td class="num">' + esc((p.end_time || '').slice(0, 10) || '—') + '</td>' +
       '</tr>';
-    }).join('');
+    };
+    const groupSummary = (group, label, count, size, remain) =>
+      '<tr class="pk-group-summary"><td colspan="7"><button type="button" class="pk-group-toggle"' +
+      ' data-pk-group="' + group + '" data-count="' + count + '" data-size="' + size +
+      '" data-remain="' + remain + '" aria-expanded="false">' + label + '，展开</button></td></tr>';
+    const rows = groups.visible.map(p => rowOf(p, '')).join('');
+    const restSummary = groups.rest.length
+      ? groupSummary('rest', '其余未用完 ' + groups.rest.length + ' 个包（面额合计 ' +
+          fmtTok(groups.restSize) + ' · 剩余 ' + fmtTok(groups.restRemain) + '）',
+          groups.rest.length, groups.restSize, groups.restRemain) +
+        groups.rest.map(p => rowOf(p, 'rest')).join('')
+      : '';
+    const usedSummary = groups.used.length
+      ? groupSummary('used', '已用完 ' + groups.used.length + ' 个包（面额合计 ' +
+          fmtTok(groups.usedSize) + '）', groups.used.length, groups.usedSize, 0) +
+        groups.used.map(p => rowOf(p, 'used')).join('')
+      : '';
     return '<div class="box"><header><h3>' +
       esc(a.nickname || a.uid.slice(0, 8)) + ' · ' + esc(a.realm || '') +
       '</h3><span class="grow"></span><span class="note">余额 ' + fmtTok(a.remain) +
-      ' / 总额 ' + fmtTok(a.size) + ' · ' + packs.length + ' 个包（按面额降序）</span>' +
+      ' / 总额 ' + fmtTok(a.size) + ' · 可用 ' + (groups.visible.length + groups.rest.length) + ' 个包' +
+      (groups.used.length ? ' / 已用完 ' + groups.used.length + ' 个' : '') +
+      ' · 默认展示最早到期 ' + pkDetailLimitValue(detailLimit) + ' 条</span>' +
       '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
       '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
       '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
       '<th class="num">发放</th><th class="num">到期</th>' +
-      '</tr></thead><tbody>' + rows + '</tbody></table></div></div>';
+      '</tr></thead><tbody>' + rows + restSummary + usedSummary + '</tbody></table></div></div>';
   }).join('');
 }
+
+if ($('pkDetail')) $('pkDetail').addEventListener('click', ev => {
+  const btn = ev.target.closest('button[data-pk-group]');
+  if (!btn) return;
+  const body = btn.closest('tbody');
+  if (!body) return;
+  const group = btn.dataset.pkGroup;
+  const expanded = btn.getAttribute('aria-expanded') === 'true';
+  body.querySelectorAll('tr[data-pk-row="' + group + '"]').forEach(row => { row.hidden = expanded; });
+  const count = btn.dataset.count || '0';
+  const size = btn.dataset.size || '0';
+  const remain = btn.dataset.remain || '0';
+  btn.setAttribute('aria-expanded', String(!expanded));
+  if (group === 'rest') {
+    btn.textContent = expanded
+      ? '其余未用完 ' + count + ' 个包（面额合计 ' + fmtTok(size) + ' · 剩余 ' +
+        fmtTok(remain) + '），展开'
+      : '收起其余未用完 ' + count + ' 个包';
+  } else {
+    btn.textContent = expanded
+      ? '已用完 ' + count + ' 个包（面额合计 ' + fmtTok(size) + '），展开'
+      : '收起已用完 ' + count + ' 个包';
+  }
+});
 
 async function loadPackages() {
   $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
   $('pkDetail').innerHTML = '';
+  if ($('pkExpiry')) $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">查询中…</div>';
   try {
-    const d = await api('packages');
-    renderPackages(d);
+    const [d, c] = await Promise.all([
+      api('packages'),
+      api('config').catch(() => null),
+    ]);
+    renderPackages(d, pkDetailLimit(c && c.config));
   } catch (e) {
     $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
+    if ($('pkExpiry')) $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">读取失败：' + esc(e.message) + '</div>';
   }
 }
 

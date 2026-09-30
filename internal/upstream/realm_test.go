@@ -279,13 +279,13 @@ func TestEffortsKeyedByRealm(t *testing.T) {
 
 	base := strings.TrimSuffix(srv.URL, "/")
 	c := &Client{
-		HTTP:                 http.DefaultClient,
-		ChatBaseCN:           base,
-		BillingBaseCN:        "https://billing.example",
-		ChatBaseGlobal:       base,
-		GlobalEnabled:        true,
-		SanitizeFingerprints: true,
+		HTTP:           http.DefaultClient,
+		ChatBaseCN:     base,
+		BillingBaseCN:  "https://billing.example",
+		ChatBaseGlobal: base,
+		GlobalEnabled:  true,
 	}
+	c.SanitizeFingerprints.Store(true)
 	cn := &auth.Auth{AccessToken: "at", UID: "cn1", Domain: "www.codebuddy.cn"}
 
 	// step 1：CN 探测写 cn 桶（glm-5.2 → [low, medium]）。

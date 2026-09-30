@@ -60,7 +60,9 @@ func growthPending(t upstream.Task) bool {
 		return false
 	}
 	if t.Target > 0 && t.Current >= t.Target {
-		return false // 达标未领：也入队（队列执行后会自动领）
+		// 达标未领：也入队（队列执行后会自动领）——但仅限有自动化动作的任务，
+		// 否则队列执行时会因 autoActionFor 为 nil 直接报错。
+		return autoActionFor(t.TaskCode) != nil
 	}
 	return autoActionFor(t.TaskCode) != nil
 }
@@ -191,28 +193,53 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 	if !body.Growth && !body.School {
 		body.Growth, body.School = true, true
 	}
-	if body.Concurrency < 1 {
-		body.Concurrency = 1
+	started, total, seq, msg := p.startQueue(body.Concurrency, body.Growth, body.School)
+	switch {
+	case seq == -1:
+		writeErr(w, http.StatusConflict, msg)
+	case !started:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": false, "message": msg})
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "total": total, "seq": seq})
 	}
-	if body.Concurrency > 4 {
-		body.Concurrency = 4
+}
+
+// RunGrowthQueueOnce 调度器 growth 时点回调（sch.SetGrowthHook 挂载）：与
+// 「执行全部待办」按钮完全同管线（成长，串行并发 1）。Sequential 族
+// 每日零点解锁一环，此前只能手动扫描推进；此回调让链条每天自动走一环。
+// 异步执行（startQueue 启动 goroutine 即返），已在跑/无待办安全跳过。
+func (p *Panel) RunGrowthQueueOnce() {
+	started, total, _, _ := p.startQueue(1, true, false)
+	if started {
+		log.Printf("panel: 定时成长任务队列已启动（%d 项）", total)
+	}
+}
+
+// startQueue 扫描全部账号待办并启动队列（HTTP「执行全部待办」与调度器 growth
+// 时点共用核心）。返回 (started, total, seq, msg)：seq==-1 表示队列已在执行
+// （冲突）；started=false 时 msg 为无可执行待办的说明。并发夹取 [1,4]；
+// growth/school 开关同 HTTP 入参语义（定时回调只跑 growth）。
+func (p *Panel) startQueue(concurrency int, growth, school bool) (started bool, total int, seq int, msg string) {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency > 4 {
+		concurrency = 4
 	}
 	q := p.queue()
 	q.mu.Lock()
 	if q.running {
 		q.mu.Unlock()
-		writeErr(w, http.StatusConflict, "队列正在执行中（可在任务中心查看进度）")
-		return
+		return false, 0, -1, "队列正在执行中（可在任务中心查看进度）"
 	}
+	// 先占位：扫描（数秒级网络耗时）期间若并发再次触发，直接命中上面的 running
+	// 判拒，避免两个 goroutine 同时启动互相覆盖 q.items/q.seq。无待办时回滚。
+	q.running = true
+	q.startedAt = time.Now()
 	q.mu.Unlock()
 
 	// 扫描待办（复用扫描逻辑的拉取部分）。
 	states := p.cfg.Pool.List()
-	type acct struct {
-		a      *auth.Auth
-		grow   []upstream.Task
-		school bool
-	}
 	var accts []queueAccount
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -232,7 +259,7 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 			if a.IsGlobal() {
 				return
 			}
-			if body.Growth {
+			if growth {
 				if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
 					for _, t := range tasks {
 						if growthPending(t) {
@@ -258,7 +285,7 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 					})
 				}
 			}
-			if wantSchool && p.cfg.Scheduler != nil {
+			if school && p.cfg.Scheduler != nil {
 				if stasks, _, err := p.cfg.Upstream.SchoolTasks(a); err == nil {
 					for _, t := range stasks {
 						if schoolPending(t) { // 认证等不可做任务已在口径外
@@ -273,7 +300,7 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 				accts = append(accts, one)
 				mu.Unlock()
 			}
-		}(a, body.School)
+		}(a, school)
 	}
 	wg.Wait()
 
@@ -289,22 +316,23 @@ func (p *Panel) tasksRunQueue(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(items) == 0 {
 		log.Printf("panel: 队列启动：无可执行待办（全部账号任务已完成）")
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": false, "message": "全部账号没有待办任务"})
-		return
+		q.mu.Lock()
+		q.running = false
+		q.startedAt = time.Time{}
+		q.mu.Unlock()
+		return false, 0, 0, "全部账号没有待办任务"
 	}
 
 	q.mu.Lock()
-	q.running = true
-	q.startedAt = time.Now()
 	q.items = items
-	q.conc = body.Concurrency
+	q.conc = concurrency
 	q.seq++
-	seq := q.seq
+	seq = q.seq
 	q.mu.Unlock()
 
-	go p.runQueueItems(accts, items, body.Concurrency)
-	log.Printf("panel: 队列启动：%d 项（并发 %d，成长 %v 开学季 %v）", len(items), body.Concurrency, body.Growth, body.School)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true, "total": len(items), "seq": seq})
+	go p.runQueueItems(accts, items, concurrency)
+	log.Printf("panel: 队列启动：%d 项（并发 %d，成长 %v 开学季 %v）", len(items), concurrency, growth, school)
+	return true, len(items), seq, ""
 }
 
 // runQueueItems 队列执行主体：按账号分组，账号内串行（per-account 锁），

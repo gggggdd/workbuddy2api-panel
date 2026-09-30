@@ -276,7 +276,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.WebBaseCN+"/v2/report", bytes.NewReader(raw))
+	req, err := http.NewRequest(http.MethodPost, c.webBase(a)+"/v2/report", bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -284,7 +284,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("x-client-platform", "web")
-	req.Header.Set("Origin", c.WebBaseCN)
+	req.Header.Set("Origin", c.webBase(a))
 	req.Header.Set("Referer", pageURL)
 	req.Header.Set("User-Agent", ua)
 	if a.UID != "" {
@@ -477,6 +477,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	// 从 SSE 流抓第一个 data.id 作为服务端 requestId（读干流避免残留连接）。
 	buf := make([]byte, 0, 1<<20)
 	tmp := make([]byte, 8192)
+	searchFrom := 0
 	for {
 		n, rerr := resp.Body.Read(tmp)
 		if n > 0 {
@@ -488,8 +489,12 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 				}
 				fmt.Printf("[dbg-rd %d] %q\n", n, dbg)
 			}
-			if i := bytes.Index(buf, []byte(`"id":"`)); i >= 0 {
-				rest := buf[i+6:]
+			// 从上次搜索位置继续：SSE 里 `"id":"` 可能先出现在消息 id 等字段，
+			// 若不推进偏移，首个不匹配的 id 会让循环永远重复命中同一位置，
+			// 读满 1MB 后误报"未找到 requestId"。
+			if i := bytes.Index(buf[searchFrom:], []byte(`"id":"`)); i >= 0 {
+				abs := searchFrom + i
+				rest := buf[abs+6:]
 				if end := bytes.IndexByte(rest, '"'); end > 0 {
 					id := string(rest[:end])
 					if os.Getenv("WB2A_DEBUG_CHAT") != "" {
@@ -498,6 +503,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 					if idRegex.MatchString(id) {
 						return conversationID, id, nil
 					}
+					searchFrom = abs + 1
 				}
 			}
 		}

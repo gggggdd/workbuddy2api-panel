@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"workbuddy2api/internal/auth"
@@ -15,11 +16,16 @@ import (
 // authz 记录最后一次鉴权头，respond 按路径决定响应。
 func globalModelsSrv(t *testing.T, calls *[]string, authz *string, respond func(path string) (int, string)) *httptest.Server {
 	t.Helper()
+	// 探测是并发发起（v3 双 UA + 企业端点三个 goroutine），handler 里的 append
+	// 必须串行化，否则丢失记录（实测 flaky：偶发丢掉 /v2 的调用记录）。
+	var mu sync.Mutex
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		*calls = append(*calls, r.URL.Path)
 		if authz != nil {
 			*authz = r.Header.Get("Authorization")
 		}
+		mu.Unlock()
 		status, body := respond(r.URL.Path)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)

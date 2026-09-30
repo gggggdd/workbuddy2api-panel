@@ -1464,8 +1464,8 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 			}, nil
 		})},
 		ChatBaseCN:           "https://fake.example",
-		SanitizeFingerprints: true, // 开启清洗层（与生产一致）
 	}
+	up.SanitizeFingerprints.Store(true) // 开启清洗层（与生产一致）
 	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
 	const customSys = "我是网关自有提示词"
 	h := NewHandler(Config{Pool: p, Upstream: up, PromptMode: "custom", PromptText: customSys})

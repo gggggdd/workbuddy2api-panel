@@ -38,6 +38,9 @@ type Config struct {
 		ActivityHours  []int `json:"activity_hours"`  // [10]
 		KeepaliveHours []int `json:"keepalive_hours"` // [22]
 		BlackcatHours  []int `json:"blackcat_hours"`  // [23] 夜猫子窗口（23:00–08:00 计数）
+		// GrowthHours 成长任务队列自动执行时点，默认 [1]（Sequential 族零点解锁，
+		// 01:00 扫描+执行；避开零点整防解锁竞态）。
+		GrowthHours []int `json:"growth_hours"`
 		// CheckinEnabled/TravelEnabled/ActivityEnabled/KeepaliveEnabled/BlackcatEnabled 显式禁用开关（缺省 true）。
 		//
 		// 为什么用独立 bool 而不是空数组/哨兵值表意"禁用"：
@@ -52,6 +55,8 @@ type Config struct {
 		ActivityEnabled  bool `json:"activity_enabled"`  // 缺省 true；false = 停活跃上报
 		KeepaliveEnabled bool `json:"keepalive_enabled"` // 缺省 true；false = 关 token 保活
 		BlackcatEnabled  bool `json:"blackcat_enabled"`  // 缺省 true；false = 关夜猫子
+		// GrowthEnabled 缺省 true；false = 关成长任务队列自动排程。
+		GrowthEnabled bool `json:"growth_enabled"`
 
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
@@ -105,6 +110,23 @@ type Config struct {
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
 	} `json:"features"`
 
+	Logging struct {
+		// RequestArchiveEnabled 请求元数据 JSONL 归档开关，缺省 true。
+		RequestArchiveEnabled bool `json:"request_archive_enabled"`
+		// RequestRetentionDays 归档保留天数，缺省 7；<=0 回落默认。
+		RequestRetentionDays int `json:"request_retention_days"`
+		// RequestArchiveMaxMB 归档总上限（MiB），缺省 100；<=0 回落默认。
+		RequestArchiveMaxMB int `json:"request_archive_max_mb"`
+		// RequestClientInfo 是否在请求日志（归档事件 + stdout 流水行 + 面板运行
+		// 日志）里记录调用来源：客户端 IP 与 User-Agent。缺省 true。
+		//
+		// 为什么做成开关而不是恒开：来源信息是排查"谁在打网关"的第一手线索，
+		// 但它比 token 计数敏感（IP 属个人信息），共享部署/多租户场景可能需要
+		// 关掉。关闭后 Event.ClientIP/UserAgent 保持为空，归档里不出现该字段。
+		// 热生效（经 livecfg 快照），无需重启。
+		RequestClientInfo bool `json:"request_client_info"`
+	} `json:"logging"`
+
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
 		// custom = 网关用自有系统提示词替换客户端 system/developer；
@@ -145,6 +167,12 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
+		// PreferExpiring 最早到期优先路由开关，默认 true。开启且 expiring_soon 窗口内
+		// 有到期批次的账号按最早到期优先消耗，避免积分过期浪费。
+		PreferExpiring bool `json:"prefer_expiring"`
+		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
+		// 参与选号（预算留给免费/未知层与签到回血）。0 = 关闭（默认）。
+		CreditFloor int64 `json:"credit_floor"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -183,6 +211,7 @@ func Default() *Config {
 	c.Schedule.ActivityHours = []int{10}
 	c.Schedule.KeepaliveHours = []int{22}
 	c.Schedule.BlackcatHours = []int{23}
+	c.Schedule.GrowthHours = []int{1}
 	// 开关「缺省 true」靠这几行实现：Load 先取 Default() 再 json.Unmarshal 覆盖，
 	// 键缺席（或为 null）时字段原样保留 true，只有显式 false 才关。
 	c.Schedule.CheckinEnabled = true
@@ -190,8 +219,16 @@ func Default() *Config {
 	c.Schedule.ActivityEnabled = true
 	c.Schedule.KeepaliveEnabled = true
 	c.Schedule.BlackcatEnabled = true
+	c.Schedule.GrowthEnabled = true
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
+	c.Logging.RequestArchiveEnabled = true
+	c.Logging.RequestRetentionDays = 7
+	c.Logging.RequestArchiveMaxMB = 100
+	// 缺省 true 靠显式赋值实现（同 Schedule 开关）：JSON 里键缺席时字段保留此值，
+	// 只有显式 false 才关闭来源记录。
+	c.Logging.RequestClientInfo = true
+	c.Pool.PreferExpiring = true
 	c.Upstream.TimeoutSeconds = 120
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
@@ -421,6 +458,17 @@ func (c *Config) normalize() error {
 	if c.CostExploreIntervalDur < 0 {
 		c.CostExploreIntervalDur = 0
 	}
+	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
+	if c.Pool.CreditFloor < 0 {
+		c.Pool.CreditFloor = 0
+	}
+	// 请求归档参数缺省归一（<=0 回落默认，与其余 numeric 配置同风格）。
+	if c.Logging.RequestRetentionDays <= 0 {
+		c.Logging.RequestRetentionDays = 7
+	}
+	if c.Logging.RequestArchiveMaxMB <= 0 {
+		c.Logging.RequestArchiveMaxMB = 100
+	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
 	}
@@ -474,6 +522,9 @@ func (c *Config) normalize() error {
 	}
 	if len(c.Schedule.BlackcatHours) == 0 {
 		c.Schedule.BlackcatHours = []int{23}
+	}
+	if len(c.Schedule.GrowthHours) == 0 {
+		c.Schedule.GrowthHours = []int{1}
 	}
 	// 余额后台刷新：启用时 minutes<=0 回落默认 5；关闭时 interval 保持 0（不启动）。
 	if c.Schedule.BalanceRefreshEnabled {
@@ -533,7 +584,10 @@ func (c *Config) validateScheduleHours() error {
 	if err := checkHourRange("schedule.keepalive_hours", "keepalive_enabled", c.Schedule.KeepaliveHours); err != nil {
 		return err
 	}
-	return checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours)
+	if err := checkHourRange("schedule.blackcat_hours", "blackcat_enabled", c.Schedule.BlackcatHours); err != nil {
+		return err
+	}
+	return checkHourRange("schedule.growth_hours", "growth_enabled", c.Schedule.GrowthHours)
 }
 
 func checkHourRange(field, switchKey string, hours []int) error {

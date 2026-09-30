@@ -10,10 +10,10 @@ import (
 // TestExpiringCreditBoostsWeight 快过期积分占比高的号权重大于占比低/无的号（同总量下）。
 func TestExpiringCreditBoostsWeight(t *testing.T) {
 	p := New("")
-	p.Add(&auth.Auth{UID: "expiring-heavy"})          // 总量相同,快过期占比高
-	p.Add(&auth.Auth{UID: "stable-heavy"})            // 总量相同,快过期占比低
-	p.SetCreditsDetailed("expiring-heavy", 1000, 1000, 900) // 90% 快过期
-	p.SetCreditsDetailed("stable-heavy", 1000, 1000, 50)    // 5% 快过期
+	p.Add(&auth.Auth{UID: "expiring-heavy"})                 // 总量相同,快过期占比高
+	p.Add(&auth.Auth{UID: "stable-heavy"})                   // 总量相同,快过期占比低
+	p.SetCreditsDetailed("expiring-heavy", 1000, 1000, 900, time.Time{}, 0) // 90% 快过期
+	p.SetCreditsDetailed("stable-heavy", 1000, 1000, 50, time.Time{}, 0)    // 5% 快过期
 
 	p.mu.RLock()
 	eExp := p.byUID["expiring-heavy"]
@@ -38,14 +38,14 @@ func TestExpiringCreditBoostsWeight(t *testing.T) {
 func TestExpiringClampedToCredits(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCreditsDetailed("u1", 100, 100, 9999) // expiring > credits
+	p.SetCreditsDetailed("u1", 100, 100, 9999, time.Time{}, 0) // expiring > credits
 	p.mu.RLock()
 	if p.byUID["u1"].creditsExpiring != 100 {
 		t.Errorf("creditsExpiring=%d want 100 (clamped to credits)", p.byUID["u1"].creditsExpiring)
 	}
 	p.mu.RUnlock()
 
-	p.SetCreditsDetailed("u1", 100, 100, -5) // 负值
+	p.SetCreditsDetailed("u1", 100, 100, -5, time.Time{}, 0) // 负值
 	p.mu.RLock()
 	if p.byUID["u1"].creditsExpiring != 0 {
 		t.Errorf("creditsExpiring=%d want 0 (negative clamped)", p.byUID["u1"].creditsExpiring)
@@ -57,7 +57,7 @@ func TestExpiringClampedToCredits(t *testing.T) {
 func TestSetCreditsLeavesExpiringUnchanged(t *testing.T) {
 	p := New("")
 	p.Add(&auth.Auth{UID: "u1"})
-	p.SetCreditsDetailed("u1", 500, 500, 200)
+	p.SetCreditsDetailed("u1", 500, 500, 200, time.Time{}, 0)
 	p.SetCredits("u1", 600, 600) // 旧入口只更新总量
 	p.mu.RLock()
 	e := p.byUID["u1"]
