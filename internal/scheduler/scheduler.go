@@ -575,6 +575,9 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if err := a.SaveAtomic(); err != nil {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}
+		// 成功也要留一行：此前 3 处日志全在失败分支，成功完全静默，
+		// 日志上无法判定保活到底跑没跑（与 checkin 同病）。
+		log.Printf("keepalive %s: token 刷新成功", logfmt.Label(st.UID, st.Nickname))
 	}
 }
 

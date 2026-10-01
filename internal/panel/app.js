@@ -1449,6 +1449,9 @@ function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') reattachQueueView();
+  // 成员管理此前不轮询：后端已记账，页面却不动，看起来像「积分不同步」。
+  // 传 silent=true——不清行（避免 5s 一闪）、失败保留旧数据只改 memNote。
+  else if (view === 'members') loadMembers(true);
 }
 function start() {
   loadOverview(true);
@@ -3012,9 +3015,11 @@ if ($('btnPk')) $('btnPk').onclick = loadPackages;
 
 /* ─── fork 特性：成员管理 + 积分明细 ─── */
 
-async function loadMembers() {
+// silent=true 供轮询复用：不清现有行（避免每 5s 闪「加载中…」），
+// 失败时保留旧数据并只更新 memNote——面板挂着不看，数据断了能看出来。
+async function loadMembers(silent) {
   const tb = $('memBody');
-  tb.innerHTML = '<tr><td colspan="9"><div class="empty">加载中…</div></td></tr>';
+  if (!silent) tb.innerHTML = '<tr><td colspan="9"><div class="empty">加载中…</div></td></tr>';
   try {
     const d = await api('members');
     const s = d.summary || {}, list = d.members || [];
@@ -3053,7 +3058,7 @@ async function loadMembers() {
     }).join('');
     window.__members = list;
   } catch (e) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    if (!silent) tb.innerHTML = '<tr><td colspan="9"><div class="empty">' + esc(e.message) + '</div></td></tr>';
     $('memNote').textContent = e.message;
   }
 }
