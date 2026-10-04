@@ -726,6 +726,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasTotal:         delta.HasTotalTokens,
 				Credit:           credit,
 				HasCredit:        hasCredit,
+				HasCacheTokens:   st.hasCache,
+				CacheHitTokens:   st.cacheHit,
+				CacheMissTokens:  st.cacheMiss,
 				ModelRate:        modelRate,
 				LatencyMs:        delta.LatencyMs,
 				HasLatency:       delta.HasLatencyMs,
@@ -1013,7 +1016,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeSuccess
 			}
 			credit, hasCredit := stats.Credit()
+			if hit, miss, ok := stats.CacheTokens(); ok {
+				st.cacheHit, st.cacheMiss, st.hasCache = hit, miss, true
+			}
 			recordAttempt(acct.UID, stats.Usage(), credit, hasCredit, attemptStarted)
+			// WARN 信号放 recordAttempt 之后：st.promptTokens 此时才是本次的观测值。
+			if st.hasCache {
+				cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+			}
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1046,7 +1056,16 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		credit, total, hasCredit := usageCreditTotal(resp)
+		if usage, ok := resp["usage"].(map[string]any); ok {
+			if hit, okH := upstream.UsageCacheHitTokens(usage); okH {
+				miss, _ := upstream.UsageCacheMissTokens(usage)
+				st.cacheHit, st.cacheMiss, st.hasCache = int64(hit), int64(miss), true
+			}
+		}
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), credit, hasCredit, attemptStarted)
+		if st.hasCache {
+			cacheMissWarn.noteCacheTokens(bareModel, st.promptTokens, st.cacheHit, st.cacheMiss)
+		}
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.outcome = reqlog.OutcomeSuccess
