@@ -23,6 +23,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -41,6 +42,28 @@ type backend struct {
 
 	mu     sync.RWMutex
 	models []modelEntry // 启动时探测的模型（无前缀），聚合时加前缀
+	// modelsAt 上次成功探测的时间；超过 modelsTTL 后由 /v1/models 触发后台刷新
+	// （上游新增模型如 space-bunny 曾因不刷新而长期缺席，直到 hub 重启才出现）。
+	modelsAt   time.Time
+	refreshing atomic.Bool // 刷新 single-flight：并发请求只派一个探测
+}
+
+// modelsTTL 模型目录的新鲜期：超过后 /v1/models 会触发一次重新探测。
+// 与面板侧模型缓存同哲学（上游目录变化频率远低于访问频率）；失败保留旧表。
+const modelsTTL = 10 * time.Minute
+
+// maybeRefreshModels 过期即重探（single-flight；失败保留旧表，下个窗口再试）。
+func (b *backend) maybeRefreshModels() {
+	b.mu.RLock()
+	stale := len(b.models) == 0 || time.Since(b.modelsAt) > modelsTTL
+	b.mu.RUnlock()
+	if !stale || !b.refreshing.CompareAndSwap(false, true) {
+		return
+	}
+	defer b.refreshing.Store(false)
+	if ms := b.fetchModels(); len(ms) > 0 {
+		b.setModels(ms)
+	}
 }
 
 // modelsSnapshot 读副本：遍历期间 backend 可能正被 healthz 重探写入，
@@ -55,6 +78,7 @@ func (b *backend) modelsSnapshot() []modelEntry {
 func (b *backend) setModels(ms []modelEntry) {
 	b.mu.Lock()
 	b.models = ms
+	b.modelsAt = time.Now()
 	b.mu.Unlock()
 }
 
@@ -393,11 +417,8 @@ func listModels(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0, 64)
 	now := time.Now().Unix()
 	for _, b := range backends {
+		b.maybeRefreshModels() // TTL 过期即重探（含启动后从未探到的惰性探活）
 		ms := b.modelsSnapshot()
-		if len(ms) == 0 {
-			ms = b.fetchModels() // 惰性重探：后端恢复后目录自动补全
-			b.setModels(ms)
-		}
 		for _, m := range ms {
 			full := m.ID
 			if b.prefix != "" {
