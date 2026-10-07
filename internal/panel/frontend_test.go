@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -475,7 +476,8 @@ process.stdout.write(JSON.stringify({
 // 时间范围控件：预设 → 查询参数的映射。要点：
 //   - 「今天」必须发浏览器本地时区的 00:00（服务端时区未必一致），且不带 to；
 //   - 滚动预设 rolling=true 发 hours（服务端整点对齐），rolling=false 折算成 from；
-//   - 「全部历史」两者都不发；「自定义」发用户挑的 from/to。
+//   - 「全部历史」滚动端点必须显式发 hours=0（不发会被后端的 72 小时缺省接管）；
+//     非滚动端点不发 from/to；「自定义」发用户挑的 from/to。
 func TestAppJSTimeRangeQuery(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -514,6 +516,7 @@ process.stdout.write(JSON.stringify({
   rolling24: q('24', true),
   rolling72: q('72', true),
   rolling0: q('0', true),
+  log0: q('0', false),
   log24From: approx(q('24', false), Math.floor((now - 24 * 3600e3) / 1000)),
   log24HasHours: /hours=/.test(q('24', false)),
   log7dFrom: approx(q('168', false), Math.floor((now - 168 * 3600e3) / 1000)),
@@ -543,12 +546,76 @@ process.stdout.write(JSON.stringify({
 		return strconv.FormatInt(time.Date(2026, 9, 30, h, m, 0, 0, time.Local).Unix(), 10)
 	}
 	want := `{"todayIsMidnight":true,"todayNoTo":true,` +
-		`"rolling24":"hours=24","rolling72":"hours=72","rolling0":"",` +
+		// rolling0 必须是 "hours=0"（显式全部历史）。此前期望值是空串——那恰好把
+		// issue #121 的错误行为固化成了断言：空 query 会被后端的 72 小时缺省接管，
+		// 于是「全部历史」显示成「近 3 天」。
+		// log0 仍为空：请求记录端点没有缺省窗口，不传 from/to 就是全部历史。
+		`"rolling24":"hours=24","rolling72":"hours=72","rolling0":"hours=0","log0":"",` +
 		`"log24From":true,"log24HasHours":false,"log7dFrom":true,` +
 		`"custom":"from=` + local(9, 0) + `&to=` + local(18, 30) + `",` +
 		`"labelCustom":"9-30 09:00 → 9-30 18:30","labelToday":"今天"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("time range=%s\nwant %s", out, want)
+	}
+}
+
+// 配置表单与 CFG_MAP 必须一一对应，且面板声称"可在线改"的热生效键必须真的
+// 出现在表单里。
+//
+// 为什么需要：`logging.request_client_info` 曾经在表单里存在过，后来在某次改动中
+// 被连带删掉，而 Go 侧的配置键、livecfg 热生效通路、README 的描述都还在——面板
+// 少了一个开关而 Go 测试全绿，只有人肉点开配置页才会发现。这里把"表单字段 ↔
+// CFG_MAP"与"关键热改键必须在表单里"两条都钉住。
+func TestConfigFormMatchesCFGMap(t *testing.T) {
+	src, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(src)
+	htmlBytes, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(htmlBytes)
+
+	// CFG_MAP 块（下面两条检查共用）。
+	mapBlock := js[strings.Index(js, "const CFG_MAP = {"):]
+	mapBlock = mapBlock[:strings.Index(mapBlock, "\n};")]
+	// 不能按行首匹配：CFG_MAP 里多个键写在同一行（`a: [...], b: [...]`），只有行首
+	// 那个带换行缩进。按「前面是行首或分隔符」判定才不漏。
+	inMap := func(name string) bool {
+		return regexp.MustCompile(`(?:^|[\s,{])` + regexp.QuoteMeta(name) + `:\s*\[`).MatchString(mapBlock)
+	}
+
+	// 1) 表单里的每个 name 都要有 CFG_MAP 条目（否则收集/回填都拿不到它）。
+	form := html[strings.Index(html, `<form id="cfgForm">`):]
+	form = form[:strings.Index(form, "</form>")]
+	names := map[string]bool{}
+	for _, m := range regexp.MustCompile(`name="([a-z_0-9]+)"`).FindAllStringSubmatch(form, -1) {
+		names[m[1]] = true
+	}
+	if len(names) == 0 {
+		t.Fatal("未从配置表单解析出任何 name 字段")
+	}
+	for n := range names {
+		if !inMap(n) {
+			t.Errorf("表单字段 %q 在 CFG_MAP 里没有条目（保存时会被静默丢弃）", n)
+		}
+	}
+
+	// 2) CFG_MAP 里的每个键都要在表单里有控件（否则回填/保存是空转）。
+	for _, m := range regexp.MustCompile(`(?:^|[\s,{])([a-z_0-9]+):\s*\[`).FindAllStringSubmatch(mapBlock, -1) {
+		if !names[m[1]] {
+			t.Errorf("CFG_MAP 键 %q 在配置表单里没有对应控件", m[1])
+		}
+	}
+
+	// 3) 明确断言这一个键：后端有配置项、README 说面板可改，UI 不能少。
+	if !strings.Contains(js, "request_client_info: ['logging', 'request_client_info']") {
+		t.Error("CFG_MAP 缺 request_client_info 条目")
+	}
+	if !names["request_client_info"] {
+		t.Error("配置表单缺「记录调用来源」开关（logging.request_client_info）")
 	}
 }
 
@@ -662,5 +729,66 @@ process.stdout.write(JSON.stringify({
 	const want = `{"rows":[{"days":1,"credits":50},{"days":7,"credits":70}],"accountCount":3,"unavailable":1,"colorA":"#4f8cff","colorB":"#25b08b"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry summary=%s want %s", out, want)
+	}
+}
+
+// TestAppJSCollectConfigClearable 钉住 collectConfig 的空串语义。
+//
+// 覆盖型字段（user_agent / prompt_file）空串必须照发：漏发会让面板显示"已保存"
+// 而 config.json 里的值没变（issue #102 附带发现 2）。
+//
+// 同时钉住反面：其余文本字段空串仍然不下发。这条同样重要——若哪天为了修上面那个
+// 问题改成"所有空串都发"，表单里任何一个没填的框都会变成"请清空"，静默抹掉配置。
+func TestAppJSCollectConfigClearable(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; collectConfig test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const CFG_MAP');
+const end = src.indexOf('/* Go 时长字段即时校验');
+if (start < 0 || end < 0 || end < start) throw new Error('collectConfig region not found');
+const mk = v => ({ type: 'text', value: v });
+const cfgForm = { elements: {
+  listen: mk(''),
+  api_key: mk('secret'),
+  user_agent: mk(''),
+  prompt_file: mk(''),
+  checkin_hours: mk(''),
+}};
+const ctx = {
+  Date, Number, String, Math, Map, Array, Object, isNaN, URLSearchParams, Set,
+  document: { getElementById: id => (id === 'cfgForm' ? cfgForm : null) },
+  $: id => (id === 'cfgForm' ? cfgForm : null),
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.collectConfig = collectConfig;', ctx);
+const out = ctx.collectConfig();
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
+process.stdout.write(JSON.stringify([
+  has(out.upstream, 'user_agent'), (out.upstream || {}).user_agent,
+  has(out.prompt, 'file'), (out.prompt || {}).file,
+  has(out, 'listen'),
+  has(out.schedule, 'checkin_hours'),
+  out.api_key
+]));`
+	f, err := os.CreateTemp(t.TempDir(), "cfgc-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("collectConfig node test failed: %v\n%s", err, out)
+	}
+	// [user_agent 已发, 其值, prompt.file 已发, 其值, listen 未发, checkin_hours 未发, api_key]
+	const want = `[true,"",true,"",false,false,"secret"]`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
 	}
 }

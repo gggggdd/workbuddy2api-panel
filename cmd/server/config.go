@@ -58,6 +58,22 @@ type Config struct {
 		// GrowthEnabled 缺省 true；false = 关成长任务队列自动排程。
 		GrowthEnabled bool `json:"growth_enabled"`
 
+		// IncludeDisabledInTasks 让「保号类」定时任务（签到 / 活跃上报 / token 保活 /
+		// 余额刷新）对**已禁用（disabled）**的账号也执行。
+		//
+		// 为什么需要它：面板「禁用」的语义是「不再参与选号」（见面板确认文案），但这四类
+		// 任务此前一律 `if st.Disabled { continue }`，等于把「停用流量」放大成「停止一切
+		// 上游保号行为」——被禁用的号拿不到签到积分、不续 token、余额也不再刷新；而
+		// ReenableIfCredits 明确不复活 disabled 账号（见 pool.state.go），于是签到这条唯一
+		// 的自动回血路径也断了，账号只能靠人工「解冻」回来。
+		//
+		// 对「一次只放开一个号、用禁用做流量开关」的轮换用法（同 IP 多号防风控），闲置
+		// 待命的号恰恰是最需要签到的那批——本开关即为该用法提供出口。
+		//
+		// 缺省 false = 保持既有行为，对老配置零影响。打开后禁用号仍会签到 / 保活，但
+		// **依旧不参与选号**：pool 选号侧的 disabled 过滤不受本开关影响。
+		IncludeDisabledInTasks bool `json:"include_disabled_in_tasks"`
+
 		// 余额后台周期刷新：两次签到时点之间 credits 也能保持新鲜（面板/状态观测用）。
 		// 解冻语义同签到（余额 > 0 的冷却账号自动解冻），但不做签到不刷 token。
 		BalanceRefreshEnabled bool `json:"balance_refresh_enabled"` // 缺省 true；false = 关闭
@@ -127,6 +143,15 @@ type Config struct {
 		RequestClientInfo bool `json:"request_client_info"`
 	} `json:"logging"`
 
+	Server struct {
+		// ReadTimeout 入站请求读取（含 body 上传）总时长上限（issue #100）。
+		// http.Server 的 ReadTimeout 覆盖整个请求读取：大上下文/文件块请求经
+		// 反代链转发时上传可超过旧固定值 60s，被掐后客户端拿到
+		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
+		//（慢速 body 可无限占用连接，自担风险）；改动需重启进程。
+		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+	} `json:"server"`
+
 	Prompt struct {
 		// Mode passthrough（默认）= 透传客户端原始 system（降级重试仍会切到 Degraded）；
 		// custom = 网关用自有系统提示词替换客户端 system/developer；
@@ -159,7 +184,8 @@ type Config struct {
 		IdleWeightPerHour  float64 `json:"idle_weight_per_hour"` // 闲置补偿：每小时未用 +0.5 权重
 		IdleWeightMax      float64 `json:"idle_weight_max"`      // 闲置补偿封顶，默认 5.0
 		// ExpiringSoon 快过期积分窗口（如 "168h"=7天）：签到/余额刷新时，到期时间在
-		// 此窗口内的积分被标记为"快过期"，选号优先消耗。空/0 = 禁用分桶。
+		// 此窗口内的批次令账号命中下面 PreferExpiring 的 ×3 加权；窗口开大 →
+		// 命中账号变多、偏好被稀释。空/0 = 禁用该加权门槛。
 		ExpiringSoon string `json:"expiring_soon"`
 		// CostExploreInterval costTier 条件探索窗口（issue #136 方案 a′）：tier 0
 		// 垄断层存在且 tier 1 有成员时，距上次探索 ≥ 窗口则本次 pick 生效层切
@@ -167,8 +193,10 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
-		// PreferExpiring 最早到期优先路由开关，默认 true。开启且 expiring_soon 窗口内
-		// 有到期批次的账号按最早到期优先消耗，避免积分过期浪费。
+		// PreferExpiring 快过期积分加权开关，默认 true。开启且 expiring_soon 窗口内
+		// 存在有效批次时，该账号选号权重 ×3（虚拟实例，见 pool 路由加权）；
+		// 不按到期时间排序、与批次金额无关（issue #101 对齐实现口径）。
+		// 关闭后完全不使用到期信息选号。
 		PreferExpiring bool `json:"prefer_expiring"`
 		// CreditFloor 积分保底：账号余额低于该值时，对实测收费模型（tier 2）不再
 		// 参与选号（预算留给免费/未知层与签到回血）。0 = 关闭（默认）。
@@ -194,6 +222,8 @@ type Config struct {
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
+	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
+	ServerReadTimeoutDur time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -206,6 +236,7 @@ func Default() *Config {
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
+	c.Server.ReadTimeout = "300s"
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.TravelHours = []int{9, 21}
 	c.Schedule.ActivityHours = []int{10}
@@ -468,6 +499,17 @@ func (c *Config) normalize() error {
 	}
 	if c.Logging.RequestArchiveMaxMB <= 0 {
 		c.Logging.RequestArchiveMaxMB = 100
+	}
+	// 入站读取上限（issue #100）：空值回落默认 300s；"0" 合法（不限制）；
+	// 负值无语义，fail fast（静默钳 0 会把保护悄悄关掉）。
+	if c.Server.ReadTimeout == "" {
+		c.Server.ReadTimeout = "300s"
+	}
+	if c.ServerReadTimeoutDur, err = time.ParseDuration(c.Server.ReadTimeout); err != nil {
+		return fmt.Errorf("server.read_timeout: %w", err)
+	}
+	if c.ServerReadTimeoutDur < 0 {
+		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
