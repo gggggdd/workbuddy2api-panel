@@ -414,13 +414,23 @@ function renderAccounts(list) {
     const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
-    const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
-    const pct = s.credits_total > 0
-      ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
-      : Math.round((s.credits || 0) / maxCred * 100);
+    // 企业版不限量：上游 limitNum == -1，网关以 credits_total=-1 透出（见 upstream
+    // enterpriseUnlimitedTotal）。此时剩余额度不参与展示，直接标「不限」。
+    const unlimited = s.credits_total === -1;
+    const cred = unlimited ? '不限'
+      : (s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits)));
+    const pct = unlimited ? 100
+      : (s.credits_total > 0
+        ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
+        : Math.round((s.credits || 0) / maxCred * 100));
     // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
     // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
-    let credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
+    let credTip;
+    if (unlimited) credTip = '企业版不限量（上游 limitNum=-1）';
+    else if (s.credits_total > 0) {
+      credTip = (s.enterprise ? '企业版剩余额度 ' : '剩余 ')
+        + s.credits + ' / ' + (s.enterprise ? '分配 ' : '总额 ') + s.credits_total + '（' + pct + '%）';
+    } else credTip = '积分（相对池内最高）';
     const costs = (s.model_costs || []).filter(c => c.model);
     if (costs.length) {
       credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
@@ -443,7 +453,7 @@ function renderAccounts(list) {
     const rowTitle = accMask ? '' : ' title="uid: ' + esc(s.uid) + '"';
     return '<tr class="' + cls + '"' + rowTitle + '>' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + nmHtml + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + idHtml + '</div></td>' +
+      '<td class="who"><div class="nm">' + nmHtml + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + idHtml + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -456,12 +466,17 @@ function renderAccounts(list) {
       '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
-        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
-        '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
+        // 企业版无个人成长体系（签到 400「企业账号不支持该操作」/ 成长任务 403）：
+        // 不渲染「签到」「任务」按钮，只留「额度」——点它走 /balance，企业额度由
+        // upstream 的 get-enterprise-user-usage 口径填充。
+        (s.enterprise ? '' :
+          '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
+        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '"' + (s.enterprise ? ' title="刷新企业版已分配额度（上游 get-enterprise-user-usage）"' : '') + '>' + (s.enterprise ? '额度' : '余额') + '</button>' +
+        (s.enterprise ? '' :
+          '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : (s.paused ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
-                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额">暂停选号</button>')) +
+                            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
         (s.disabled ? '' : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
@@ -669,6 +684,8 @@ async function loadOverview(quiet) {
     $('sHealthy').textContent = d.healthy;
     $('sCooling').textContent = d.cooling;
     $('sDisabled').textContent = d.disabled;
+    // 暂停选号单列（issue #125）：它只关选号、照常签到保活，与禁用是两种状态。
+    if ($('sPaused')) $('sPaused').textContent = d.paused == null ? '-' : d.paused;
     renderCreditSummary();
     $('sSticky').textContent = d.sticky_sessions;
     $('navSub').textContent = 'v' + d.version;
@@ -2609,6 +2626,15 @@ function renderUsageChart(series) {
     const hTot = ih * (p.tt / max);
     const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
     const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
+    // 每根柱子包一个 <g>，把 <title> 放进去。
+    //
+    // 为什么必须包裹：SVG 里 <title> 描述的是它的**父元素**。此前 <title> 是
+    // <rect> 的兄弟节点（rect 自闭合，无法包含子节点），于是全部平铺在 <svg>
+    // 根下 —— 整张图只有一个 tooltip（浏览器取第一个），悬停任何柱子都显示同一
+    // 份数据（issue #128）。包进 <g> 后 tooltip 跟随该柱，且堆叠的两段
+    //（prompt + completion）共用同一个提示。
+    out += '<g><title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
+           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
     // 圆角只给堆叠顶端（贴轴的底边保持方角，柱子才像"立"在基线上）。
     // 类名用 usbar 而不是 bar：账号池的积分条是 .bar{height:3px}，而 SVG2 里
     // height 是 rect 的 CSS 几何属性，同名类会把每根柱子压成 3px 高（踩过）。
@@ -2618,8 +2644,7 @@ function renderUsageChart(series) {
     if (hC > 0) out += '<rect class="usbar" x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
       '" fill="url(#usGradC)" rx="1.5"/>';
-    out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
-           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+    out += '</g>';
   }
 
   // 峰值标注：柱子够窄时文字压在柱顶，够宽时贴右侧避免和柱体重叠。
@@ -3195,7 +3220,30 @@ function expDaysLeft(dateStr, today) {
 function renderExpiry(d) {
   const list = (d.accounts || []);
   const today = new Date(); today.setHours(0, 0, 0, 0);
-  const rows = list.map(a => {
+  // 按「最近到期」升序排（issue #125）。
+  //
+  // 后端 /panel/api/packages 是按**余额降序**返回的，恰好把 CN 账号都排在前面、
+  // global 排在末尾，看起来像"按域分组"，其实只是余额顺序。这里再排一次，让
+  // "最快过期的排最前"这个唯一重要的顺序成立，且不分域。
+  //
+  // 排序键用最早到期批次的日期（expBatches 已按日期升序，故 [0] 即最早）。
+  // 查询失败的账号、以及 7 天内无到期的账号没有可比较的到期时间，统一排在最后，
+  // 保持它们原本的相对顺序（稳定排序）。
+  const keyed = list.map(a => {
+    let key = null;
+    if (!a.error) {
+      const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
+      if (bs.length) key = bs[0].date;
+    }
+    return { a, key };
+  });
+  keyed.sort((x, y) => {
+    if (x.key === y.key) return 0;
+    if (x.key === null) return 1;
+    if (y.key === null) return -1;
+    return x.key < y.key ? -1 : 1;
+  });
+  const rows = keyed.map(({ a }) => {
     if (a.error) {
       return '<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
         '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +

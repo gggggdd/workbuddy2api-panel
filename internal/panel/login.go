@@ -264,7 +264,10 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		} else if claimed {
 			log.Printf("panel: global trial uid=%s 已领", acct.UID)
 		}
-	} else {
+	} else if !a.IsEnterprise() {
+		// 企业版跳过签到：上游 POST /v2/billing/meter/daily-checkin 对企业号
+		// 400 code 10001「企业账号不支持该操作」，发了只会把该错误写进登录返回。
+		// 下方 UserResource 余额查询照常（企业额度走 get-enterprise-user-usage 口径）。
 		// DailyCheckinCredit 一次 POST 即完成签到并解析奖励，不要再调 DailyCheckin：
 		// 连两次 POST 时第二次必返回「今天已签到」（code=10001），credit 恒为 0，
 		// 入账被 Append 的零变动过滤静默丢弃——登录签到长期不入账即源于此。

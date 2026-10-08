@@ -476,19 +476,27 @@ func (s *Scheduler) RunCheckinNow() {
 		if a.IsGlobal() {
 			continue
 		}
-		credit, _, cerr := s.cfg.Upstream.DailyCheckinCredit(a)
-		if cerr != nil {
-			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
-			if upstream.IsAlreadyCheckin(cerr) {
-				log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
+		// 企业版门控：企业版无签到体系，上游对 POST /v2/billing/meter/daily-checkin
+		// 直接 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 continue**——
+		// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
+		// credit_floor 判定与面板额度展示的唯一数据源）。
+		credit := 0.0
+		if !a.IsEnterprise() {
+			var cerr error
+			credit, _, cerr = s.cfg.Upstream.DailyCheckinCredit(a)
+			if cerr != nil {
+				// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
+				if upstream.IsAlreadyCheckin(cerr) {
+					log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
+				} else {
+					log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), cerr)
+				}
+				credit = 0 // 业务错误（含已签到）奖励记 0
 			} else {
-				log.Printf("checkin %s: %v", logfmt.Label(st.UID, st.Nickname), cerr)
+				// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
+				// 重复触发时出现），成功也落一行。
+				log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
 			}
-			credit = 0 // 业务错误（含已签到）奖励记 0
-		} else {
-			// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
-			// 重复触发时出现），成功也落一行。
-			log.Printf("checkin %s: 签到成功", logfmt.Label(st.UID, st.Nickname))
 		}
 		if lg := s.lg(); lg != nil {
 			lg.Append(ledger.Entry{
@@ -535,6 +543,13 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
+			continue
+		}
+		// 企业版跳过活跃上报：/v2/report 本身返回 200（不报错），但它唯一的作用是
+		// 点亮 growth 连登天数 / 解锁 first_buddy 领养——这两者对企业号都是 403
+		// （「growth system is only available for personal users」），即**零收益**。
+		// 该类"静默无效"最易被忽略（日志无异常），故显式跳过，不给上游多发一次请求。
+		if a.IsEnterprise() {
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
