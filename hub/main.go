@@ -13,6 +13,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -30,6 +31,32 @@ import (
 // modelsClient 供 fetchModels 复用：每次新建会丢弃连接池，healthz 高频调用时
 // 产生大量 TIME_WAIT。
 var modelsClient = &http.Client{Timeout: 15 * time.Second}
+
+// /healthz 探测预算。旧实现每个请求都对三后端**串行** fetchModels（15s 超时）
+// + 必要时 probeOK（5s），最坏单请求 45s+，16 并发实测 10s 超时；且探测失败时
+// setModels(nil) 会把模型目录清空（连带 /v1/models 掉模型）。现在改成
+// 「TTL 快照 + single-flight + 并发探测（单轮 ≤5s）」，形状与旧版严格一致。
+const (
+	healthzTTL      = 25 * time.Second // 快照新鲜期：窗口内直接命中缓存，不打上游
+	healthzBudget   = 5 * time.Second  // 单次刷新总预算（三后端并发，硬上限）
+	healthzModelCap = 4 * time.Second  // 单后端目录探测上限，留 1s 给 /healthz 兜底判活
+)
+
+// backendHealth 是 healthz 快照里的单条：形状与旧实现一致
+// （{"models":N,"reachable":bool}），监控/面板按字段取值，不可改。
+type backendHealth struct {
+	Models    int  `json:"models"`
+	Reachable bool `json:"reachable"`
+}
+
+// healthz 快照缓存：healthzAt 为零表示还没探过（冷启动），healthzFlight 非 nil
+// 表示有刷新在进行，等待者 close 后读同一份结果。
+var (
+	healthzMu     sync.Mutex
+	healthzAt     time.Time
+	healthzSnap   map[string]backendHealth
+	healthzFlight chan struct{}
+)
 
 type backend struct {
 	name          string   // 诊断用
@@ -61,7 +88,7 @@ func (b *backend) maybeRefreshModels() {
 		return
 	}
 	defer b.refreshing.Store(false)
-	if ms := b.fetchModels(); len(ms) > 0 {
+	if ms := b.fetchModels(context.Background()); len(ms) > 0 {
 		b.setModels(ms)
 	}
 }
@@ -265,10 +292,14 @@ func newBackend(name, prefix, rawTarget, key, keyHdr string, keepCallerKey bool)
 	return b
 }
 
-// fetchModels 探测后端模型目录（启动时一次 + /healthz 复查）。失败不致命：返回
-// 空（该后端在 /v1/models 里缺席，转发仍可用）。
-func (b *backend) fetchModels() []modelEntry {
-	req, _ := http.NewRequest(http.MethodGet, b.target.String()+"/v1/models", nil)
+// fetchModels 探测后端模型目录（启动时一轮 + /healthz 复查 + TTL 惰性重探）。
+// ctx 用来兜住探测预算（healthz 单轮 ≤5s）；失败不致命：返回空（该后端在
+// /v1/models 里缺席，转发仍可用）。
+func (b *backend) fetchModels(ctx context.Context) []modelEntry {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.target.String()+"/v1/models", nil)
+	if err != nil {
+		return nil
+	}
 	if b.keyHdr == "x-api-key" {
 		req.Header.Set("x-api-key", b.key)
 	} else if b.key != "" {
@@ -354,10 +385,7 @@ func main() {
 		newBackend("trae", "trae", traeTarget, traeKey, "bearer", false),
 		newBackend("qoder", "qoder", qoderTarget, qoderKey, "x-api-key", false),
 	}
-	for _, b := range backends {
-		b.setModels(b.fetchModels())
-		log.Printf("[hub] %s: %d models", b.name, b.modelsCount())
-	}
+	startupProbe() // 并发探一轮（≤healthzBudget）并装进 healthz 首帧缓存
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthz)
@@ -486,20 +514,143 @@ func chat(w http.ResponseWriter, r *http.Request) {
 	b.proxy.ServeHTTP(w, r)
 }
 
+// healthz 运维/监控入口：读 TTL 快照（过期才刷新一次），响应形状与旧版严格一致
+// （{"ok":true,"<name>":{"models":N,"reachable":bool}}），不加鉴权。
 func healthz(w http.ResponseWriter, r *http.Request) {
+	snap := healthSnapshot(r.Context())
 	status := map[string]any{"ok": true}
 	for _, b := range backends {
-		ms := b.fetchModels()
-		b.setModels(ms)
-		status[b.name] = map[string]any{"reachable": len(ms) > 0 || probeOK(b), "models": len(ms)}
+		status[b.name] = snap[b.name]
 	}
 	writeJSON(w, status)
 }
 
+// healthSnapshot 取健康快照：TTL 内直接命中；过期由先到者刷新（single-flight），
+// 其余请求等这次刷新结束后读同一份结果——冷启动时也不让空表漏给监控。
+func healthSnapshot(ctx context.Context) map[string]backendHealth {
+	healthzMu.Lock()
+	if !healthzAt.IsZero() && time.Since(healthzAt) < healthzTTL {
+		s := healthzSnap
+		healthzMu.Unlock()
+		return s
+	}
+	if healthzFlight != nil {
+		done := healthzFlight
+		healthzMu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done(): // 调用方提前断开：不等了，直接用上一份快照
+		}
+		healthzMu.Lock()
+		s := healthzSnap
+		healthzMu.Unlock()
+		return s
+	}
+	done := make(chan struct{})
+	healthzFlight = done
+	prev := healthzSnap
+	healthzMu.Unlock()
+
+	snap := mergeHealth(prev, refreshHealth())
+
+	healthzMu.Lock()
+	healthzSnap, healthzAt, healthzFlight = snap, time.Now(), nil
+	healthzMu.Unlock()
+	close(done)
+	return snap
+}
+
+// refreshHealth 并发探测三后端，单轮总耗时不超过 healthzBudget。
+func refreshHealth() map[string]backendHealth {
+	ctx, cancel := context.WithTimeout(context.Background(), healthzBudget)
+	defer cancel()
+	var mu sync.Mutex
+	out := make(map[string]backendHealth, len(backends))
+	var wg sync.WaitGroup
+	for _, b := range backends {
+		wg.Add(1)
+		go func(b *backend) {
+			defer wg.Done()
+			n, ok := probeBackend(ctx, b)
+			mu.Lock()
+			out[b.name] = backendHealth{Models: n, Reachable: ok}
+			mu.Unlock()
+		}(b)
+	}
+	// 预算用尽即返回已探到的部分（没探到的后端由 mergeHealth 沿用上一轮结果）。
+	waited := make(chan struct{})
+	go func() { wg.Wait(); close(waited) }()
+	select {
+	case <-waited:
+	case <-ctx.Done():
+		log.Printf("[hub] healthz refresh hit %s budget", healthzBudget)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	snap := make(map[string]backendHealth, len(out))
+	for k, v := range out {
+		snap[k] = v
+	}
+	return snap
+}
+
+// probeBackend 探单个后端：先取模型目录（≤healthzModelCap，给兜底留预算），目录为空
+// 再探 /healthz 判活（后端正常但没账号时目录本就为空）。返回 (模型数, 是否可达)。
+func probeBackend(ctx context.Context, b *backend) (int, bool) {
+	mctx, cancel := context.WithTimeout(ctx, healthzModelCap)
+	ms := b.fetchModels(mctx)
+	cancel()
+	if len(ms) > 0 {
+		// 只有探到目录才写表：旧实现无条件 setModels，一次探测失败就把 /v1/models 清空。
+		b.setModels(ms)
+		return len(ms), true
+	}
+	if probeOK(ctx, b) {
+		return 0, true
+	}
+	go b.maybeRefreshModels() // 探失败：后台兜底重探（single-flight + 失败保旧表）
+	return 0, false
+}
+
+// mergeHealth 合并新旧快照：本轮没探到（预算耗尽）或目录探测失败的后端，模型数沿用
+// 上一次的非零值——目录不会因一次探测失败变 0；可达性一律用本轮结果，故障要如实
+// 暴露给监控，不能靠"保留旧值"掩盖。
+func mergeHealth(prev, fresh map[string]backendHealth) map[string]backendHealth {
+	out := make(map[string]backendHealth, len(backends))
+	for _, b := range backends {
+		p := prev[b.name]
+		f, ok := fresh[b.name]
+		switch {
+		case !ok:
+			f = p
+		case f.Models == 0 && p.Models > 0:
+			f.Models = p.Models
+		}
+		out[b.name] = f
+	}
+	return out
+}
+
+// startupProbe 启动探一轮并把结果装进 healthz 首帧缓存：顺序探测最坏 3×15s，
+// 会把 docker 健康检查拖到超时；并发 + ≤healthzBudget 后首帧 healthz 直接命中缓存。
+func startupProbe() {
+	snap := mergeHealth(nil, refreshHealth())
+	healthzMu.Lock()
+	healthzSnap, healthzAt = snap, time.Now()
+	healthzMu.Unlock()
+	for _, b := range backends {
+		log.Printf("[hub] %s: %d models", b.name, b.modelsCount())
+	}
+}
+
 // probeOK models 空也可能是后端正常但无账号——用 healthz 端点兜底判活。
-func probeOK(b *backend) bool {
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Get(b.target.String() + "/healthz")
+// 走 modelsClient 复用连接池（旧实现每次 new client，探测时攒 TIME_WAIT）。
+func probeOK(ctx context.Context, b *backend) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.target.String()+"/healthz", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := modelsClient.Do(req)
 	if err != nil {
 		return false
 	}
